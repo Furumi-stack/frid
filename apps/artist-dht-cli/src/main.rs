@@ -102,12 +102,16 @@ async fn main() -> anyhow::Result<()> {
     let mut printer = editor.create_external_printer().ok();
     let prompt = format!("{}> ", args.name);
     let (line_tx, line_rx) = std_mpsc::sync_channel::<Input>(16);
+    // The reader waits for this ack after every line, so the next prompt is
+    // drawn only after the command's output has been printed — otherwise the
+    // line editor's redraws can visually swallow the output.
+    let (ack_tx, ack_rx) = std_mpsc::channel::<()>();
     std::thread::spawn(move || {
         loop {
             match editor.readline(&prompt) {
                 Ok(line) => {
                     let _ = editor.add_history_entry(&line);
-                    if line_tx.send(Input::Line(line)).is_err() {
+                    if line_tx.send(Input::Line(line)).is_err() || ack_rx.recv().is_err() {
                         break;
                     }
                 }
@@ -138,7 +142,10 @@ async fn main() -> anyhow::Result<()> {
             input = async_line_rx.recv() => {
                 match input {
                     Some(Input::Line(line)) => {
-                        if handle_line(&service, line.trim()).await {
+                        let quit = handle_line(&service, line.trim()).await;
+                        // Let the reader draw the next prompt.
+                        let _ = ack_tx.send(());
+                        if quit {
                             break;
                         }
                     }
