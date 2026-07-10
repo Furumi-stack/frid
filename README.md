@@ -152,6 +152,15 @@ event channel (`NetworkEventReceiver`):
 Consume events promptly: the channel is bounded and the engine applies
 back-pressure instead of buffering without limit.
 
+## Example: distributed search (`artist-dht`)
+
+The workspace also contains a bigger example built entirely on this library:
+[`crates/artist-dht`](crates/artist-dht/README.md) — a Kademlia-style DHT
+where every peer stores, routes and searches artist records without any
+dedicated servers, plus its interactive CLI
+[`apps/artist-dht-cli`](apps/artist-dht-cli). See its README for the
+three-peer demo scenario.
+
 ## Verification
 
 ```bash

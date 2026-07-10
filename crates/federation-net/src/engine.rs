@@ -684,6 +684,11 @@ impl<M: Message> NetworkEngine<M> {
         lock(&self.shared.peers).keys().copied().collect()
     }
 
+    /// Returns `true` if there is an active connection to `peer`.
+    pub fn is_connected(&self, peer: EndpointId) -> bool {
+        lock(&self.shared.peers).contains_key(&peer)
+    }
+
     /// Closes the connection to `peer` and removes it from the registry.
     pub async fn disconnect(&self, peer: EndpointId) -> Result<()> {
         let state = lock(&self.shared.peers)
