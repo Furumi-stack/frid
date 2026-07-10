@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/federation-net", "apps/federation-net-demo"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+iroh = "1"
+iroh-base = "1"
+iroh-tickets = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "signal"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+blake3 = "1"
+thiserror = "2"
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+data-encoding = "2"
+rand = "0.9"
+tempfile = "3"

@@ -1,0 +1,25 @@
+[package]
+name = "federation-net"
+version = "0.1.0"
+description = "Generic peer-to-peer networking engine built on Iroh"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iroh = { workspace = true }
+iroh-base = { workspace = true }
+iroh-tickets = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+data-encoding = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
