@@ -97,9 +97,9 @@ async fn main() -> anyhow::Result<()> {
     // Rustyline is blocking, so it runs on its own thread and forwards lines
     // through a channel; the external printer keeps async output readable.
     let mut editor = rustyline::DefaultEditor::new().context("failed to init the line editor")?;
-    let mut printer = editor
-        .create_external_printer()
-        .context("failed to create the console printer")?;
+    // The external printer needs a TTY; when stdout is piped (e.g. through
+    // `tee`), fall back to plain println.
+    let mut printer = editor.create_external_printer().ok();
     let prompt = format!("{}> ", args.name);
     let (line_tx, line_rx) = std_mpsc::sync_channel::<Input>(16);
     std::thread::spawn(move || {
@@ -148,7 +148,13 @@ async fn main() -> anyhow::Result<()> {
             event = events.recv() => {
                 match event {
                     Some(event) => {
-                        let _ = printer.print(format_event(event));
+                        let message = format_event(event);
+                        match printer.as_mut() {
+                            Some(printer) => {
+                                let _ = printer.print(message);
+                            }
+                            None => println!("{message}"),
+                        }
                     }
                     None => {
                         println!("Node stopped.");
