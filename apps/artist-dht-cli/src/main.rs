@@ -79,7 +79,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     for ticket in &args.connect {
-        let ticket: PeerTicket = ticket.parse().context("invalid ticket")?;
+        let ticket: PeerTicket = match ticket.parse() {
+            Ok(ticket) => ticket,
+            Err(err) => {
+                println!("Invalid ticket (make sure you copied the whole string): {err}");
+                let _ = service.shutdown().await;
+                std::process::exit(1);
+            }
+        };
         match service.connect(ticket).await {
             Ok(peer) => println!("Connected to: {peer}"),
             Err(err) => {
