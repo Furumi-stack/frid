@@ -13,6 +13,9 @@ as an opaque serde-serializable payload.
 
 * Persistent peer identity (`<data_dir>/identity.key`, created on first start).
 * Connection establishment via a shareable string ticket (`fnet...`).
+* Optional automatic peer discovery (**rendezvous**): peers of a network find
+  each other through the BitTorrent Mainline DHT knowing nothing but the
+  network id — no tickets and no bootstrap servers.
 * An application-level handshake that isolates networks and schemas.
 * Typed message exchange in both directions over one QUIC connection.
 * Network events (connect, disconnect, message, protocol error).
@@ -20,10 +23,9 @@ as an opaque serde-serializable payload.
 
 ## What it deliberately does not do (yet)
 
-No global peer discovery, gossip, broadcast overlay, DHT, content search,
-file/chunk/streaming transfer, database sync, CRDTs, authorization, ACLs,
-HTTP APIs or metrics. The architecture allows adding these later as separate
-modules or ALPN protocols.
+No gossip, broadcast overlay, content search, file/chunk/streaming transfer,
+database sync, CRDTs, authorization, ACLs, HTTP APIs or metrics. The
+architecture allows adding these later as separate modules or ALPN protocols.
 
 ## Usage
 
@@ -125,6 +127,32 @@ as `BLAKE3("federation-net:schema:" + name)` (e.g. `music-domain-v1`,
 reject each other, because they could not decode each other's messages. Any
 backwards-incompatible change to your message type requires a new schema
 name.
+
+## Rendezvous (peer discovery by network id)
+
+Passing a `RendezvousConfig` to the config builder enables automatic peer
+discovery: every peer periodically publishes its own Iroh address into a
+shared BEP44 mutable record in the public BitTorrent Mainline DHT and dials
+the addresses other peers published there. The record's signing key is
+derived deterministically from the `NetworkId`, so knowing the network id is
+enough to find and join the network; the first peer of a new network simply
+publishes itself and waits.
+
+```rust
+let config = NetworkConfig::builder()
+    .data_dir("./peer-a")
+    .network_id(NetworkId::from_name("example-network"))
+    .schema_id(SchemaId::from_name("demo-message-v1"))
+    .rendezvous(federation_net::RendezvousConfig::default())
+    .build()?;
+```
+
+Because the rendezvous record is world-readable, the network id acts as a
+public rendezvous token: anyone who knows it can discover and join the
+network. Treat the id of a private network like a shared secret (e.g.
+`myorg-prod-7f3a`); the handshake still rejects peers whose network id does
+not match exactly. Rendezvous is off by default — without it, peers are
+connected via tickets only.
 
 ## Tickets
 

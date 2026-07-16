@@ -21,7 +21,10 @@ running peers itself.
 * Each peer has a stable 256-bit `NodeId` derived from its persistent
   `federation-net` endpoint id; records live on the `K = 8` XOR-closest
   nodes.
-* Peers discover each other through automatic Hello/PeerExchange gossip;
+* A peer joins the network knowing **only the network id**: on startup it
+  finds other peers through a rendezvous record in the public BitTorrent
+  Mainline DHT (see `federation-net`'s rendezvous). Within the network peers
+  then discover each other through automatic Hello/PeerExchange gossip;
   connections to newly learned peers are opened **on demand** from stored
   tickets.
 * Deletions propagate as **tombstones** (revision-based, they beat active
@@ -33,16 +36,29 @@ running peers itself.
 Out of scope (by design): fuzzy search, content transfer, CRDTs, consensus,
 signatures on DHT records, Sybil protection, accounts, GUI.
 
-## Bootstrapping limitation
+## Bootstrapping
 
-There is deliberately **no bootstrap server**, so a peer cannot join a
-network it has no contact in: you must pass the ticket of *any* already
-running peer via `--connect`. That first peer has no special role — once
-contacts have spread through peer exchange, it can be switched off.
+There is deliberately **no bootstrap server**. A peer joins a network knowing
+only its `--network-id`: peers of the same network find each other through a
+shared rendezvous record in the public BitTorrent Mainline DHT (the record's
+signing key is derived from the network id). The first peer of a new network
+simply publishes itself and waits; every later peer with the same id finds it
+within a rendezvous round or two (typically well under a minute). No peer has
+a special role.
+
+Because the rendezvous record is world-readable, the network id acts as a
+public rendezvous token: anyone who knows it can discover and join the
+network. Pick a unique, hard-to-guess name for a private network (e.g.
+`myband-artists-prod-7f3a`).
+
+Discovery can be turned off with `--no-bootstrap`; then a peer can only join
+through the ticket of *any* already running peer passed via `--connect`
+(tickets also work in addition to discovery, e.g. on isolated networks
+without internet access).
 
 ## Running the demo (three peers)
 
-Start Peer A (alice):
+Start the peers in any order — they only share the network id:
 
 ```bash
 cargo run -p artist-dht-cli -- \
@@ -51,30 +67,25 @@ cargo run -p artist-dht-cli -- \
   --name alice
 ```
 
-Copy the printed `Ticket: fnet...`. Start Peer B (bob) with it:
-
 ```bash
 cargo run -p artist-dht-cli -- \
   --data-dir ./peer-b \
   --network-id demo-artists \
-  --name bob \
-  --connect 'fnet...'
+  --name bob
 ```
-
-Start Peer C (charlie), connected **only to A** — it will learn about B via
-peer exchange:
 
 ```bash
 cargo run -p artist-dht-cli -- \
   --data-dir ./peer-c \
   --network-id demo-artists \
-  --name charlie \
-  --connect 'fnet...'
+  --name charlie
 ```
 
-`--connect` may be repeated to dial several peers. All three processes must
-use the same `--network-id`; a peer from another network is rejected during
-the transport handshake.
+Within a minute `Peer connected: ...` lines appear on all three. All
+processes must use the same `--network-id`; a peer from another network is
+rejected during the transport handshake. (With `--no-bootstrap`, pass the
+ticket printed by a running peer via `--connect 'fnet...'` instead;
+`--connect` may be repeated.)
 
 ### Demo scenario
 
@@ -130,6 +141,8 @@ use federation_net::NetworkId;
 let config = ArtistDhtConfig::builder()
     .data_dir("./peer-a")
     .network_id(NetworkId::from_name("demo-artists"))
+    // Optional: discover peers of this network via the mainline DHT.
+    .rendezvous(artist_dht::RendezvousConfig::default())
     .build()?;
 let (service, mut events) = ArtistDhtService::start(config).await?;
 

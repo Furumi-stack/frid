@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -24,6 +24,7 @@ use crate::protocol::{
     ALPN, Handshake, HandshakeAck, HandshakeErrorCode, MAX_HANDSHAKE_FRAME_SIZE,
     MessageRejectReason, MessageRequest, MessageResponse, NetworkId, PROTOCOL_VERSION, SchemaId,
 };
+use crate::rendezvous::{RendezvousClient, RendezvousConfig, now_ms};
 use crate::ticket::{PeerTicket, TICKET_VERSION};
 use crate::wire;
 
@@ -47,6 +48,8 @@ const REJECT_LINGER: Duration = Duration::from_secs(3);
 /// How long [`NetworkEngine::shutdown`] waits for background tasks before
 /// aborting them.
 const SHUTDOWN_TASK_GRACE: Duration = Duration::from_secs(5);
+/// Upper bound of the rendezvous round delay while no peer is connected yet.
+const RENDEZVOUS_LONELY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Bounds required of a domain message type.
 ///
@@ -85,6 +88,9 @@ struct Shared<M> {
     tasks: Mutex<JoinSet<()>>,
     next_generation: AtomicU64,
     shutting_down: AtomicBool,
+    /// Broadcasts the start of the shutdown to long-running background
+    /// loops so they can stop promptly instead of being aborted.
+    shutdown_signal: watch::Sender<bool>,
 }
 
 impl<M: Message> Shared<M> {
@@ -396,6 +402,52 @@ impl<M: Message> Shared<M> {
         Ok(())
     }
 
+    /// Dials `addr`, runs the client handshake and registers the connection.
+    ///
+    /// An existing healthy connection to the same peer is reused. The remote
+    /// identity is taken from the authenticated Iroh connection, never from
+    /// `addr` itself.
+    async fn connect_to_addr(self: &Arc<Self>, addr: EndpointAddr) -> Result<EndpointId> {
+        self.ensure_running()?;
+        let target = addr.id;
+        if lock(&self.peers).contains_key(&target) {
+            debug!(peer = %target, "reusing existing connection");
+            return Ok(target);
+        }
+
+        let request_timeout = self.config.request_timeout;
+        let connection = timeout(request_timeout, self.endpoint.connect(addr, ALPN))
+            .await
+            .map_err(|_| NetworkError::Timeout)?
+            .map_err(|err| NetworkError::Transport(format!("failed to connect: {err}")))?;
+        let peer_id = connection.remote_id();
+
+        let handshake = timeout(request_timeout, self.run_client_handshake(&connection))
+            .await
+            .map_err(|_| NetworkError::Timeout)
+            .and_then(|res| res);
+        if let Err(err) = handshake {
+            connection.close(CLOSE_CODE_HANDSHAKE_REJECTED, b"handshake failed");
+            return Err(err);
+        }
+
+        let generation =
+            self.register_connection(peer_id, connection.clone(), ConnectionDirection::Outgoing);
+        info!(peer = %peer_id, "peer connected (outgoing)");
+        self.emit(NetworkEvent::PeerConnected {
+            peer_id,
+            direction: ConnectionDirection::Outgoing,
+        })
+        .await;
+        let loop_shared = self.clone();
+        self.spawn_task(async move {
+            loop_shared
+                .connection_loop(peer_id, connection, generation)
+                .await;
+        });
+        Ok(peer_id)
+    }
+
     /// Runs the client side of the handshake on a fresh outgoing connection.
     async fn run_client_handshake(&self, connection: &Connection) -> Result<()> {
         let (mut send, mut recv) = connection.open_bi().await.map_err(|err| {
@@ -414,6 +466,65 @@ impl<M: Message> Shared<M> {
         } else {
             let code = ack.error.unwrap_or(HandshakeErrorCode::InvalidHandshake);
             Err(handshake_code_to_error(code))
+        }
+    }
+}
+
+/// Periodically publishes this peer to the network's rendezvous record and
+/// dials every other peer found there.
+///
+/// Failures of a single round or dial are logged and retried on the next
+/// round; the loop only ends when the engine shuts down (the task is
+/// aborted).
+async fn rendezvous_loop<M: Message>(
+    shared: Arc<Shared<M>>,
+    client: RendezvousClient,
+    config: RendezvousConfig,
+) {
+    let mut shutdown = shared.shutdown_signal.subscribe();
+    // Give the endpoint a moment to learn its relay and direct addresses so
+    // the very first published record is already dialable.
+    let _ = timeout(shared.config.request_timeout, shared.endpoint.online()).await;
+    let self_id = shared.endpoint.id();
+    loop {
+        if shared.is_shutting_down() {
+            return;
+        }
+        let round = async {
+            let addr = shared.endpoint.addr();
+            let self_addr = (!addr.is_empty()).then_some(addr);
+            match client.round(self_addr, now_ms()).await {
+                Ok(peers) => {
+                    for peer_addr in peers {
+                        let peer = peer_addr.id;
+                        if peer == self_id || lock(&shared.peers).contains_key(&peer) {
+                            continue;
+                        }
+                        debug!(peer = %peer, "rendezvous discovered a peer; connecting");
+                        if let Err(err) = shared.connect_to_addr(peer_addr).await {
+                            // Stale entries (peers that left) fail here; they
+                            // age out of the record by TTL.
+                            debug!(peer = %peer, error = %err, "rendezvous connect attempt failed");
+                        }
+                    }
+                }
+                Err(err) => debug!(error = %err, "rendezvous round failed"),
+            }
+        };
+        tokio::select! {
+            _ = round => {}
+            _ = shutdown.changed() => return,
+        }
+        // Poll faster while the peer is still alone: joining a network
+        // should not have to wait a full interval for the next round.
+        let delay = if lock(&shared.peers).is_empty() {
+            config.interval.min(RENDEZVOUS_LONELY_INTERVAL)
+        } else {
+            config.interval
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.changed() => return,
         }
     }
 }
@@ -506,12 +617,26 @@ impl<M: Message> NetworkEngine<M> {
             tasks: Mutex::new(JoinSet::new()),
             next_generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
+            shutdown_signal: watch::Sender::new(false),
         });
         let handler = FederationProtocol {
             shared: Arc::downgrade(&shared),
         };
         let router = Router::builder(endpoint).accept(ALPN, handler).spawn();
         *lock(&shared.router) = Some(router);
+        if let Some(rendezvous) = shared.config.rendezvous.clone() {
+            match RendezvousClient::new(shared.config.network_id, &rendezvous) {
+                Ok(client) => {
+                    let loop_shared = shared.clone();
+                    shared.spawn_task(async move {
+                        rendezvous_loop(loop_shared, client, rendezvous).await;
+                    });
+                }
+                // Rendezvous is a convenience; the engine stays usable via
+                // tickets even when the DHT client cannot start.
+                Err(err) => warn!(error = %err, "peer rendezvous disabled"),
+            }
+        }
         info!(
             endpoint_id = %endpoint_id,
             network_id = %shared.config.network_id,
@@ -587,54 +712,12 @@ impl<M: Message> NetworkEngine<M> {
         if ticket.schema_id != shared.config.schema_id {
             return Err(NetworkError::SchemaMismatch);
         }
-        let target = ticket.endpoint_id();
-        if target == self.endpoint_id() {
+        if ticket.endpoint_id() == self.endpoint_id() {
             return Err(NetworkError::InvalidTicket(
                 "the ticket points to this peer itself".to_string(),
             ));
         }
-        if lock(&shared.peers).contains_key(&target) {
-            debug!(peer = %target, "reusing existing connection");
-            return Ok(target);
-        }
-
-        let request_timeout = shared.config.request_timeout;
-        let connection = timeout(
-            request_timeout,
-            shared.endpoint.connect(ticket.endpoint_addr, ALPN),
-        )
-        .await
-        .map_err(|_| NetworkError::Timeout)?
-        .map_err(|err| NetworkError::Transport(format!("failed to connect: {err}")))?;
-        // The remote identity comes from the authenticated Iroh connection,
-        // never from the ticket payload.
-        let peer_id = connection.remote_id();
-
-        let handshake = timeout(request_timeout, shared.run_client_handshake(&connection))
-            .await
-            .map_err(|_| NetworkError::Timeout)
-            .and_then(|res| res);
-        if let Err(err) = handshake {
-            connection.close(CLOSE_CODE_HANDSHAKE_REJECTED, b"handshake failed");
-            return Err(err);
-        }
-
-        let generation =
-            shared.register_connection(peer_id, connection.clone(), ConnectionDirection::Outgoing);
-        info!(peer = %peer_id, "peer connected (outgoing)");
-        shared
-            .emit(NetworkEvent::PeerConnected {
-                peer_id,
-                direction: ConnectionDirection::Outgoing,
-            })
-            .await;
-        let loop_shared = shared.clone();
-        shared.spawn_task(async move {
-            loop_shared
-                .connection_loop(peer_id, connection, generation)
-                .await;
-        });
-        Ok(peer_id)
+        shared.connect_to_addr(ticket.endpoint_addr).await
     }
 
     /// Sends a domain message to a connected peer.
@@ -719,6 +802,7 @@ impl<M: Message> NetworkEngine<M> {
             return Ok(());
         }
         info!("network engine shutting down");
+        let _ = shared.shutdown_signal.send(true);
 
         // Close all active connections.
         let states: Vec<PeerState> = lock(&shared.peers)

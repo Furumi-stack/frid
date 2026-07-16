@@ -106,11 +106,15 @@ impl ArtistDhtService {
     /// Starts the service: opens the database, starts the network engine,
     /// loads persisted contacts and spawns the maintenance tasks.
     pub async fn start(config: ArtistDhtConfig) -> Result<(Self, ArtistDhtEventReceiver)> {
-        let engine_config = NetworkConfig::builder()
+        let mut engine_builder = NetworkConfig::builder()
             .data_dir(&config.data_dir)
             .network_id(config.network_id)
             .schema_id(SchemaId::from_name(SCHEMA_NAME))
-            .request_timeout(config.transport_timeout)
+            .request_timeout(config.transport_timeout);
+        if let Some(rendezvous) = config.rendezvous.clone() {
+            engine_builder = engine_builder.rendezvous(rendezvous);
+        }
+        let engine_config = engine_builder
             .build()
             .map_err(|err| ArtistDhtError::Network(err.to_string()))?;
         let (engine, net_events) = NetworkEngine::start(engine_config).await?;

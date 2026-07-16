@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use federation_net::NetworkId;
+use federation_net::{NetworkId, RendezvousConfig};
 
 use crate::error::{ArtistDhtError, Result};
 
@@ -40,6 +40,10 @@ pub struct ArtistDhtConfig {
     /// establishing a connection through relays can take much longer than a
     /// request over an existing one.
     pub transport_timeout: Duration,
+    /// Automatic peer discovery over the mainline DHT: peers of the same
+    /// network find each other knowing nothing but the network id. `None`
+    /// disables it; peers are then connected via tickets only.
+    pub rendezvous: Option<RendezvousConfig>,
 }
 
 impl ArtistDhtConfig {
@@ -62,6 +66,7 @@ pub struct ArtistDhtConfigBuilder {
     request_timeout: Option<Duration>,
     lookup_timeout: Option<Duration>,
     transport_timeout: Option<Duration>,
+    rendezvous: Option<RendezvousConfig>,
 }
 
 impl ArtistDhtConfigBuilder {
@@ -107,6 +112,12 @@ impl ArtistDhtConfigBuilder {
         self
     }
 
+    /// Enables automatic peer discovery over the mainline DHT.
+    pub fn rendezvous(mut self, rendezvous: RendezvousConfig) -> Self {
+        self.rendezvous = Some(rendezvous);
+        self
+    }
+
     /// Validates and builds the configuration.
     pub fn build(self) -> Result<ArtistDhtConfig> {
         let data_dir = self
@@ -131,6 +142,7 @@ impl ArtistDhtConfigBuilder {
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             lookup_timeout: self.lookup_timeout.unwrap_or(DEFAULT_LOOKUP_TIMEOUT),
             transport_timeout: self.transport_timeout.unwrap_or(DEFAULT_TRANSPORT_TIMEOUT),
+            rendezvous: self.rendezvous,
         };
         for (name, value) in [
             ("republish_interval", config.republish_interval),

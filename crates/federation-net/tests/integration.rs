@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use federation_net::{
     ConnectionDirection, EndpointId, NetworkConfig, NetworkEngine, NetworkError, NetworkEvent,
-    NetworkEventReceiver, NetworkId, PeerTicket, SchemaId,
+    NetworkEventReceiver, NetworkId, PeerTicket, RendezvousConfig, SchemaId,
 };
 
 /// Hard cap on every test so a regression can never hang CI.
@@ -290,6 +290,68 @@ async fn disconnect_removes_peer() {
             matches!(err, NetworkError::PeerNotConnected(_)),
             "got {err:?}"
         );
+
+        engine_a.shutdown().await.expect("shutdown a");
+        engine_b.shutdown().await.expect("shutdown b");
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn rendezvous_discovers_peers_without_tickets() {
+    let _net = NET_LOCK.lock().await;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        // A local mainline DHT testnet replaces the public one, keeping the
+        // rendezvous traffic entirely on this machine.
+        let testnet = mainline::Testnet::builder(8)
+            .build()
+            .expect("mainline testnet");
+        let config = |dir: &Path| {
+            NetworkConfig::builder()
+                .data_dir(dir)
+                .network_id(NetworkId::from_name("rendezvous-test-net"))
+                .schema_id(SchemaId::from_name("test-schema-v1"))
+                .request_timeout(Duration::from_secs(10))
+                .rendezvous(RendezvousConfig {
+                    interval: Duration::from_secs(2),
+                    dht_bootstrap: Some(testnet.bootstrap.clone()),
+                    ..RendezvousConfig::default()
+                })
+                .build()
+                .expect("valid test config")
+        };
+
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let (engine_a, mut events_a): (Engine, Events) = NetworkEngine::start(config(dir_a.path()))
+            .await
+            .expect("engine a starts");
+        let (engine_b, mut events_b): (Engine, Events) = NetworkEngine::start(config(dir_b.path()))
+            .await
+            .expect("engine b starts");
+
+        // No tickets are exchanged: both peers only know the network id and
+        // must find each other through the rendezvous record. Discovery
+        // needs a few rendezvous rounds, so the wait is more generous than
+        // EVENT_TIMEOUT (which the usual helpers apply per event).
+        async fn wait_discovered(events: &mut Events, peer: EndpointId) {
+            loop {
+                match events.recv().await.expect("event channel open") {
+                    NetworkEvent::PeerConnected { peer_id, .. } if peer_id == peer => return,
+                    _ => {}
+                }
+            }
+        }
+        let discovery_timeout = Duration::from_secs(90);
+        tokio::time::timeout(discovery_timeout, async {
+            wait_discovered(&mut events_a, engine_b.endpoint_id()).await;
+            wait_discovered(&mut events_b, engine_a.endpoint_id()).await;
+        })
+        .await
+        .expect("peers did not discover each other via rendezvous");
+        assert_eq!(engine_a.connected_peers(), vec![engine_b.endpoint_id()]);
+        assert_eq!(engine_b.connected_peers(), vec![engine_a.endpoint_id()]);
 
         engine_a.shutdown().await.expect("shutdown a");
         engine_b.shutdown().await.expect("shutdown b");

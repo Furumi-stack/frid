@@ -13,6 +13,9 @@
 //! * [`NetworkId`] — isolates independent P2P networks from each other.
 //! * [`SchemaId`] — isolates applications with incompatible message schemas.
 //! * [`PeerTicket`] — a shareable string invitation used to reach a peer.
+//! * [`RendezvousConfig`] — optional automatic peer discovery: peers of a
+//!   network find each other through the BitTorrent Mainline DHT knowing
+//!   nothing but the network id.
 //! * [`NetworkEngine`] — the engine itself; [`NetworkEventReceiver`] delivers
 //!   [`NetworkEvent`]s to the application.
 //!
@@ -54,6 +57,7 @@ mod error;
 mod event;
 mod identity;
 mod protocol;
+mod rendezvous;
 mod ticket;
 mod wire;
 
@@ -65,6 +69,7 @@ pub use engine::{Message, NetworkEngine};
 pub use error::{NetworkError, Result};
 pub use event::{ConnectionDirection, NetworkEvent, NetworkEventReceiver};
 pub use protocol::{ALPN, NetworkId, PROTOCOL_VERSION, SchemaId};
+pub use rendezvous::{DEFAULT_RENDEZVOUS_ENTRY_TTL, DEFAULT_RENDEZVOUS_INTERVAL, RendezvousConfig};
 pub use ticket::{PeerTicket, TICKET_VERSION};
 
 // Re-exported Iroh types that appear in the public API.

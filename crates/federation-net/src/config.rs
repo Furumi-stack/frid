@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::error::{NetworkError, Result};
 use crate::protocol::{NetworkId, SchemaId};
+use crate::rendezvous::RendezvousConfig;
 
 /// Default maximum size of an encoded domain message (256 KiB).
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024;
@@ -34,6 +35,9 @@ pub struct NetworkConfig {
     pub event_channel_capacity: usize,
     /// Maximum number of concurrently processed streams per peer.
     pub max_concurrent_streams_per_peer: usize,
+    /// Automatic peer discovery over the mainline DHT; `None` disables it and
+    /// peers are connected via tickets only.
+    pub rendezvous: Option<RendezvousConfig>,
 }
 
 impl NetworkConfig {
@@ -56,6 +60,7 @@ pub struct NetworkConfigBuilder {
     request_timeout: Option<Duration>,
     event_channel_capacity: Option<usize>,
     max_concurrent_streams_per_peer: Option<usize>,
+    rendezvous: Option<RendezvousConfig>,
 }
 
 impl NetworkConfigBuilder {
@@ -98,6 +103,12 @@ impl NetworkConfigBuilder {
     /// Sets the maximum number of concurrently processed streams per peer.
     pub fn max_concurrent_streams_per_peer(mut self, limit: usize) -> Self {
         self.max_concurrent_streams_per_peer = Some(limit);
+        self
+    }
+
+    /// Enables automatic peer discovery over the mainline DHT.
+    pub fn rendezvous(mut self, rendezvous: RendezvousConfig) -> Self {
+        self.rendezvous = Some(rendezvous);
         self
     }
 
@@ -156,6 +167,19 @@ impl NetworkConfigBuilder {
             ));
         }
 
+        if let Some(rendezvous) = &self.rendezvous {
+            if rendezvous.interval.is_zero() {
+                return Err(NetworkError::InvalidConfig(
+                    "rendezvous interval must be greater than zero".into(),
+                ));
+            }
+            if rendezvous.entry_ttl.is_zero() {
+                return Err(NetworkError::InvalidConfig(
+                    "rendezvous entry_ttl must be greater than zero".into(),
+                ));
+            }
+        }
+
         Ok(NetworkConfig {
             data_dir,
             network_id,
@@ -164,6 +188,7 @@ impl NetworkConfigBuilder {
             request_timeout,
             event_channel_capacity,
             max_concurrent_streams_per_peer,
+            rendezvous: self.rendezvous,
         })
     }
 }
@@ -222,5 +247,29 @@ mod tests {
                 .build()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rendezvous_is_disabled_by_default_and_validated_when_set() {
+        let config = base_builder().build().expect("valid config");
+        assert!(config.rendezvous.is_none());
+
+        let config = base_builder()
+            .rendezvous(RendezvousConfig::default())
+            .build()
+            .expect("valid config");
+        assert!(config.rendezvous.is_some());
+
+        let zero_interval = RendezvousConfig {
+            interval: Duration::ZERO,
+            ..RendezvousConfig::default()
+        };
+        assert!(base_builder().rendezvous(zero_interval).build().is_err());
+
+        let zero_ttl = RendezvousConfig {
+            entry_ttl: Duration::ZERO,
+            ..RendezvousConfig::default()
+        };
+        assert!(base_builder().rendezvous(zero_ttl).build().is_err());
     }
 }

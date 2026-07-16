@@ -8,7 +8,8 @@ use std::sync::mpsc as std_mpsc;
 
 use anyhow::Context;
 use artist_dht::{
-    Artist, ArtistDhtConfig, ArtistDhtEvent, ArtistDhtService, NetworkId, PeerTicket, SearchOutcome,
+    Artist, ArtistDhtConfig, ArtistDhtEvent, ArtistDhtService, NetworkId, PeerTicket,
+    RendezvousConfig, SearchOutcome,
 };
 use clap::Parser;
 use rustyline::ExternalPrinter;
@@ -30,8 +31,15 @@ struct Args {
     name: String,
 
     /// Ticket(s) of peers to connect to on startup; may be repeated.
+    /// Optional: peers of the same network normally find each other
+    /// automatically through the mainline DHT.
     #[arg(long)]
     connect: Vec<String>,
+
+    /// Disable automatic peer discovery through the mainline DHT; only the
+    /// tickets given via --connect are used.
+    #[arg(long)]
+    no_bootstrap: bool,
 
     /// Enable verbose logging.
     #[arg(long)]
@@ -61,11 +69,13 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = ArtistDhtConfig::builder()
+    let mut config_builder = ArtistDhtConfig::builder()
         .data_dir(&args.data_dir)
-        .network_id(NetworkId::from_name(&args.network_id))
-        .build()
-        .context("invalid configuration")?;
+        .network_id(NetworkId::from_name(&args.network_id));
+    if !args.no_bootstrap {
+        config_builder = config_builder.rendezvous(RendezvousConfig::default());
+    }
+    let config = config_builder.build().context("invalid configuration")?;
 
     let (service, mut events) = ArtistDhtService::start(config)
         .await
@@ -96,7 +106,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    if args.connect.is_empty() {
+    if !args.no_bootstrap {
+        println!(
+            "Discovering '{}' peers via the mainline DHT... (may take up to a minute)",
+            args.network_id
+        );
+    } else if args.connect.is_empty() {
         println!("Waiting for peers... (share the ticket above)");
     }
     println!("Type /help for commands.");
