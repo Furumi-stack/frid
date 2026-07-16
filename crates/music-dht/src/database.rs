@@ -228,12 +228,15 @@ impl Database {
 
     /// Returns non-expired replicas stored under `key`, including tombstones
     /// (they inform other peers about deletions). Capped at
-    /// [`MAX_RECORDS_PER_RESPONSE`].
+    /// [`MAX_RECORDS_PER_RESPONSE`] with a deterministic order (freshest
+    /// replicas first), so an overfull bucket always returns the same
+    /// subset instead of an arbitrary one.
     pub async fn dht_records_by_key(&self, key: DhtKey, now_ms: u64) -> Result<Vec<StoredRecord>> {
         self.call(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT payload FROM dht_records
                  WHERE dht_key = ?1 AND expires_at_ms > ?2
+                 ORDER BY expires_at_ms DESC, artist_id
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(

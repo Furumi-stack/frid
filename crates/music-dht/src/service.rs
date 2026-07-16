@@ -163,6 +163,9 @@ impl MusicDhtService {
             .data_dir(&config.data_dir)
             .network_id(config.network_id)
             .schema_id(SchemaId::from_name(SCHEMA_NAME))
+            // A full FindValue response (MAX_RECORDS_PER_RESPONSE records
+            // with long names and artist lists) must fit into one frame.
+            .max_message_size(1024 * 1024)
             .request_timeout(config.transport_timeout);
         if let Some(rendezvous) = config.rendezvous.clone() {
             engine_builder = engine_builder.rendezvous(rendezvous);

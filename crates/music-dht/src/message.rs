@@ -13,7 +13,7 @@ pub const DHT_PROTOCOL_VERSION: u16 = 1;
 /// Maximum number of contacts in a single [`PeerExchange`].
 pub const MAX_PEER_EXCHANGE_CONTACTS: usize = 32;
 /// Maximum number of records in a single [`FindValueResponse`].
-pub const MAX_RECORDS_PER_RESPONSE: usize = 100;
+pub const MAX_RECORDS_PER_RESPONSE: usize = 256;
 
 /// Correlates a response with its request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
