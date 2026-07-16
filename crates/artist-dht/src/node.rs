@@ -4,10 +4,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use federation_net::{EndpointId, NetworkEngine, NetworkEvent, NetworkEventReceiver, PeerTicket};
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -28,6 +29,29 @@ use crate::service::{ArtistDhtEvent, PublishStats};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Base of the exponential backoff applied to a contact after a failed dial.
+const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Upper bound of the dial backoff.
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
+/// Consecutive failed dials after which a contact is evicted entirely.
+const DIAL_FAILURES_BEFORE_EVICT: u32 = 5;
+
+/// Dial-failure state of one currently unreachable contact.
+#[derive(Debug, Clone, Copy)]
+struct DialFailure {
+    consecutive: u32,
+    last_attempt_ms: u64,
+}
+
+/// How long a contact is skipped after `consecutive` failed dials:
+/// 30s, 1m, 2m, 4m, 8m, then capped at 10 minutes.
+fn dial_backoff(consecutive: u32) -> Duration {
+    let exponent = consecutive.saturating_sub(1).min(8);
+    DIAL_BACKOFF_BASE
+        .saturating_mul(1u32 << exponent)
+        .min(DIAL_BACKOFF_MAX)
 }
 
 /// An outbound DHT request, before it is wrapped in an envelope.
@@ -63,6 +87,8 @@ pub(crate) struct Node {
     hello_sent: Mutex<HashSet<EndpointId>>,
     /// Peers we already gossiped contacts to (per connection).
     exchange_sent: Mutex<HashSet<EndpointId>>,
+    /// Contacts that recently failed to dial, with their backoff state.
+    dial_failures: Mutex<HashMap<EndpointId, DialFailure>>,
     events: Mutex<Option<mpsc::Sender<ArtistDhtEvent>>>,
     /// Set once the post-startup republish has been triggered.
     initial_republish_done: AtomicBool,
@@ -88,6 +114,7 @@ impl Node {
             pending: PendingRequests::default(),
             hello_sent: Mutex::new(HashSet::new()),
             exchange_sent: Mutex::new(HashSet::new()),
+            dial_failures: Mutex::new(HashMap::new()),
             events: Mutex::new(Some(events)),
             initial_republish_done: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -193,6 +220,7 @@ impl Node {
             match event {
                 NetworkEvent::PeerConnected { peer_id, .. } => {
                     debug!(peer = %peer_id, "peer connected");
+                    self.clear_dial_failures(&peer_id);
                     self.emit(ArtistDhtEvent::PeerConnected { peer_id }).await;
                     self.send_hello(peer_id).await;
                 }
@@ -427,6 +455,9 @@ impl Node {
 
     /// Makes sure a connection to the contact exists, dialing its ticket if
     /// necessary. The Hello exchange runs asynchronously via the event loop.
+    ///
+    /// On-demand dials are bounded by the (short) `dial_timeout` and feed the
+    /// dial-failure backoff, so unreachable contacts cannot stall lookups.
     async fn ensure_connected(&self, contact: &NodeContact) -> Result<EndpointId> {
         self.ensure_running()?;
         if self.engine.is_connected(contact.peer_id) {
@@ -437,8 +468,71 @@ impl Node {
             .parse()
             .map_err(|err| ArtistDhtError::InvalidTicket(format!("{err}")))?;
         debug!(peer = %contact.peer_id, "connecting on demand");
-        let peer = self.engine.connect(ticket).await?;
-        Ok(peer)
+        let result = timeout(self.config.dial_timeout, self.engine.connect(ticket))
+            .await
+            .map_err(|_| ArtistDhtError::Timeout)
+            .and_then(|res| res.map_err(Into::into));
+        match result {
+            Ok(peer) => {
+                self.clear_dial_failures(&peer);
+                Ok(peer)
+            }
+            Err(err) => {
+                self.note_dial_failure(contact).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Forgets the dial-failure history of a peer (it proved reachable).
+    fn clear_dial_failures(&self, peer: &EndpointId) {
+        lock(&self.dial_failures).remove(peer);
+    }
+
+    /// `true` if the contact recently failed to dial and its backoff window
+    /// has not elapsed yet. Connected peers are never considered backed off.
+    fn dial_backoff_active(&self, peer: &EndpointId, now_ms: u64) -> bool {
+        if self.engine.is_connected(*peer) {
+            return false;
+        }
+        match lock(&self.dial_failures).get(peer) {
+            Some(failure) => {
+                let backoff = dial_backoff(failure.consecutive).as_millis() as u64;
+                now_ms < failure.last_attempt_ms.saturating_add(backoff)
+            }
+            None => false,
+        }
+    }
+
+    /// Records a failed dial; after [`DIAL_FAILURES_BEFORE_EVICT`] failures
+    /// in a row the contact is dropped from the routing table and the
+    /// database (gossip re-adds it with a clean slate if it comes back).
+    async fn note_dial_failure(&self, contact: &NodeContact) {
+        let consecutive = {
+            let mut failures = lock(&self.dial_failures);
+            let failure = failures.entry(contact.peer_id).or_insert(DialFailure {
+                consecutive: 0,
+                last_attempt_ms: 0,
+            });
+            failure.consecutive += 1;
+            failure.last_attempt_ms = now_ms();
+            failure.consecutive
+        };
+        if consecutive < DIAL_FAILURES_BEFORE_EVICT {
+            debug!(
+                peer = %contact.peer_id,
+                consecutive,
+                backoff_s = dial_backoff(consecutive).as_secs(),
+                "dial failed; backing off"
+            );
+            return;
+        }
+        lock(&self.dial_failures).remove(&contact.peer_id);
+        lock(&self.routing).remove(&contact.peer_id);
+        if let Err(err) = self.db.delete_known_peer(contact.peer_id).await {
+            warn!(error = %err, "failed to delete evicted peer from the database");
+        }
+        info!(peer = %contact.peer_id, "evicted unreachable DHT contact");
     }
 
     /// Sends one request and awaits its response, cleaning up the pending
@@ -451,6 +545,9 @@ impl Node {
         let peer = self.ensure_connected(contact).await?;
         let request_id = RequestId::random();
         let receiver = self.pending.register(request_id, peer)?;
+        // Lookups may cancel this future (early exit); the guard makes sure
+        // the pending entry never outlives it.
+        let _cleanup = self.pending.remove_on_drop(request_id);
         tracing::trace!(pending = self.pending.len(), peer = %peer, "sending DHT request");
         let message = match request {
             OutboundRequest::Ping => ArtistDhtMessage::Ping(RequestEnvelope {
@@ -470,23 +567,14 @@ impl Node {
                 payload,
             }),
         };
-        if let Err(err) = self.send_message(peer, &message).await {
-            self.pending.remove(&request_id);
-            return Err(err);
-        }
+        self.send_message(peer, &message).await?;
         match timeout(self.config.request_timeout, receiver).await {
             Ok(Ok(response)) => {
                 lock(&self.routing).touch(&peer, now_ms());
                 Ok(response)
             }
-            Ok(Err(_)) => {
-                self.pending.remove(&request_id);
-                Err(ArtistDhtError::Protocol("response channel closed".into()))
-            }
-            Err(_) => {
-                self.pending.remove(&request_id);
-                Err(ArtistDhtError::Timeout)
-            }
+            Ok(Err(_)) => Err(ArtistDhtError::Protocol("response channel closed".into())),
+            Err(_) => Err(ArtistDhtError::Timeout),
         }
     }
 
@@ -514,13 +602,15 @@ impl Node {
     ///
     /// With `find_value: None` this is a node lookup converging on the
     /// closest known nodes to `target`; with `Some(key)` it sends `FindValue`
-    /// and stops as soon as records are found. Never broadcasts: at most
-    /// [`ALPHA`] requests run concurrently and at most
-    /// [`MAX_LOOKUP_REQUESTS`] are sent in total, all bounded by the lookup
-    /// timeout.
+    /// and returns as soon as the **first** records arrive — in-flight
+    /// requests to slower or unreachable peers are cancelled instead of
+    /// awaited. Contacts in dial backoff are skipped. Never broadcasts: at
+    /// most [`ALPHA`] requests run concurrently and at most
+    /// [`MAX_LOOKUP_REQUESTS`] are sent in total, all hard-bounded by the
+    /// lookup timeout.
     pub async fn lookup(&self, target: [u8; 32], find_value: Option<DhtKey>) -> LookupOutcome {
         let started = Instant::now();
-        let deadline = started + self.config.lookup_timeout;
+        let deadline = tokio::time::Instant::now() + self.config.lookup_timeout;
         let mut candidates: Vec<NodeContact> = lock(&self.routing).closest(&target, K);
         let mut known: HashSet<EndpointId> =
             candidates.iter().map(|contact| contact.peer_id).collect();
@@ -531,16 +621,20 @@ impl Node {
 
         debug!(target = %NodeId::from_bytes(target), seeds = candidates.len(), "lookup started");
 
-        loop {
-            if Instant::now() >= deadline {
+        'rounds: loop {
+            if tokio::time::Instant::now() >= deadline {
                 debug!("lookup deadline reached");
                 break;
             }
             candidates.sort_by_key(|contact| distance(contact.node_id.as_bytes(), &target));
             let budget = MAX_LOOKUP_REQUESTS.saturating_sub(sent);
+            let round_now = now_ms();
             let batch: Vec<NodeContact> = candidates
                 .iter()
-                .filter(|contact| !queried.contains(&contact.peer_id))
+                .filter(|contact| {
+                    !queried.contains(&contact.peer_id)
+                        && !self.dial_backoff_active(&contact.peer_id, round_now)
+                })
                 .take(ALPHA.min(budget))
                 .cloned()
                 .collect();
@@ -552,19 +646,25 @@ impl Node {
                 queried.insert(contact.peer_id);
             }
 
-            let futures = batch.iter().map(|contact| {
-                let request = match find_value {
-                    Some(key) => OutboundRequest::FindValue(FindValueRequest { key }),
-                    None => OutboundRequest::FindNode(FindNodeRequest {
-                        target: NodeId::from_bytes(target),
-                    }),
+            // Process responses as they complete: one dead contact must not
+            // hold back the answers of the live ones.
+            let mut in_flight: FuturesUnordered<_> = batch
+                .iter()
+                .map(|contact| async move {
+                    let request = match find_value {
+                        Some(key) => OutboundRequest::FindValue(FindValueRequest { key }),
+                        None => OutboundRequest::FindNode(FindNodeRequest {
+                            target: NodeId::from_bytes(target),
+                        }),
+                    };
+                    (contact, self.request(contact, request).await)
+                })
+                .collect();
+            while let Ok(next) = tokio::time::timeout_at(deadline, in_flight.next()).await {
+                let Some((contact, result)) = next else {
+                    break; // The round is complete.
                 };
-                self.request(contact, request)
-            });
-            let results = join_all(futures).await;
-
-            let mut found_records = false;
-            for (contact, result) in batch.iter().zip(results) {
+                let mut found_records = false;
                 let nodes = match result {
                     Ok(DhtResponse::FindNode(response)) => response.nodes,
                     Ok(DhtResponse::FindValue(FindValueResponse::Records { records: found })) => {
@@ -599,8 +699,13 @@ impl Node {
                         last_seen_ms: now_ms(),
                     });
                 }
+                if find_value.is_some() && found_records {
+                    // Dropping `in_flight` cancels the outstanding requests.
+                    break 'rounds;
+                }
             }
-            if find_value.is_some() && found_records {
+            if tokio::time::Instant::now() >= deadline {
+                debug!("lookup deadline reached");
                 break;
             }
             if sent >= MAX_LOOKUP_REQUESTS {
@@ -609,6 +714,10 @@ impl Node {
             }
         }
 
+        // The closest set feeds publishes (store targets); contacts that are
+        // currently backed off would only burn a dial timeout each.
+        let closest_now = now_ms();
+        candidates.retain(|contact| !self.dial_backoff_active(&contact.peer_id, closest_now));
         candidates.sort_by_key(|contact| distance(contact.node_id.as_bytes(), &target));
         candidates.truncate(K);
         info!(
@@ -777,6 +886,17 @@ mod tests {
             ticket: format!("fnet-test-{seed}"),
             last_seen_ms: 0,
         }
+    }
+
+    #[test]
+    fn dial_backoff_doubles_and_is_capped() {
+        assert_eq!(dial_backoff(1), Duration::from_secs(30));
+        assert_eq!(dial_backoff(2), Duration::from_secs(60));
+        assert_eq!(dial_backoff(3), Duration::from_secs(120));
+        assert_eq!(dial_backoff(5), Duration::from_secs(480));
+        // Capped at the maximum from the 6th failure on, even for huge counts.
+        assert_eq!(dial_backoff(6), DIAL_BACKOFF_MAX);
+        assert_eq!(dial_backoff(u32::MAX), DIAL_BACKOFF_MAX);
     }
 
     #[test]

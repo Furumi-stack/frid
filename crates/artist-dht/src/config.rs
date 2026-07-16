@@ -17,6 +17,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default timeout for transport operations (dialing, handshakes, sends).
 pub const DEFAULT_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default timeout for on-demand dials during DHT operations.
+pub const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for an [`crate::ArtistDhtService`].
 ///
@@ -40,6 +42,12 @@ pub struct ArtistDhtConfig {
     /// establishing a connection through relays can take much longer than a
     /// request over an existing one.
     pub transport_timeout: Duration,
+    /// Timeout for dialing a contact **on demand during DHT operations**
+    /// (lookups, publishes). Deliberately shorter than `transport_timeout`:
+    /// a dead contact must not stall a whole lookup, and a peer that needs
+    /// longer than this to dial will still be reached by the periodic
+    /// rendezvous/republish machinery.
+    pub dial_timeout: Duration,
     /// Automatic peer discovery over the mainline DHT: peers of the same
     /// network find each other knowing nothing but the network id. `None`
     /// disables it; peers are then connected via tickets only.
@@ -66,6 +74,7 @@ pub struct ArtistDhtConfigBuilder {
     request_timeout: Option<Duration>,
     lookup_timeout: Option<Duration>,
     transport_timeout: Option<Duration>,
+    dial_timeout: Option<Duration>,
     rendezvous: Option<RendezvousConfig>,
 }
 
@@ -112,6 +121,12 @@ impl ArtistDhtConfigBuilder {
         self
     }
 
+    /// Sets the timeout for on-demand dials during DHT operations.
+    pub fn dial_timeout(mut self, timeout: Duration) -> Self {
+        self.dial_timeout = Some(timeout);
+        self
+    }
+
     /// Enables automatic peer discovery over the mainline DHT.
     pub fn rendezvous(mut self, rendezvous: RendezvousConfig) -> Self {
         self.rendezvous = Some(rendezvous);
@@ -142,6 +157,7 @@ impl ArtistDhtConfigBuilder {
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             lookup_timeout: self.lookup_timeout.unwrap_or(DEFAULT_LOOKUP_TIMEOUT),
             transport_timeout: self.transport_timeout.unwrap_or(DEFAULT_TRANSPORT_TIMEOUT),
+            dial_timeout: self.dial_timeout.unwrap_or(DEFAULT_DIAL_TIMEOUT),
             rendezvous: self.rendezvous,
         };
         for (name, value) in [
@@ -150,6 +166,7 @@ impl ArtistDhtConfigBuilder {
             ("request_timeout", config.request_timeout),
             ("lookup_timeout", config.lookup_timeout),
             ("transport_timeout", config.transport_timeout),
+            ("dial_timeout", config.dial_timeout),
         ] {
             if value.is_zero() {
                 return Err(ArtistDhtError::Database(format!(

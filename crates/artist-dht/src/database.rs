@@ -327,6 +327,18 @@ impl Database {
         .await
     }
 
+    /// Deletes a persisted peer contact (e.g. after repeated failed dials).
+    pub async fn delete_known_peer(&self, peer_id: EndpointId) -> Result<()> {
+        self.call(move |conn| {
+            conn.execute(
+                "DELETE FROM known_peers WHERE peer_id = ?1",
+                params![peer_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Loads all persisted peer contacts.
     pub async fn load_known_peers(&self) -> Result<Vec<NodeContact>> {
         self.call(|conn| {

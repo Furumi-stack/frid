@@ -165,6 +165,17 @@ impl RoutingTable {
         false
     }
 
+    /// Removes a contact by its transport id. Returns `true` if it was known.
+    pub fn remove(&mut self, peer_id: &EndpointId) -> bool {
+        for bucket in &mut self.buckets {
+            if let Some(index) = bucket.iter().position(|entry| &entry.peer_id == peer_id) {
+                bucket.remove(index);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Looks up a contact by its transport id.
     pub fn get(&self, peer_id: &EndpointId) -> Option<NodeContact> {
         self.buckets
@@ -301,6 +312,18 @@ mod tests {
         // The oldest contacts (smallest last_seen_ms) were evicted.
         let contacts = table.contacts();
         assert!(contacts.iter().all(|c| c.last_seen_ms >= 4));
+    }
+
+    #[test]
+    fn remove_deletes_contact() {
+        let own = NodeId::from_bytes([0u8; 32]);
+        let mut table = RoutingTable::new(own);
+        table.upsert(contact(1, 10));
+        table.upsert(contact(2, 10));
+        assert!(table.remove(&test_peer(1)));
+        assert!(!table.remove(&test_peer(1)));
+        assert_eq!(table.len(), 1);
+        assert!(table.get(&test_peer(1)).is_none());
     }
 
     #[test]

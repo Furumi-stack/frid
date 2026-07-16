@@ -88,9 +88,31 @@ impl PendingRequests {
         lock(&self.map).remove(request_id);
     }
 
+    /// Returns a guard that removes the entry when dropped, making a request
+    /// future safe to cancel (e.g. when a lookup exits early). Removing an
+    /// already-completed entry is a no-op.
+    pub fn remove_on_drop(&self, request_id: RequestId) -> PendingCleanup<'_> {
+        PendingCleanup {
+            pending: self,
+            request_id,
+        }
+    }
+
     /// Number of currently pending requests.
     pub fn len(&self) -> usize {
         lock(&self.map).len()
+    }
+}
+
+/// Removes a pending entry on drop; see [`PendingRequests::remove_on_drop`].
+pub(crate) struct PendingCleanup<'a> {
+    pending: &'a PendingRequests,
+    request_id: RequestId,
+}
+
+impl Drop for PendingCleanup<'_> {
+    fn drop(&mut self) {
+        self.pending.remove(&self.request_id);
     }
 }
 

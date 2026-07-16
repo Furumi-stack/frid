@@ -128,7 +128,15 @@ max records per FindValue response = 100
 max artist name = 512 bytes, max tokens = 32
 max pending requests = 1024
 request timeout = 5 s, lookup timeout = 15 s
+on-demand dial timeout = 5 s
+dial backoff = 30 s doubling up to 10 min, eviction after 5 failures
 ```
+
+Value lookups return as soon as the first records arrive; in-flight requests
+to slower or dead contacts are cancelled. Contacts that failed to dial are
+skipped for an exponentially growing backoff window and evicted after five
+consecutive failures (peer exchange re-adds them with a clean slate if they
+come back).
 
 ## Library usage
 
