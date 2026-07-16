@@ -52,6 +52,9 @@ pub struct MusicDhtConfig {
     /// network find each other knowing nothing but the network id. `None`
     /// disables it; peers are then connected via tickets only.
     pub rendezvous: Option<RendezvousConfig>,
+    /// Auxiliary ALPN protocols on which this peer accepts raw byte streams
+    /// (see [`crate::MusicDhtService::stream_acceptor`]).
+    pub stream_protocols: Vec<Vec<u8>>,
 }
 
 impl MusicDhtConfig {
@@ -76,6 +79,7 @@ pub struct MusicDhtConfigBuilder {
     transport_timeout: Option<Duration>,
     dial_timeout: Option<Duration>,
     rendezvous: Option<RendezvousConfig>,
+    stream_protocols: Vec<Vec<u8>>,
 }
 
 impl MusicDhtConfigBuilder {
@@ -133,6 +137,15 @@ impl MusicDhtConfigBuilder {
         self
     }
 
+    /// Declares an auxiliary ALPN protocol on which this peer accepts raw
+    /// byte streams (see [`crate::MusicDhtService::stream_acceptor`]). May
+    /// be called multiple times, once per protocol. The ALPNs are validated
+    /// by the underlying network engine on service start.
+    pub fn stream_protocol(mut self, alpn: impl Into<Vec<u8>>) -> Self {
+        self.stream_protocols.push(alpn.into());
+        self
+    }
+
     /// Validates and builds the configuration.
     pub fn build(self) -> Result<MusicDhtConfig> {
         let data_dir = self
@@ -157,6 +170,7 @@ impl MusicDhtConfigBuilder {
             transport_timeout: self.transport_timeout.unwrap_or(DEFAULT_TRANSPORT_TIMEOUT),
             dial_timeout: self.dial_timeout.unwrap_or(DEFAULT_DIAL_TIMEOUT),
             rendezvous: self.rendezvous,
+            stream_protocols: self.stream_protocols,
         };
         for (name, value) in [
             ("republish_interval", config.republish_interval),

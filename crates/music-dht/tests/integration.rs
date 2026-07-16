@@ -187,3 +187,72 @@ async fn library_sync_and_distributed_search() {
     .await
     .expect("test timed out");
 }
+
+/// Two nodes exchange raw bytes over an auxiliary stream protocol: the
+/// requester finds an item through the DHT and then opens a byte stream to
+/// its owner (the flow a file-transfer application follows).
+#[tokio::test]
+async fn byte_stream_to_item_owner() {
+    let _net = NET_LOCK.lock().await;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        const BLOB_ALPN: &[u8] = b"music-test/blob/1";
+
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+
+        // Node A owns the library and serves byte streams.
+        let config_a = MusicDhtConfig::builder()
+            .data_dir(dir_a.path())
+            .network_id(NetworkId::from_name("stream-test-net"))
+            .request_timeout(Duration::from_secs(5))
+            .lookup_timeout(Duration::from_secs(10))
+            .stream_protocol(BLOB_ALPN)
+            .build()
+            .expect("valid config");
+        let (node_a, _events_a) = MusicDhtService::start(config_a)
+            .await
+            .expect("service starts");
+        let mut acceptor = node_a.stream_acceptor(BLOB_ALPN).expect("acceptor");
+        let payload = b"pretend this is FLAC".to_vec();
+        let served = payload.clone();
+        let serve_task = tokio::spawn(async move {
+            let mut stream = acceptor.accept().await.expect("incoming stream");
+            stream.send.write_all(&served).await.expect("write");
+            stream.send.finish().expect("finish");
+            let _ = stream.send.stopped().await;
+            stream.peer_id
+        });
+        node_a
+            .sync_library(vec![spec("track:1", ItemKind::Track, "Teardrop", &["Massive Attack"])])
+            .await
+            .expect("sync");
+
+        // Node B joins via ticket and finds the track and its owner.
+        let (node_b, _events_b) = start(dir_b.path(), "stream-test-net").await;
+        let ticket = node_a.ticket().await.expect("ticket");
+        node_b.connect(ticket).await.expect("connect");
+        let owner = search_until("the track by name", &node_b, "teardrop", |items| {
+            !items.is_empty()
+        })
+        .await
+        .pop()
+        .expect("found item")
+        .owner;
+        assert_eq!(owner, node_a.endpoint_id());
+
+        // B streams the bytes from the owner.
+        let mut stream = node_b.open_stream(owner, BLOB_ALPN).await.expect("open stream");
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while let Some(n) = stream.recv.read(&mut chunk).await.expect("read") {
+            received.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(received, payload);
+        assert_eq!(serve_task.await.expect("serve task"), node_b.endpoint_id());
+
+        node_a.shutdown().await.expect("shutdown a");
+        node_b.shutdown().await.expect("shutdown b");
+    })
+    .await
+    .expect("test timed out");
+}

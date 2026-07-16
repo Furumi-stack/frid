@@ -105,4 +105,7 @@ pub use service::{
 };
 
 // Re-exported types from the transport layer that appear in this API.
-pub use federation_net::{EndpointId, NetworkId, PeerTicket, RendezvousConfig};
+pub use federation_net::{
+    ByteStream, EndpointAddr, EndpointId, NetworkId, PeerTicket, RecvStream, RendezvousConfig,
+    SendStream, StreamAcceptor,
+};

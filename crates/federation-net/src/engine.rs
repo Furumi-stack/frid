@@ -50,6 +50,10 @@ const REJECT_LINGER: Duration = Duration::from_secs(3);
 const SHUTDOWN_TASK_GRACE: Duration = Duration::from_secs(5);
 /// Upper bound of the rendezvous round delay while no peer is connected yet.
 const RENDEZVOUS_LONELY_INTERVAL: Duration = Duration::from_secs(15);
+/// Capacity of the queue of accepted-but-not-yet-consumed incoming byte
+/// streams, per stream protocol. A full queue delays the handshake ack of
+/// further incoming streams (natural backpressure).
+const STREAM_ACCEPT_QUEUE: usize = 16;
 
 /// Bounds required of a domain message type.
 ///
@@ -77,6 +81,76 @@ struct PeerState {
     generation: u64,
 }
 
+/// A raw bidirectional byte stream to a peer, running over a dedicated
+/// connection on an auxiliary ALPN.
+///
+/// Returned by [`NetworkEngine::open_stream`] (outgoing) and by
+/// [`StreamAcceptor::accept`] (incoming). Both sides passed the regular
+/// network handshake, so the peer is authenticated and belongs to the same
+/// network and schema. The connection behind the stream closes when both
+/// halves are dropped.
+pub struct ByteStream {
+    /// The authenticated peer on the other side of the stream.
+    pub peer_id: EndpointId,
+    /// The sending half of the stream.
+    pub send: SendStream,
+    /// The receiving half of the stream.
+    pub recv: RecvStream,
+    /// Keeps the dedicated connection alive for the lifetime of the stream.
+    _connection: Connection,
+}
+
+impl fmt::Debug for ByteStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ByteStream")
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Receiver of incoming [`ByteStream`]s for one declared stream protocol.
+///
+/// Obtained once per protocol from [`NetworkEngine::stream_acceptor`].
+/// Dropping the acceptor makes the engine refuse further incoming streams
+/// on that protocol.
+pub struct StreamAcceptor {
+    alpn: Vec<u8>,
+    rx: mpsc::Receiver<ByteStream>,
+}
+
+impl StreamAcceptor {
+    /// Waits for the next incoming stream.
+    ///
+    /// Returns `None` after the engine shut down.
+    pub async fn accept(&mut self) -> Option<ByteStream> {
+        self.rx.recv().await
+    }
+
+    /// The ALPN of the stream protocol this acceptor serves.
+    pub fn alpn(&self) -> &[u8] {
+        &self.alpn
+    }
+}
+
+impl fmt::Debug for StreamAcceptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamAcceptor")
+            .field("alpn", &String::from_utf8_lossy(&self.alpn))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Producer/consumer pair behind one declared stream protocol.
+struct StreamAcceptorSlot {
+    sender: mpsc::Sender<ByteStream>,
+    /// Taken (once) by [`NetworkEngine::stream_acceptor`].
+    receiver: Option<mpsc::Receiver<ByteStream>>,
+}
+
+fn alpn_display(alpn: &[u8]) -> String {
+    String::from_utf8_lossy(alpn).into_owned()
+}
+
 /// State shared between the engine handles, the protocol handler and all
 /// background tasks.
 struct Shared<M> {
@@ -84,6 +158,7 @@ struct Shared<M> {
     endpoint: Endpoint,
     router: Mutex<Option<Router>>,
     peers: Mutex<HashMap<EndpointId, PeerState>>,
+    stream_acceptors: Mutex<HashMap<Vec<u8>, StreamAcceptorSlot>>,
     events: Mutex<Option<mpsc::Sender<NetworkEvent<M>>>>,
     tasks: Mutex<JoinSet<()>>,
     next_generation: AtomicU64,
@@ -402,6 +477,106 @@ impl<M: Message> Shared<M> {
         Ok(())
     }
 
+    /// Handles a freshly accepted connection on an auxiliary stream ALPN:
+    /// validates the stream handshake and hands the byte stream over to the
+    /// application through the protocol's acceptor.
+    ///
+    /// Unlike message connections, stream connections are not registered in
+    /// the peer registry: their lifecycle belongs entirely to the returned
+    /// [`ByteStream`].
+    async fn handle_incoming_stream(&self, connection: &Connection, alpn: &[u8]) -> Result<()> {
+        let peer_id = connection.remote_id();
+        if self.is_shutting_down() {
+            connection.close(CLOSE_CODE_SHUTDOWN, b"engine is shutting down");
+            return Err(NetworkError::ShuttingDown);
+        }
+        debug!(peer = %peer_id, alpn = %alpn_display(alpn), "incoming byte stream");
+        let request_timeout = self.config.request_timeout;
+
+        let (mut send, mut recv) = timeout(request_timeout, connection.accept_bi())
+            .await
+            .map_err(|_| NetworkError::Timeout)
+            .and_then(|res| {
+                res.map_err(|err| {
+                    NetworkError::Transport(format!("failed to accept stream handshake: {err}"))
+                })
+            })
+            .inspect_err(|_| {
+                connection.close(CLOSE_CODE_HANDSHAKE_REJECTED, b"stream handshake failed");
+            })?;
+
+        let handshake: Result<Handshake> = timeout(
+            request_timeout,
+            wire::read_frame(&mut recv, MAX_HANDSHAKE_FRAME_SIZE),
+        )
+        .await
+        .map_err(|_| NetworkError::Timeout)
+        .and_then(|res| res);
+
+        let verdict = match &handshake {
+            Ok(handshake) => self.validate_handshake(handshake),
+            Err(_) => Some(HandshakeErrorCode::InvalidHandshake),
+        };
+        if let Some(code) = verdict {
+            warn!(peer = %peer_id, code = ?code, "stream handshake rejected");
+            let ack = HandshakeAck {
+                accepted: false,
+                error: Some(code),
+            };
+            let sent = timeout(
+                request_timeout,
+                wire::write_frame(&mut send, &ack, MAX_HANDSHAKE_FRAME_SIZE),
+            )
+            .await;
+            if matches!(sent, Ok(Ok(()))) {
+                let _ = send.finish();
+                let _ = timeout(REJECT_LINGER, connection.closed()).await;
+            }
+            connection.close(CLOSE_CODE_HANDSHAKE_REJECTED, b"stream handshake rejected");
+            return Err(handshake_code_to_error(code));
+        }
+
+        // Reserve a queue slot before acking so a stream the application
+        // will never consume is refused instead of silently dying after an
+        // accepted handshake. A full queue delays the ack (backpressure).
+        let sender = lock(&self.stream_acceptors)
+            .get(alpn)
+            .map(|slot| slot.sender.clone())
+            .ok_or_else(|| NetworkError::UnknownStreamProtocol(alpn_display(alpn)))?;
+        let Ok(permit) = sender.reserve().await else {
+            connection.close(CLOSE_CODE_HANDSHAKE_REJECTED, b"stream acceptor closed");
+            return Err(NetworkError::Transport(
+                "the stream acceptor was dropped by the application".to_string(),
+            ));
+        };
+
+        let ack = HandshakeAck {
+            accepted: true,
+            error: None,
+        };
+        timeout(
+            request_timeout,
+            wire::write_frame(&mut send, &ack, MAX_HANDSHAKE_FRAME_SIZE),
+        )
+        .await
+        .map_err(|_| NetworkError::Timeout)
+        .and_then(|res| res)
+        .inspect_err(|_| {
+            connection.close(CLOSE_CODE_HANDSHAKE_REJECTED, b"stream handshake failed");
+        })?;
+        // The stream is deliberately not finished: the application payload
+        // follows on the same stream pair.
+
+        info!(peer = %peer_id, alpn = %alpn_display(alpn), "byte stream accepted");
+        permit.send(ByteStream {
+            peer_id,
+            send,
+            recv,
+            _connection: connection.clone(),
+        });
+        Ok(())
+    }
+
     /// Dials `addr`, runs the client handshake and registers the connection.
     ///
     /// An existing healthy connection to the same peer is reused. The remote
@@ -570,6 +745,43 @@ impl<M: Message> ProtocolHandler for FederationProtocol<M> {
     }
 }
 
+/// Protocol handler registered with the Iroh [`Router`] for one auxiliary
+/// stream ALPN declared in the configuration.
+struct StreamProtocol<M> {
+    shared: Weak<Shared<M>>,
+    alpn: Vec<u8>,
+}
+
+impl<M> fmt::Debug for StreamProtocol<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamProtocol")
+            .field("alpn", &alpn_display(&self.alpn))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M: Message> ProtocolHandler for StreamProtocol<M> {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let Some(shared) = self.shared.upgrade() else {
+            connection.close(CLOSE_CODE_SHUTDOWN, b"engine is gone");
+            return Ok(());
+        };
+        let peer_id = connection.remote_id();
+        if let Err(err) = shared.handle_incoming_stream(&connection, &self.alpn).await {
+            shared
+                .report_protocol_error(
+                    Some(peer_id),
+                    format!(
+                        "incoming byte stream on {} failed: {err}",
+                        alpn_display(&self.alpn)
+                    ),
+                )
+                .await;
+        }
+        Ok(())
+    }
+}
+
 /// A generic peer-to-peer network engine on top of Iroh.
 ///
 /// `M` is the application-defined domain message type; the engine treats it
@@ -608,11 +820,26 @@ impl<M: Message> NetworkEngine<M> {
             .map_err(|err| NetworkError::Transport(format!("failed to bind endpoint: {err}")))?;
         let endpoint_id = endpoint.id();
         let (sender, receiver) = mpsc::channel(config.event_channel_capacity);
+        let stream_acceptors = config
+            .stream_protocols
+            .iter()
+            .map(|alpn| {
+                let (sender, receiver) = mpsc::channel(STREAM_ACCEPT_QUEUE);
+                (
+                    alpn.clone(),
+                    StreamAcceptorSlot {
+                        sender,
+                        receiver: Some(receiver),
+                    },
+                )
+            })
+            .collect();
         let shared = Arc::new(Shared {
             config,
             endpoint: endpoint.clone(),
             router: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
+            stream_acceptors: Mutex::new(stream_acceptors),
             events: Mutex::new(Some(sender)),
             tasks: Mutex::new(JoinSet::new()),
             next_generation: AtomicU64::new(0),
@@ -622,7 +849,15 @@ impl<M: Message> NetworkEngine<M> {
         let handler = FederationProtocol {
             shared: Arc::downgrade(&shared),
         };
-        let router = Router::builder(endpoint).accept(ALPN, handler).spawn();
+        let mut router_builder = Router::builder(endpoint).accept(ALPN, handler);
+        for alpn in &shared.config.stream_protocols {
+            let handler = StreamProtocol::<M> {
+                shared: Arc::downgrade(&shared),
+                alpn: alpn.clone(),
+            };
+            router_builder = router_builder.accept(alpn.clone(), handler);
+        }
+        let router = router_builder.spawn();
         *lock(&shared.router) = Some(router);
         if let Some(rendezvous) = shared.config.rendezvous.clone() {
             match RendezvousClient::new(shared.config.network_id, &rendezvous) {
@@ -760,6 +995,97 @@ impl<M: Message> NetworkEngine<M> {
         })
         .await
         .map_err(|_| NetworkError::Timeout)?
+    }
+
+    /// Opens a raw bidirectional byte stream to a peer over a dedicated
+    /// connection on the auxiliary ALPN `alpn`.
+    ///
+    /// The remote peer must have declared `alpn` in its configuration
+    /// ([`crate::NetworkConfigBuilder::stream_protocol`]) and hold on to the
+    /// matching [`StreamAcceptor`]. The stream begins with the regular
+    /// network handshake, so it can only be established between peers of the
+    /// same network and schema; afterwards the stream carries opaque
+    /// application bytes with no framing imposed by the engine.
+    ///
+    /// `target` can be a full [`EndpointAddr`] (e.g. from a ticket) or a
+    /// bare [`EndpointId`] when the transport already knows how to reach the
+    /// peer (an active or recent connection, or discovery).
+    pub async fn open_stream(
+        &self,
+        target: impl Into<EndpointAddr>,
+        alpn: &[u8],
+    ) -> Result<ByteStream> {
+        let shared = &self.shared;
+        shared.ensure_running()?;
+        let addr: EndpointAddr = target.into();
+        let request_timeout = shared.config.request_timeout;
+        let connection = timeout(request_timeout, shared.endpoint.connect(addr, alpn))
+            .await
+            .map_err(|_| NetworkError::Timeout)?
+            .map_err(|err| {
+                NetworkError::Transport(format!("failed to connect for a byte stream: {err}"))
+            })?;
+        let peer_id = connection.remote_id();
+        let handshake = Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            network_id: shared.config.network_id,
+            schema_id: shared.config.schema_id,
+        };
+        let result = timeout(request_timeout, async {
+            let (mut send, mut recv) = connection.open_bi().await.map_err(|err| {
+                NetworkError::Transport(format!("failed to open the byte stream: {err}"))
+            })?;
+            wire::write_frame(&mut send, &handshake, MAX_HANDSHAKE_FRAME_SIZE).await?;
+            // The stream is deliberately not finished: application payload
+            // follows the handshake on the same stream.
+            let ack: HandshakeAck = wire::read_frame(&mut recv, MAX_HANDSHAKE_FRAME_SIZE).await?;
+            if ack.accepted {
+                Ok((send, recv))
+            } else {
+                let code = ack.error.unwrap_or(HandshakeErrorCode::InvalidHandshake);
+                Err(handshake_code_to_error(code))
+            }
+        })
+        .await
+        .map_err(|_| NetworkError::Timeout)
+        .and_then(|res| res);
+        match result {
+            Ok((send, recv)) => {
+                debug!(peer = %peer_id, alpn = %alpn_display(alpn), "byte stream opened");
+                Ok(ByteStream {
+                    peer_id,
+                    send,
+                    recv,
+                    _connection: connection,
+                })
+            }
+            Err(err) => {
+                connection.close(CLOSE_CODE_HANDSHAKE_REJECTED, b"stream handshake failed");
+                Err(err)
+            }
+        }
+    }
+
+    /// Takes the acceptor of incoming byte streams for the declared stream
+    /// protocol `alpn`.
+    ///
+    /// The acceptor for a protocol can be taken exactly once. Streams whose
+    /// handshake succeeded are delivered in accept order; the queue is small
+    /// and bounded, so an unconsumed acceptor applies backpressure to
+    /// remote peers.
+    pub fn stream_acceptor(&self, alpn: &[u8]) -> Result<StreamAcceptor> {
+        let mut acceptors = lock(&self.shared.stream_acceptors);
+        let slot = acceptors
+            .get_mut(alpn)
+            .ok_or_else(|| NetworkError::UnknownStreamProtocol(alpn_display(alpn)))?;
+        let rx = slot
+            .receiver
+            .take()
+            .ok_or_else(|| NetworkError::StreamAcceptorTaken(alpn_display(alpn)))?;
+        Ok(StreamAcceptor {
+            alpn: alpn.to_vec(),
+            rx,
+        })
     }
 
     /// Returns the ids of all currently connected peers.

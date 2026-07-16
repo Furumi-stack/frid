@@ -65,7 +65,7 @@ pub use config::{
     DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_MAX_CONCURRENT_STREAMS_PER_PEER,
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_REQUEST_TIMEOUT, NetworkConfig, NetworkConfigBuilder,
 };
-pub use engine::{Message, NetworkEngine};
+pub use engine::{ByteStream, Message, NetworkEngine, StreamAcceptor};
 pub use error::{NetworkError, Result};
 pub use event::{ConnectionDirection, NetworkEvent, NetworkEventReceiver};
 pub use protocol::{ALPN, NetworkId, PROTOCOL_VERSION, SchemaId};
@@ -73,6 +73,7 @@ pub use rendezvous::{DEFAULT_RENDEZVOUS_ENTRY_TTL, DEFAULT_RENDEZVOUS_INTERVAL, 
 pub use ticket::{PeerTicket, TICKET_VERSION};
 
 // Re-exported Iroh types that appear in the public API.
+pub use iroh::endpoint::{RecvStream, SendStream};
 pub use iroh::{EndpointAddr, EndpointId};
 // Re-exported so applications can use the generic ticket helpers.
 pub use iroh_tickets::Ticket;

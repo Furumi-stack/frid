@@ -4,7 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use federation_net::{EndpointId, NetworkConfig, NetworkEngine, PeerTicket, SchemaId};
+use federation_net::{
+    ByteStream, EndpointAddr, EndpointId, NetworkConfig, NetworkEngine, PeerTicket, SchemaId,
+    StreamAcceptor,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -164,6 +167,9 @@ impl MusicDhtService {
         if let Some(rendezvous) = config.rendezvous.clone() {
             engine_builder = engine_builder.rendezvous(rendezvous);
         }
+        for alpn in &config.stream_protocols {
+            engine_builder = engine_builder.stream_protocol(alpn.clone());
+        }
         let engine_config = engine_builder
             .build()
             .map_err(|err| MusicDhtError::Network(err.to_string()))?;
@@ -239,6 +245,39 @@ impl MusicDhtService {
     /// Returns `true` if a transport connection to `peer` is open.
     pub fn is_connected(&self, peer: EndpointId) -> bool {
         self.node.engine.is_connected(peer)
+    }
+
+    /// Takes the acceptor of incoming raw byte streams for the stream
+    /// protocol `alpn` declared in the configuration.
+    ///
+    /// The acceptor for a protocol can be taken exactly once; see
+    /// [`federation_net::NetworkEngine::stream_acceptor`].
+    pub fn stream_acceptor(&self, alpn: &[u8]) -> Result<StreamAcceptor> {
+        self.node.ensure_running()?;
+        self.node.engine.stream_acceptor(alpn).map_err(Into::into)
+    }
+
+    /// Opens a raw byte stream to `peer` on the auxiliary ALPN `alpn`.
+    ///
+    /// The peer is dialed using the address from its stored DHT contact
+    /// when one is known (which is the case for every peer that appears in
+    /// search results), falling back to whatever the transport itself knows
+    /// about the peer. See [`federation_net::NetworkEngine::open_stream`].
+    pub async fn open_stream(&self, peer: EndpointId, alpn: &[u8]) -> Result<ByteStream> {
+        self.node.ensure_running()?;
+        let contact_addr = self
+            .node
+            .known_contacts()
+            .into_iter()
+            .find(|contact| contact.peer_id == peer)
+            .and_then(|contact| contact.ticket.parse::<PeerTicket>().ok())
+            .map(|ticket| ticket.endpoint_addr);
+        let addr: EndpointAddr = contact_addr.unwrap_or_else(|| peer.into());
+        self.node
+            .engine
+            .open_stream(addr, alpn)
+            .await
+            .map_err(Into::into)
     }
 
     /// Synchronizes the published library with `specs`: the desired set of

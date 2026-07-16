@@ -61,6 +61,15 @@ pub enum NetworkError {
     #[error("message rejected by peer: {0}")]
     MessageRejected(String),
 
+    /// The given ALPN was not declared as a stream protocol in the
+    /// configuration.
+    #[error("unknown stream protocol: {0}")]
+    UnknownStreamProtocol(String),
+
+    /// The incoming-stream acceptor for this protocol was already taken.
+    #[error("stream acceptor already taken: {0}")]
+    StreamAcceptorTaken(String),
+
     /// The engine is shutting down and no longer accepts operations.
     #[error("engine is shutting down")]
     ShuttingDown,

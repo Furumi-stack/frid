@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{NetworkError, Result};
-use crate::protocol::{NetworkId, SchemaId};
+use crate::protocol::{ALPN, NetworkId, SchemaId};
 use crate::rendezvous::RendezvousConfig;
 
 /// Default maximum size of an encoded domain message (256 KiB).
@@ -38,6 +38,9 @@ pub struct NetworkConfig {
     /// Automatic peer discovery over the mainline DHT; `None` disables it and
     /// peers are connected via tickets only.
     pub rendezvous: Option<RendezvousConfig>,
+    /// Auxiliary ALPN protocols on which this peer accepts raw byte streams
+    /// (see [`crate::NetworkEngine::stream_acceptor`]).
+    pub stream_protocols: Vec<Vec<u8>>,
 }
 
 impl NetworkConfig {
@@ -61,6 +64,7 @@ pub struct NetworkConfigBuilder {
     event_channel_capacity: Option<usize>,
     max_concurrent_streams_per_peer: Option<usize>,
     rendezvous: Option<RendezvousConfig>,
+    stream_protocols: Vec<Vec<u8>>,
 }
 
 impl NetworkConfigBuilder {
@@ -109,6 +113,14 @@ impl NetworkConfigBuilder {
     /// Enables automatic peer discovery over the mainline DHT.
     pub fn rendezvous(mut self, rendezvous: RendezvousConfig) -> Self {
         self.rendezvous = Some(rendezvous);
+        self
+    }
+
+    /// Declares an auxiliary ALPN protocol on which this peer accepts raw
+    /// byte streams (see [`crate::NetworkEngine::stream_acceptor`]). May be
+    /// called multiple times, once per protocol.
+    pub fn stream_protocol(mut self, alpn: impl Into<Vec<u8>>) -> Self {
+        self.stream_protocols.push(alpn.into());
         self
     }
 
@@ -180,6 +192,25 @@ impl NetworkConfigBuilder {
             }
         }
 
+        for (index, alpn) in self.stream_protocols.iter().enumerate() {
+            if alpn.is_empty() {
+                return Err(NetworkError::InvalidConfig(
+                    "stream protocol ALPN must not be empty".into(),
+                ));
+            }
+            if alpn.as_slice() == ALPN {
+                return Err(NetworkError::InvalidConfig(
+                    "stream protocol ALPN must differ from the engine ALPN".into(),
+                ));
+            }
+            if self.stream_protocols[..index].contains(alpn) {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "duplicate stream protocol ALPN: {}",
+                    String::from_utf8_lossy(alpn)
+                )));
+            }
+        }
+
         Ok(NetworkConfig {
             data_dir,
             network_id,
@@ -189,6 +220,7 @@ impl NetworkConfigBuilder {
             event_channel_capacity,
             max_concurrent_streams_per_peer,
             rendezvous: self.rendezvous,
+            stream_protocols: self.stream_protocols,
         })
     }
 }
@@ -271,5 +303,28 @@ mod tests {
             ..RendezvousConfig::default()
         };
         assert!(base_builder().rendezvous(zero_ttl).build().is_err());
+    }
+
+    #[test]
+    fn stream_protocols_are_validated() {
+        let config = base_builder().build().expect("valid config");
+        assert!(config.stream_protocols.is_empty());
+
+        let config = base_builder()
+            .stream_protocol("my-app/blob/1")
+            .stream_protocol("my-app/other/1")
+            .build()
+            .expect("valid config");
+        assert_eq!(config.stream_protocols.len(), 2);
+
+        assert!(base_builder().stream_protocol("").build().is_err());
+        assert!(base_builder().stream_protocol(ALPN).build().is_err());
+        assert!(
+            base_builder()
+                .stream_protocol("dup/1")
+                .stream_protocol("dup/1")
+                .build()
+                .is_err()
+        );
     }
 }
