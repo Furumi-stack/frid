@@ -1,0 +1,78 @@
+# music-dht
+
+A distributed **music library directory** built on
+[`federation-net`](../federation-net): peers publish their local library
+index — artists, releases and tracks (names and small metadata, **never
+files**) — into a Kademlia-style DHT and search each other's libraries.
+Every running node is simultaneously a client, a DHT router and a storage
+node; there are no dedicated servers of any kind.
+
+This crate is the grown-up sibling of the minimal
+[`artist-dht`](../artist-dht) example: same DHT machinery, richer records and
+an application-oriented API.
+
+## Records
+
+A [`LibraryItem`] carries: `kind` (artist | release | track), `name`,
+`artist_names` (for releases/tracks), `year`, `release_type`,
+`duration_seconds`, plus ownership and versioning metadata. Records are
+published under one exact key (the normalized name) and one token key per
+word of the name **and of every artist name**, so searching for an artist
+also returns their releases and tracks.
+
+## API
+
+The application does not add or delete records one by one — it declares the
+desired state and the service diffs:
+
+```rust
+let (service, events) = MusicDhtService::start(config).await?;
+// Publish (and later re-publish) the whole library; matched by local_key.
+service.sync_library(vec![
+    ItemSpec {
+        local_key: "artist:1".into(),
+        kind: ItemKind::Artist,
+        name: "Massive Attack".into(),
+        artist_names: vec![],
+        year: None,
+        release_type: None,
+        duration_seconds: None,
+    },
+    // ...
+]).await?;
+let outcome = service.search_network("teardrop").await?;
+```
+
+`sync_library` is idempotent: item ids are derived from
+`(owner, kind, local_key)`, so unchanged items are skipped, changed ones are
+republished with a bumped revision and items that disappeared from the input
+are tombstoned network-wide.
+
+## Peer discovery
+
+With `.rendezvous(RendezvousConfig::default())` in the config, peers of a
+network find each other knowing **only the network id** (a shared rendezvous
+record in the public BitTorrent Mainline DHT — see the `federation-net`
+README). Tickets (`service.ticket()` / `service.connect(ticket)`) remain as a
+manual fallback for isolated networks.
+
+The network id is a public rendezvous token: anyone who knows it can join
+and see the published names. Use a unique, hard-to-guess name for a private
+network.
+
+## Consumers
+
+[`furumi-fd`](../../../furumi-stack/furumi-fd) uses this crate for its
+federation feature: every instance publishes its library index and can search
+the libraries of all other instances on the same network.
+
+## Verification
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test -p music-dht
+```
+
+The integration test starts three real nodes in one process (they use Iroh's
+public relay infrastructure), so it needs network access.

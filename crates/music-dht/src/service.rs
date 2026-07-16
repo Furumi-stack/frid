@@ -1,0 +1,535 @@
+//! The public service facade: lifecycle, item operations and search.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use federation_net::{EndpointId, NetworkConfig, NetworkEngine, PeerTicket, SchemaId};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::info;
+
+use crate::config::MusicDhtConfig;
+use crate::database::Database;
+use crate::error::{MusicDhtError, Result};
+use crate::node::{Node, record_supersedes};
+use crate::normalization::{normalize_name, tokenize};
+use crate::record::{
+    DhtKey, ItemId, ItemKind, LibraryItem, MAX_ARTISTS_PER_ITEM, MAX_ITEM_NAME_BYTES, PeerId,
+    StoredRecord, now_ms, validate_name,
+};
+use crate::routing::{NodeContact, NodeId};
+
+/// Fixed schema of the music-dht protocol; peers with a different schema are
+/// rejected by `federation-net` during the handshake.
+pub const SCHEMA_NAME: &str = "music-dht-poc-v1";
+
+/// Capacity of the application event channel.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Events delivered to the application.
+#[derive(Debug)]
+pub enum MusicDhtEvent {
+    /// A transport connection to a peer was established.
+    PeerConnected {
+        /// The connected peer.
+        peer_id: EndpointId,
+    },
+    /// A transport connection to a peer closed.
+    PeerDisconnected {
+        /// The disconnected peer.
+        peer_id: EndpointId,
+    },
+    /// A previously unknown DHT contact was learned.
+    ContactDiscovered {
+        /// The new contact.
+        contact: NodeContact,
+    },
+    /// A non-fatal error occurred.
+    Error {
+        /// Human-readable description.
+        message: String,
+    },
+}
+
+/// Receiving side of the service event channel.
+#[derive(Debug)]
+pub struct MusicDhtEventReceiver {
+    rx: mpsc::Receiver<MusicDhtEvent>,
+}
+
+impl MusicDhtEventReceiver {
+    /// Receives the next event; `None` after shutdown.
+    pub async fn recv(&mut self) -> Option<MusicDhtEvent> {
+        self.rx.recv().await
+    }
+}
+
+/// Statistics of one publish or republish operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublishStats {
+    /// Number of item records published.
+    pub records: usize,
+    /// Total number of DHT keys published.
+    pub keys: usize,
+    /// Number of distinct remote nodes that accepted at least one replica.
+    pub remote_nodes: usize,
+    /// Whether a replica was also stored locally.
+    pub local_replica: bool,
+}
+
+/// Description of one library item to publish, as provided by the
+/// application.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemSpec {
+    /// Application-chosen stable key (e.g. `"track:42"`). The record id is
+    /// derived from it, so republishing the same key updates the same record.
+    pub local_key: String,
+    /// Kind of the item.
+    pub kind: ItemKind,
+    /// Display name or title.
+    pub name: String,
+    /// Display names of the item's artists (empty for artist records).
+    pub artist_names: Vec<String>,
+    /// Release/track year, when known.
+    pub year: Option<i32>,
+    /// Release type (album, ep, ...) for releases.
+    pub release_type: Option<String>,
+    /// Track duration in seconds for tracks.
+    pub duration_seconds: Option<f64>,
+}
+
+/// Result of one [`MusicDhtService::sync_library`] call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    /// Items published for the first time (or resurrected).
+    pub added: usize,
+    /// Items whose content changed and was republished.
+    pub updated: usize,
+    /// Items tombstoned because they left the library.
+    pub removed: usize,
+    /// Items already up to date.
+    pub unchanged: usize,
+    /// Items skipped or whose publish failed.
+    pub failed: usize,
+}
+
+/// `true` if the two records describe the same content (revision, deletion
+/// state and timestamps are ignored).
+fn same_content(a: &LibraryItem, b: &LibraryItem) -> bool {
+    a.kind == b.kind
+        && a.name == b.name
+        && a.artist_names == b.artist_names
+        && a.year == b.year
+        && a.release_type == b.release_type
+        && a.duration_seconds == b.duration_seconds
+}
+
+/// Result of a combined local + network search.
+#[derive(Debug)]
+pub struct SearchOutcome {
+    /// Matches from the local `local_items` table.
+    pub local_results: Vec<LibraryItem>,
+    /// Matches found in the DHT (including local replicas), tombstones and
+    /// duplicates already filtered out. Artists matching every query token
+    /// come first.
+    pub network_results: Vec<LibraryItem>,
+    /// Number of distinct peers queried during the lookups.
+    pub queried_nodes: usize,
+    /// Number of distinct nodes discovered during the lookups.
+    pub discovered_nodes: usize,
+    /// Total wall-clock duration of the search.
+    pub duration: Duration,
+}
+
+/// A distributed item directory node.
+///
+/// Every instance is simultaneously a client, a DHT router and a storage
+/// node; there are no special server roles. See the crate documentation for
+/// the protocol description.
+pub struct MusicDhtService {
+    node: Arc<Node>,
+    tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl MusicDhtService {
+    /// Starts the service: opens the database, starts the network engine,
+    /// loads persisted contacts and spawns the maintenance tasks.
+    pub async fn start(config: MusicDhtConfig) -> Result<(Self, MusicDhtEventReceiver)> {
+        let mut engine_builder = NetworkConfig::builder()
+            .data_dir(&config.data_dir)
+            .network_id(config.network_id)
+            .schema_id(SchemaId::from_name(SCHEMA_NAME))
+            .request_timeout(config.transport_timeout);
+        if let Some(rendezvous) = config.rendezvous.clone() {
+            engine_builder = engine_builder.rendezvous(rendezvous);
+        }
+        let engine_config = engine_builder
+            .build()
+            .map_err(|err| MusicDhtError::Network(err.to_string()))?;
+        let (engine, net_events) = NetworkEngine::start(engine_config).await?;
+        let db = Database::open(&config.data_dir.join("state.sqlite3")).await?;
+
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let node = Arc::new(Node::new(engine, db, config.clone(), event_tx));
+        info!(
+            endpoint_id = %node.endpoint_id,
+            node_id = %node.node_id,
+            "music-dht node starting"
+        );
+
+        // Contacts persisted by earlier runs seed the routing table; if any
+        // exist, local records are republished right away.
+        let persisted = node.db.load_known_peers().await?;
+        if !persisted.is_empty() {
+            info!(count = persisted.len(), "loaded persisted DHT contacts");
+            node.seed_contacts(persisted);
+        }
+
+        let tasks = vec![
+            tokio::spawn(node.clone().run_event_loop(net_events)),
+            tokio::spawn(republish_timer(node.clone())),
+            tokio::spawn(expire_timer(node.clone())),
+        ];
+        node.maybe_trigger_initial_republish();
+
+        Ok((
+            Self {
+                node,
+                tasks: std::sync::Mutex::new(tasks),
+            },
+            MusicDhtEventReceiver { rx: event_rx },
+        ))
+    }
+
+    /// Returns the transport identifier of this peer.
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.node.endpoint_id
+    }
+
+    /// Returns the DHT identifier of this peer.
+    pub fn node_id(&self) -> NodeId {
+        self.node.node_id
+    }
+
+    /// Creates a shareable ticket for this peer.
+    pub async fn ticket(&self) -> Result<PeerTicket> {
+        self.node.ensure_running()?;
+        self.node.engine.ticket().await.map_err(Into::into)
+    }
+
+    /// Connects to another peer by ticket. Contacts are exchanged
+    /// automatically once the connection is up.
+    pub async fn connect(&self, ticket: PeerTicket) -> Result<EndpointId> {
+        self.node.ensure_running()?;
+        let peer = self.node.engine.connect(ticket).await?;
+        Ok(peer)
+    }
+
+    /// All DHT contacts currently known to this node.
+    pub fn known_peers(&self) -> Vec<NodeContact> {
+        self.node.known_contacts()
+    }
+
+    /// Transport connections that are currently open.
+    pub fn connected_peers(&self) -> Vec<EndpointId> {
+        self.node.engine.connected_peers()
+    }
+
+    /// Returns `true` if a transport connection to `peer` is open.
+    pub fn is_connected(&self, peer: EndpointId) -> bool {
+        self.node.engine.is_connected(peer)
+    }
+
+    /// Synchronizes the published library with `specs`: the desired set of
+    /// items this peer wants to share.
+    ///
+    /// Items are matched by their application-chosen `local_key` (the record
+    /// id is derived from it), so calling this repeatedly is idempotent:
+    /// new/changed items are (re)published with a bumped revision, items
+    /// missing from `specs` are tombstoned, unchanged items are left alone.
+    pub async fn sync_library(&self, specs: Vec<ItemSpec>) -> Result<SyncStats> {
+        self.node.ensure_running()?;
+        let owner = self.node.endpoint_id;
+        let existing: HashMap<ItemId, LibraryItem> = self
+            .node
+            .db
+            .list_local_items(true)
+            .await?
+            .into_iter()
+            .map(|item| (item.id, item))
+            .collect();
+
+        let mut stats = SyncStats::default();
+        let mut seen: HashSet<ItemId> = HashSet::new();
+        let mut to_publish: Vec<LibraryItem> = Vec::new();
+
+        for spec in specs {
+            let name = spec.name.trim().to_string();
+            let normalized = match validate_name(&name) {
+                Ok(normalized) => normalized,
+                Err(err) => {
+                    tracing::debug!(key = %spec.local_key, error = %err, "skipping item with invalid name");
+                    stats.failed += 1;
+                    continue;
+                }
+            };
+            let id = ItemId::derive(&owner, spec.kind, &spec.local_key);
+            if !seen.insert(id) {
+                // Duplicate local key in the input; first occurrence wins.
+                continue;
+            }
+            let artist_names: Vec<String> = spec
+                .artist_names
+                .into_iter()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty() && n.len() <= MAX_ITEM_NAME_BYTES)
+                .take(MAX_ARTISTS_PER_ITEM)
+                .collect();
+            let mut item = LibraryItem {
+                id,
+                owner,
+                kind: spec.kind,
+                name,
+                normalized_name: normalized,
+                artist_names,
+                year: spec.year,
+                release_type: spec.release_type,
+                duration_seconds: spec.duration_seconds,
+                revision: 1,
+                deleted: false,
+                updated_at_ms: now_ms(),
+            };
+            match existing.get(&id) {
+                Some(current) if !current.deleted && same_content(current, &item) => {
+                    stats.unchanged += 1;
+                }
+                Some(current) => {
+                    item.revision = current.revision + 1;
+                    self.node.db.upsert_local_item(&item).await?;
+                    if current.deleted {
+                        stats.added += 1;
+                    } else {
+                        stats.updated += 1;
+                    }
+                    to_publish.push(item);
+                }
+                None => {
+                    self.node.db.upsert_local_item(&item).await?;
+                    stats.added += 1;
+                    to_publish.push(item);
+                }
+            }
+        }
+
+        // Items that disappeared from the library become tombstones.
+        for (id, current) in &existing {
+            if seen.contains(id) || current.deleted {
+                continue;
+            }
+            let mut item = current.clone();
+            item.revision += 1;
+            item.deleted = true;
+            item.updated_at_ms = now_ms();
+            self.node.db.upsert_local_item(&item).await?;
+            stats.removed += 1;
+            to_publish.push(item);
+        }
+
+        for item in &to_publish {
+            if let Err(err) = self.node.publish_item(item).await {
+                tracing::warn!(item = %item.id, error = %err, "failed to publish item");
+                stats.failed += 1;
+            }
+        }
+        if stats.added + stats.updated + stats.removed > 0 {
+            info!(
+                added = stats.added,
+                updated = stats.updated,
+                removed = stats.removed,
+                unchanged = stats.unchanged,
+                "library sync finished"
+            );
+        }
+        Ok(stats)
+    }
+
+    /// Lists all locally owned active items.
+    pub async fn list_local_items(&self) -> Result<Vec<LibraryItem>> {
+        self.node.db.list_local_items(false).await
+    }
+
+    /// Searches only the local database.
+    pub async fn search_local(&self, query: &str) -> Result<Vec<LibraryItem>> {
+        let normalized = normalize_name(query);
+        if normalized.is_empty() {
+            return Err(MusicDhtError::InvalidItemName);
+        }
+        self.node.db.search_local(normalized).await
+    }
+
+    /// Searches locally and across the DHT.
+    ///
+    /// The exact key and every token key are looked up and their results
+    /// merged, so a query for an artist also returns the artist's releases
+    /// and tracks. No broadcast is involved: every step is an iterative
+    /// Kademlia-style lookup.
+    pub async fn search_network(&self, query: &str) -> Result<SearchOutcome> {
+        self.node.ensure_running()?;
+        let started = Instant::now();
+        let normalized = normalize_name(query);
+        if normalized.is_empty() {
+            return Err(MusicDhtError::InvalidItemName);
+        }
+        let tokens = tokenize(&normalized);
+        let network_id = self.node.config.network_id;
+
+        let local_results = self.node.db.search_local(normalized.clone()).await?;
+
+        let mut queried_nodes = 0usize;
+        let mut discovered_nodes = 0usize;
+        // (item id, owner) -> best record seen so far.
+        let mut merged: HashMap<(ItemId, PeerId), StoredRecord> = HashMap::new();
+        fn merge(merged: &mut HashMap<(ItemId, PeerId), StoredRecord>, records: Vec<StoredRecord>) {
+            for record in records {
+                let key = (record.item.id, record.item.owner);
+                match merged.get(&key) {
+                    Some(existing) if !record_supersedes(&record, existing) => {}
+                    _ => {
+                        merged.insert(key, record);
+                    }
+                }
+            }
+        }
+
+        // Step 1: the exact key — local replicas, then the network.
+        let exact_key = DhtKey::exact(&network_id, &normalized);
+        merge(
+            &mut merged,
+            self.node.db.dht_records_by_key(exact_key, now_ms()).await?,
+        );
+        let outcome = self
+            .node
+            .lookup(*exact_key.as_bytes(), Some(exact_key))
+            .await;
+        queried_nodes += outcome.queried;
+        discovered_nodes = discovered_nodes.max(outcome.discovered);
+        merge(&mut merged, outcome.records);
+
+        // Step 2: token keys — always, not only as a fallback. The exact key
+        // of "massive attack" carries the artist record only; the artist's
+        // releases and tracks live under the token keys.
+        for token in &tokens {
+            let key = DhtKey::token(&network_id, token);
+            merge(
+                &mut merged,
+                self.node.db.dht_records_by_key(key, now_ms()).await?,
+            );
+            let outcome = self.node.lookup(*key.as_bytes(), Some(key)).await;
+            queried_nodes += outcome.queried;
+            discovered_nodes = discovered_nodes.max(outcome.discovered);
+            merge(&mut merged, outcome.records);
+        }
+
+        // Drop tombstones and expired records, then rank: full-token matches
+        // first, then alphabetically.
+        let now = now_ms();
+        let mut network_results: Vec<LibraryItem> = merged
+            .into_values()
+            .filter(|record| !record.item.deleted && record.expires_at_ms > now)
+            .map(|record| record.item)
+            .collect();
+        let matches_all_tokens = |item: &LibraryItem| {
+            let item_tokens = item.search_tokens();
+            tokens
+                .iter()
+                .all(|token| item_tokens.iter().any(|t| t == token))
+        };
+        network_results.sort_by(|a, b| {
+            matches_all_tokens(b)
+                .cmp(&matches_all_tokens(a))
+                .then_with(|| a.normalized_name.cmp(&b.normalized_name))
+        });
+
+        Ok(SearchOutcome {
+            local_results,
+            network_results,
+            queried_nodes,
+            discovered_nodes,
+            duration: started.elapsed(),
+        })
+    }
+
+    /// Pings a known peer: verifies liveness and DHT identity, returns the
+    /// round-trip time and refreshes the contact.
+    pub async fn ping(&self, peer: EndpointId) -> Result<Duration> {
+        self.node.ensure_running()?;
+        let contact = self
+            .node
+            .known_contacts()
+            .into_iter()
+            .find(|contact| contact.peer_id == peer)
+            .ok_or_else(|| MusicDhtError::Network(format!("unknown peer {peer}")))?;
+        self.node.ping(&contact).await
+    }
+
+    /// Republishes all live local records immediately.
+    pub async fn republish(&self) -> Result<PublishStats> {
+        self.node.republish_all().await
+    }
+
+    /// Shuts the service down gracefully: stops the maintenance tasks, shuts
+    /// the network engine down and closes the event channel. Safe to call
+    /// once from any handle; repeated calls are no-ops.
+    pub async fn shutdown(&self) -> Result<()> {
+        info!("music-dht node shutting down");
+        self.node.begin_shutdown();
+        let tasks: Vec<JoinHandle<()>> = {
+            let mut guard = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *guard)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        self.node.engine.clone().shutdown().await?;
+        for task in tasks {
+            let _ = task.await;
+        }
+        info!("music-dht node shut down");
+        Ok(())
+    }
+}
+
+async fn republish_timer(node: Arc<Node>) {
+    let mut interval = tokio::time::interval(node.config.republish_interval);
+    // The first tick fires immediately; skip it, the initial republish is
+    // triggered by contact discovery instead.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if node.is_shutting_down() {
+            break;
+        }
+        if node.known_contacts().is_empty() {
+            continue;
+        }
+        if let Err(err) = node.republish_all().await {
+            tracing::warn!(error = %err, "periodic republish failed");
+        }
+    }
+}
+
+async fn expire_timer(node: Arc<Node>) {
+    let mut interval = tokio::time::interval(node.config.expire_interval);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if node.is_shutting_down() {
+            break;
+        }
+        node.sweep_expired().await;
+    }
+}
