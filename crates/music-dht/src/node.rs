@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::MusicDhtConfig;
-use crate::database::Database;
+use crate::database::MusicDhtStorage;
 use crate::dht::validate_store;
 use crate::error::{MusicDhtError, Result};
 use crate::message::{
@@ -77,7 +77,7 @@ pub(crate) struct LookupOutcome {
 /// Shared state of one DHT node.
 pub(crate) struct Node {
     pub engine: NetworkEngine<MusicDhtMessage>,
-    pub db: Database,
+    pub db: Arc<dyn MusicDhtStorage>,
     pub config: MusicDhtConfig,
     pub node_id: NodeId,
     pub endpoint_id: EndpointId,
@@ -98,7 +98,7 @@ pub(crate) struct Node {
 impl Node {
     pub fn new(
         engine: NetworkEngine<MusicDhtMessage>,
-        db: Database,
+        db: Arc<dyn MusicDhtStorage>,
         config: MusicDhtConfig,
         events: mpsc::Sender<MusicDhtEvent>,
     ) -> Self {

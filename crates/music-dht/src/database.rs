@@ -8,6 +8,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use federation_net::EndpointId;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -54,6 +55,77 @@ CREATE TABLE IF NOT EXISTS known_peers (
 );
 ";
 
+/// Persistence backend used by [`crate::MusicDhtService`] for local items,
+/// replicated DHT records and learned peer contacts.
+///
+/// The default service start path uses the bundled SQLite implementation.
+/// Applications that already have durable storage can pass their own backend
+/// to [`crate::MusicDhtService::start_with_storage`].
+#[async_trait]
+pub trait MusicDhtStorage: std::fmt::Debug + Send + Sync {
+    /// Inserts or replaces a locally owned item record.
+    async fn upsert_local_item(&self, item: &LibraryItem) -> Result<()>;
+
+    /// Lists locally owned items. Tombstones are excluded unless
+    /// `include_deleted` is set.
+    async fn list_local_items(&self, include_deleted: bool) -> Result<Vec<LibraryItem>>;
+
+    /// Returns everything that must be republished: active records plus
+    /// tombstones that have not outlived [`TOMBSTONE_TTL`] yet.
+    async fn local_items_for_republish(&self, now_ms: u64) -> Result<Vec<LibraryItem>> {
+        let all = self.list_local_items(true).await?;
+        let tombstone_ttl = TOMBSTONE_TTL.as_millis() as u64;
+        Ok(all
+            .into_iter()
+            .filter(|item| {
+                !item.deleted || item.updated_at_ms.saturating_add(tombstone_ttl) > now_ms
+            })
+            .collect())
+    }
+
+    /// Searches locally owned active items: exact normalized match, or all
+    /// query tokens present in the item's token set.
+    async fn search_local(&self, normalized_query: String) -> Result<Vec<LibraryItem>> {
+        let all = self.list_local_items(false).await?;
+        let query_tokens = tokenize(&normalized_query);
+        Ok(all
+            .into_iter()
+            .filter(|item| {
+                if item.normalized_name == normalized_query {
+                    return true;
+                }
+                if query_tokens.is_empty() {
+                    return false;
+                }
+                let artist_tokens = tokenize(&item.normalized_name);
+                query_tokens
+                    .iter()
+                    .all(|token| artist_tokens.iter().any(|t| t == token))
+            })
+            .collect())
+    }
+
+    /// Applies a validated incoming record to the replica store, following
+    /// the revision/tombstone rules. Returns `true` if the record was written
+    /// or refreshed.
+    async fn store_dht_record(&self, key: DhtKey, record: StoredRecord) -> Result<bool>;
+
+    /// Returns non-expired replicas stored under `key`, including tombstones.
+    async fn dht_records_by_key(&self, key: DhtKey, now_ms: u64) -> Result<Vec<StoredRecord>>;
+
+    /// Deletes expired replicas. Returns the number of removed rows.
+    async fn delete_expired_records(&self, now_ms: u64) -> Result<usize>;
+
+    /// Inserts or refreshes a known peer contact.
+    async fn upsert_known_peer(&self, contact: &NodeContact) -> Result<()>;
+
+    /// Deletes a persisted peer contact.
+    async fn delete_known_peer(&self, peer_id: EndpointId) -> Result<()>;
+
+    /// Loads all persisted peer contacts.
+    async fn load_known_peers(&self) -> Result<Vec<NodeContact>>;
+}
+
 /// Handle to the local SQLite database.
 ///
 /// Cheap to clone; all clones share one connection guarded by a mutex that is
@@ -61,6 +133,12 @@ CREATE TABLE IF NOT EXISTS known_peers (
 #[derive(Clone)]
 pub(crate) struct Database {
     conn: Arc<Mutex<Connection>>,
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database").finish_non_exhaustive()
+    }
 }
 
 impl Database {
@@ -334,6 +412,49 @@ impl Database {
             Ok(contacts)
         })
         .await
+    }
+}
+
+#[async_trait]
+impl MusicDhtStorage for Database {
+    async fn upsert_local_item(&self, item: &LibraryItem) -> Result<()> {
+        Database::upsert_local_item(self, item).await
+    }
+
+    async fn list_local_items(&self, include_deleted: bool) -> Result<Vec<LibraryItem>> {
+        Database::list_local_items(self, include_deleted).await
+    }
+
+    async fn local_items_for_republish(&self, now_ms: u64) -> Result<Vec<LibraryItem>> {
+        Database::local_items_for_republish(self, now_ms).await
+    }
+
+    async fn search_local(&self, normalized_query: String) -> Result<Vec<LibraryItem>> {
+        Database::search_local(self, normalized_query).await
+    }
+
+    async fn store_dht_record(&self, key: DhtKey, record: StoredRecord) -> Result<bool> {
+        Database::store_dht_record(self, key, record).await
+    }
+
+    async fn dht_records_by_key(&self, key: DhtKey, now_ms: u64) -> Result<Vec<StoredRecord>> {
+        Database::dht_records_by_key(self, key, now_ms).await
+    }
+
+    async fn delete_expired_records(&self, now_ms: u64) -> Result<usize> {
+        Database::delete_expired_records(self, now_ms).await
+    }
+
+    async fn upsert_known_peer(&self, contact: &NodeContact) -> Result<()> {
+        Database::upsert_known_peer(self, contact).await
+    }
+
+    async fn delete_known_peer(&self, peer_id: EndpointId) -> Result<()> {
+        Database::delete_known_peer(self, peer_id).await
+    }
+
+    async fn load_known_peers(&self) -> Result<Vec<NodeContact>> {
+        Database::load_known_peers(self).await
     }
 }
 

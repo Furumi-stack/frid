@@ -11,7 +11,7 @@ use crate::record::{
 
 /// Outcome of comparing an incoming record with the stored one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StoreDecision {
+pub enum StoreDecision {
     /// No record stored yet, or the incoming one supersedes it: write it.
     Write,
     /// Same logical record: keep the stored row but extend its expiry.
@@ -31,10 +31,7 @@ pub(crate) enum StoreDecision {
 ///   only the expiry is refreshed (this is how republish extends TTL);
 /// * an older revision never replaces a newer one, in particular an old
 ///   active record never resurrects a tombstone.
-pub(crate) fn decide_store(
-    existing: Option<(u64, bool, u64)>,
-    incoming: &StoredRecord,
-) -> StoreDecision {
+pub fn decide_store(existing: Option<(u64, bool, u64)>, incoming: &StoredRecord) -> StoreDecision {
     let Some((revision, deleted, expires_at_ms)) = existing else {
         return StoreDecision::Write;
     };

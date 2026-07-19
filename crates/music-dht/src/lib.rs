@@ -82,6 +82,8 @@ pub use config::{
     DEFAULT_EXPIRE_INTERVAL, DEFAULT_LOOKUP_TIMEOUT, DEFAULT_REPUBLISH_INTERVAL,
     DEFAULT_REQUEST_TIMEOUT, DEFAULT_TRANSPORT_TIMEOUT, MusicDhtConfig, MusicDhtConfigBuilder,
 };
+pub use database::MusicDhtStorage;
+pub use dht::{StoreDecision, decide_store};
 pub use error::{MusicDhtError, Result};
 pub use message::{
     DHT_PROTOCOL_VERSION, FindNodeRequest, FindNodeResponse, FindValueRequest, FindValueResponse,
@@ -107,5 +109,5 @@ pub use service::{
 // Re-exported types from the transport layer that appear in this API.
 pub use federation_net::{
     ByteStream, EndpointAddr, EndpointId, NetworkId, PeerTicket, RecvStream, RendezvousConfig,
-    SendStream, StreamAcceptor,
+    SecretKey, SendStream, StreamAcceptor,
 };

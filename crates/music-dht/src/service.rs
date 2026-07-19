@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 
 use federation_net::{
     ByteStream, EndpointAddr, EndpointId, NetworkConfig, NetworkEngine, PeerTicket, SchemaId,
-    StreamAcceptor,
+    SecretKey, StreamAcceptor,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::config::MusicDhtConfig;
-use crate::database::Database;
+use crate::database::{Database, MusicDhtStorage};
 use crate::error::{MusicDhtError, Result};
 use crate::node::{Node, record_supersedes};
 use crate::normalization::{normalize_name, tokenize};
@@ -159,6 +159,42 @@ impl MusicDhtService {
     /// Starts the service: opens the database, starts the network engine,
     /// loads persisted contacts and spawns the maintenance tasks.
     pub async fn start(config: MusicDhtConfig) -> Result<(Self, MusicDhtEventReceiver)> {
+        let db = Arc::new(Database::open(&config.data_dir.join("state.sqlite3")).await?);
+        Self::start_with_storage(config, db).await
+    }
+
+    /// Starts the service with an application-provided persistence backend.
+    ///
+    /// This is useful for servers that already have durable storage and do
+    /// not want the DHT state tied to a local SQLite file. The `data_dir`
+    /// in `config` is still used by the transport layer for the peer
+    /// identity.
+    pub async fn start_with_storage(
+        config: MusicDhtConfig,
+        storage: Arc<dyn MusicDhtStorage>,
+    ) -> Result<(Self, MusicDhtEventReceiver)> {
+        Self::start_with_storage_inner(config, storage, None).await
+    }
+
+    /// Starts the service with application-provided persistence and identity.
+    ///
+    /// The identity controls the stable transport endpoint id. Supplying it
+    /// lets applications store both the DHT state and the peer identity in
+    /// their own durable database while keeping [`MusicDhtService::start`]
+    /// as the SQLite/file-backed default.
+    pub async fn start_with_storage_and_secret_key(
+        config: MusicDhtConfig,
+        storage: Arc<dyn MusicDhtStorage>,
+        secret_key: SecretKey,
+    ) -> Result<(Self, MusicDhtEventReceiver)> {
+        Self::start_with_storage_inner(config, storage, Some(secret_key)).await
+    }
+
+    async fn start_with_storage_inner(
+        config: MusicDhtConfig,
+        storage: Arc<dyn MusicDhtStorage>,
+        secret_key: Option<SecretKey>,
+    ) -> Result<(Self, MusicDhtEventReceiver)> {
         let mut engine_builder = NetworkConfig::builder()
             .data_dir(&config.data_dir)
             .network_id(config.network_id)
@@ -176,11 +212,15 @@ impl MusicDhtService {
         let engine_config = engine_builder
             .build()
             .map_err(|err| MusicDhtError::Network(err.to_string()))?;
-        let (engine, net_events) = NetworkEngine::start(engine_config).await?;
-        let db = Database::open(&config.data_dir.join("state.sqlite3")).await?;
+        let (engine, net_events) = match secret_key {
+            Some(secret_key) => {
+                NetworkEngine::start_with_secret_key(engine_config, secret_key).await?
+            }
+            None => NetworkEngine::start(engine_config).await?,
+        };
 
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let node = Arc::new(Node::new(engine, db, config.clone(), event_tx));
+        let node = Arc::new(Node::new(engine, storage, config.clone(), event_tx));
         info!(
             endpoint_id = %node.endpoint_id,
             node_id = %node.node_id,

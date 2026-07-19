@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -813,6 +813,18 @@ impl<M: Message> NetworkEngine<M> {
     /// [`NetworkEvent`]s.
     pub async fn start(config: NetworkConfig) -> Result<(Self, NetworkEventReceiver<M>)> {
         let secret_key = identity::load_or_create(&config.data_dir).await?;
+        Self::start_with_secret_key(config, secret_key).await
+    }
+
+    /// Starts the engine with an application-provided identity key.
+    ///
+    /// Use this when the caller already stores the peer identity in durable
+    /// application storage. The regular [`NetworkEngine::start`] method
+    /// remains the file-backed default.
+    pub async fn start_with_secret_key(
+        config: NetworkConfig,
+        secret_key: SecretKey,
+    ) -> Result<(Self, NetworkEventReceiver<M>)> {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .bind()
