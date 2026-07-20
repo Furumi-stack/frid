@@ -5,8 +5,8 @@ use federation_net::NetworkId;
 use crate::message::StoreRecordRequest;
 use crate::normalization::{normalize_name, tokenize};
 use crate::record::{
-    ACTIVE_RECORD_TTL, DhtKey, MAX_ITEM_NAME_BYTES, MAX_TOKENS_PER_ITEM, StoredRecord,
-    TOMBSTONE_TTL,
+    ACTIVE_RECORD_TTL, DhtKey, MAX_ARTISTS_PER_ITEM, MAX_ITEM_NAME_BYTES, MAX_TOKENS_PER_ITEM,
+    StoredRecord, TOMBSTONE_TTL,
 };
 
 /// Outcome of comparing an incoming record with the stored one.
@@ -59,9 +59,9 @@ pub fn decide_store(existing: Option<(u64, bool, u64)>, incoming: &StoredRecord)
 /// Validates an incoming `StoreRecord` request.
 ///
 /// Checks the size limits, that the record is internally consistent, that the
-/// key actually corresponds to the record's name or one of its tokens, and
-/// clamps the expiry to the maximum TTL allowed for the record type. Returns
-/// the record with a possibly clamped `expires_at_ms`.
+/// key actually corresponds to the record's name, or one of the item's/artist's
+/// search tokens, and clamps the expiry to the maximum TTL allowed for the
+/// record type. Returns the record with a possibly clamped `expires_at_ms`.
 pub(crate) fn validate_store(
     request: StoreRecordRequest,
     network_id: &NetworkId,
@@ -83,9 +83,21 @@ pub(crate) fn validate_store(
     if tokens.len() > MAX_TOKENS_PER_ITEM {
         return Err("too many tokens".into());
     }
+    if item.artist_names.len() > MAX_ARTISTS_PER_ITEM {
+        return Err("too many artists".into());
+    }
+    for artist in &item.artist_names {
+        if artist.len() > MAX_ITEM_NAME_BYTES {
+            return Err("artist name too long".into());
+        }
+        if tokenize(&normalize_name(artist)).len() > MAX_TOKENS_PER_ITEM {
+            return Err("artist name has too many tokens".into());
+        }
+    }
 
     let key_matches = request.key == DhtKey::exact(network_id, &item.normalized_name)
-        || tokens
+        || item
+            .search_tokens()
             .iter()
             .any(|token| request.key == DhtKey::token(network_id, token));
     if !key_matches {
@@ -131,6 +143,28 @@ mod tests {
                 duration_seconds: None,
                 revision,
                 deleted,
+                updated_at_ms: 0,
+            },
+            publisher: owner,
+            expires_at_ms,
+        }
+    }
+
+    fn track_with_artist(expires_at_ms: u64) -> StoredRecord {
+        let owner = test_peer(1);
+        StoredRecord {
+            item: LibraryItem {
+                id: ItemId::from_bytes([8u8; 32]),
+                owner,
+                kind: crate::record::ItemKind::Track,
+                name: "Teardrop".into(),
+                normalized_name: "teardrop".into(),
+                artist_names: vec!["Massive Attack".into()],
+                year: Some(1998),
+                release_type: None,
+                duration_seconds: Some(330.0),
+                revision: 1,
+                deleted: false,
                 updated_at_ms: 0,
             },
             publisher: owner,
@@ -271,6 +305,36 @@ mod tests {
                 now,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_artist_token_keys() {
+        let net = NetworkId::from_name("test");
+        let now = 1_000_000;
+        let rec = track_with_artist(now + ACTIVE_RECORD_TTL.as_millis() as u64);
+
+        assert!(
+            validate_store(
+                StoreRecordRequest {
+                    key: DhtKey::token(&net, "massive"),
+                    record: rec.clone(),
+                },
+                &net,
+                now,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_store(
+                StoreRecordRequest {
+                    key: DhtKey::token(&net, "attack"),
+                    record: rec,
+                },
+                &net,
+                now,
+            )
+            .is_ok()
         );
     }
 }

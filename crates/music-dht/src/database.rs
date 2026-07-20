@@ -84,7 +84,7 @@ pub trait MusicDhtStorage: std::fmt::Debug + Send + Sync {
     }
 
     /// Searches locally owned active items: exact normalized match, or all
-    /// query tokens present in the item's token set.
+    /// query tokens present in the item's token set, including artist names.
     async fn search_local(&self, normalized_query: String) -> Result<Vec<LibraryItem>> {
         let all = self.list_local_items(false).await?;
         let query_tokens = tokenize(&normalized_query);
@@ -97,7 +97,7 @@ pub trait MusicDhtStorage: std::fmt::Debug + Send + Sync {
                 if query_tokens.is_empty() {
                     return false;
                 }
-                let artist_tokens = tokenize(&item.normalized_name);
+                let artist_tokens = item.search_tokens();
                 query_tokens
                     .iter()
                     .all(|token| artist_tokens.iter().any(|t| t == token))
@@ -237,7 +237,7 @@ impl Database {
     }
 
     /// Searches locally owned active items: exact normalized match, or all
-    /// query tokens present in the item's token set.
+    /// query tokens present in the item's token set, including artist names.
     pub async fn search_local(&self, normalized_query: String) -> Result<Vec<LibraryItem>> {
         let all = self.list_local_items(false).await?;
         let query_tokens = tokenize(&normalized_query);
@@ -250,7 +250,7 @@ impl Database {
                 if query_tokens.is_empty() {
                     return false;
                 }
-                let artist_tokens = tokenize(&item.normalized_name);
+                let artist_tokens = item.search_tokens();
                 query_tokens
                     .iter()
                     .all(|token| artist_tokens.iter().any(|t| t == token))
@@ -520,6 +520,22 @@ mod tests {
         assert_eq!(by_token.len(), 1);
         let none = db.search_local("portishead".into()).await.expect("search");
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_search_uses_artist_names() {
+        let (_dir, db) = open_temp().await;
+        let owner = test_peer(1);
+        let mut track = item(owner, "Teardrop", 1, false);
+        track.kind = ItemKind::Track;
+        track.artist_names = vec!["Massive Attack".into()];
+        db.upsert_local_item(&track).await.expect("upsert");
+
+        let found = db
+            .search_local("massive attack".into())
+            .await
+            .expect("search");
+        assert_eq!(found, vec![track]);
     }
 
     #[tokio::test]
