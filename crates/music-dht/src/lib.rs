@@ -14,7 +14,8 @@
 //!   `federation-net` endpoint id.
 //! * [`LibraryItem`] records are published under BLAKE3-derived [`DhtKey`]s:
 //!   one exact key for the whole normalized name plus one key per token of
-//!   the name and of every artist name (so a track is found by its artist).
+//!   the name, every main/featured artist name and the track's release title
+//!   (so a track is found by its artists).
 //! * Records are replicated to the `K` nodes whose ids are XOR-closest to
 //!   each key, discovered with an iterative Kademlia-style lookup (never a
 //!   broadcast).
@@ -47,8 +48,12 @@
 //!         kind: ItemKind::Track,
 //!         name: "Teardrop".into(),
 //!         artist_names: vec!["Massive Attack".into()],
+//!         featured_artist_names: vec![],
 //!         year: Some(1998),
 //!         release_type: None,
+//!         release_title: Some("Mezzanine".into()),
+//!         track_number: Some(10),
+//!         disc_number: Some(1),
 //!         duration_seconds: Some(330.0),
 //!     }])
 //!     .await?;

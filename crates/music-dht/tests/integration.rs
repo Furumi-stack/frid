@@ -39,8 +39,12 @@ fn spec(local_key: &str, kind: ItemKind, name: &str, artists: &[&str]) -> ItemSp
         kind,
         name: name.to_string(),
         artist_names: artists.iter().map(|s| s.to_string()).collect(),
+        featured_artist_names: Vec::new(),
         year: Some(1998),
         release_type: (kind == ItemKind::Release).then(|| "album".to_string()),
+        release_title: (kind == ItemKind::Track).then(|| "Mezzanine".to_string()),
+        track_number: (kind == ItemKind::Track).then_some(10),
+        disc_number: (kind == ItemKind::Track).then_some(1),
         duration_seconds: (kind == ItemKind::Track).then_some(287.0),
     }
 }
@@ -223,7 +227,12 @@ async fn byte_stream_to_item_owner() {
             stream.peer_id
         });
         node_a
-            .sync_library(vec![spec("track:1", ItemKind::Track, "Teardrop", &["Massive Attack"])])
+            .sync_library(vec![spec(
+                "track:1",
+                ItemKind::Track,
+                "Teardrop",
+                &["Massive Attack"],
+            )])
             .await
             .expect("sync");
 
@@ -241,7 +250,10 @@ async fn byte_stream_to_item_owner() {
         assert_eq!(owner, node_a.endpoint_id());
 
         // B streams the bytes from the owner.
-        let mut stream = node_b.open_stream(owner, BLOB_ALPN).await.expect("open stream");
+        let mut stream = node_b
+            .open_stream(owner, BLOB_ALPN)
+            .await
+            .expect("open stream");
         let mut received = Vec::new();
         let mut chunk = [0u8; 1024];
         while let Some(n) = stream.recv.read(&mut chunk).await.expect("read") {

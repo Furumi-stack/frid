@@ -18,14 +18,14 @@ use crate::error::{MusicDhtError, Result};
 use crate::node::{Node, record_supersedes};
 use crate::normalization::{normalize_name, tokenize};
 use crate::record::{
-    DhtKey, ItemId, ItemKind, LibraryItem, MAX_ARTISTS_PER_ITEM, MAX_ITEM_NAME_BYTES, PeerId,
-    StoredRecord, now_ms, validate_name,
+    DhtKey, ItemId, ItemKind, LibraryItem, MAX_ARTISTS_PER_ITEM, MAX_ITEM_NAME_BYTES,
+    MAX_TOKENS_PER_ITEM, PeerId, StoredRecord, now_ms, validate_name,
 };
 use crate::routing::{NodeContact, NodeId};
 
 /// Fixed schema of the music-dht protocol; peers with a different schema are
 /// rejected by `federation-net` during the handshake.
-pub const SCHEMA_NAME: &str = "music-dht-poc-v1";
+pub const SCHEMA_NAME: &str = "music-dht-poc-v2";
 
 /// Capacity of the application event channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -92,14 +92,68 @@ pub struct ItemSpec {
     pub kind: ItemKind,
     /// Display name or title.
     pub name: String,
-    /// Display names of the item's artists (empty for artist records).
+    /// Display names of the item's main artists (empty for artist records).
     pub artist_names: Vec<String>,
+    /// Display names of the item's featured artists (track records only).
+    pub featured_artist_names: Vec<String>,
     /// Release/track year, when known.
     pub year: Option<i32>,
-    /// Release type (album, ep, ...) for releases.
+    /// Release type (album, ep, ...) for releases and track release context.
     pub release_type: Option<String>,
+    /// Release title for track records, when known.
+    pub release_title: Option<String>,
+    /// Track number inside the release, when known.
+    pub track_number: Option<i32>,
+    /// Disc number inside the release, when known.
+    pub disc_number: Option<i32>,
     /// Track duration in seconds for tracks.
     pub duration_seconds: Option<f64>,
+}
+
+fn sanitize_artist_names(
+    names: Vec<String>,
+    seen: &mut HashSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let name = name.trim().to_string();
+            if name.is_empty() || name.len() > MAX_ITEM_NAME_BYTES {
+                return None;
+            }
+            let normalized = normalize_name(&name);
+            if normalized.is_empty()
+                || tokenize(&normalized).len() > MAX_TOKENS_PER_ITEM
+                || !seen.insert(normalized)
+            {
+                return None;
+            }
+            Some(name)
+        })
+        .take(limit)
+        .collect()
+}
+
+fn sanitize_optional_name(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_string();
+    if value.is_empty() || value.len() > MAX_ITEM_NAME_BYTES {
+        return None;
+    }
+    let normalized = normalize_name(&value);
+    if normalized.is_empty() || tokenize(&normalized).len() > MAX_TOKENS_PER_ITEM {
+        return None;
+    }
+    Some(value)
+}
+
+fn sanitize_optional_text(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_string();
+    (!value.is_empty() && value.len() <= MAX_ITEM_NAME_BYTES).then_some(value)
+}
+
+fn positive_index(value: Option<i32>) -> Option<i32> {
+    value.filter(|number| *number > 0)
 }
 
 /// Result of one [`MusicDhtService::sync_library`] call.
@@ -123,8 +177,12 @@ fn same_content(a: &LibraryItem, b: &LibraryItem) -> bool {
     a.kind == b.kind
         && a.name == b.name
         && a.artist_names == b.artist_names
+        && a.featured_artist_names == b.featured_artist_names
         && a.year == b.year
         && a.release_type == b.release_type
+        && a.release_title == b.release_title
+        && a.track_number == b.track_number
+        && a.disc_number == b.disc_number
         && a.duration_seconds == b.duration_seconds
 }
 
@@ -361,13 +419,14 @@ impl MusicDhtService {
                 // Duplicate local key in the input; first occurrence wins.
                 continue;
             }
-            let artist_names: Vec<String> = spec
-                .artist_names
-                .into_iter()
-                .map(|n| n.trim().to_string())
-                .filter(|n| !n.is_empty() && n.len() <= MAX_ITEM_NAME_BYTES)
-                .take(MAX_ARTISTS_PER_ITEM)
-                .collect();
+            let mut seen_artists = HashSet::new();
+            let artist_names =
+                sanitize_artist_names(spec.artist_names, &mut seen_artists, MAX_ARTISTS_PER_ITEM);
+            let featured_artist_names = sanitize_artist_names(
+                spec.featured_artist_names,
+                &mut seen_artists,
+                MAX_ARTISTS_PER_ITEM.saturating_sub(artist_names.len()),
+            );
             let mut item = LibraryItem {
                 id,
                 owner,
@@ -375,9 +434,13 @@ impl MusicDhtService {
                 name,
                 normalized_name: normalized,
                 artist_names,
+                featured_artist_names,
                 year: spec.year,
-                release_type: spec.release_type,
-                duration_seconds: spec.duration_seconds,
+                release_type: sanitize_optional_text(spec.release_type),
+                release_title: sanitize_optional_name(spec.release_title),
+                track_number: positive_index(spec.track_number),
+                disc_number: positive_index(spec.disc_number),
+                duration_seconds: spec.duration_seconds.filter(|duration| *duration > 0.0),
                 revision: 1,
                 deleted: false,
                 updated_at_ms: now_ms(),

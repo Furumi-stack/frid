@@ -14,11 +14,13 @@ an application-oriented API.
 ## Records
 
 A [`LibraryItem`] carries: `kind` (artist | release | track), `name`,
-`artist_names` (for releases/tracks), `year`, `release_type`,
-`duration_seconds`, plus ownership and versioning metadata. Records are
-published under one exact key (the normalized name) and one token key per
-word of the name **and of every artist name**, so searching for an artist
-also returns their releases and tracks.
+`artist_names` (main artists for releases/tracks), `featured_artist_names`
+(for track guest appearances), `year`, `release_type`, `release_title`,
+`track_number`, `disc_number`, `duration_seconds`, plus ownership and
+versioning metadata. Records are published under one exact key (the
+normalized name) and one token key per word of the name, every main/featured
+artist name and the track release title, so searching for an artist also
+returns their releases, tracks and guest appearances.
 
 ## API
 
@@ -34,8 +36,12 @@ service.sync_library(vec![
         kind: ItemKind::Artist,
         name: "Massive Attack".into(),
         artist_names: vec![],
+        featured_artist_names: vec![],
         year: None,
         release_type: None,
+        release_title: None,
+        track_number: None,
+        disc_number: None,
         duration_seconds: None,
     },
     // ...

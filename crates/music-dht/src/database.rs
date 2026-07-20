@@ -210,10 +210,13 @@ impl Database {
                 "SELECT payload
                  FROM local_items ORDER BY normalized_name",
             )?;
-            let rows = stmt.query_map([], item_from_row)?;
+            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
             let mut result = Vec::new();
             for row in rows {
-                let item = row?;
+                let payload = row?;
+                let Ok(item) = postcard::from_bytes::<LibraryItem>(&payload) else {
+                    continue;
+                };
                 if include_deleted || !item.deleted {
                     result.push(item);
                 }
@@ -458,17 +461,6 @@ impl MusicDhtStorage for Database {
     }
 }
 
-fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
-    let payload: Vec<u8> = row.get(0)?;
-    postcard::from_bytes(&payload).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Blob,
-            format!("undecodable local item payload: {err}").into(),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,8 +478,12 @@ mod tests {
             name: name.to_string(),
             normalized_name: crate::normalization::normalize_name(name),
             artist_names: Vec::new(),
+            featured_artist_names: Vec::new(),
             year: None,
             release_type: None,
+            release_title: None,
+            track_number: None,
+            disc_number: None,
             duration_seconds: None,
             revision,
             deleted,
@@ -520,6 +516,37 @@ mod tests {
         assert_eq!(by_token.len(), 1);
         let none = db.search_local("portishead".into()).await.expect("search");
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn undecodable_local_item_payload_is_skipped() {
+        let (_dir, db) = open_temp().await;
+        db.call(|conn| {
+            conn.execute(
+                "INSERT INTO local_items
+                 (id, normalized_name, revision, deleted, updated_at_ms, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &[1u8; 32],
+                    "legacy",
+                    1_i64,
+                    0_i64,
+                    0_i64,
+                    vec![0xff_u8, 0xff],
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("insert corrupt row");
+
+        assert!(db.list_local_items(true).await.expect("list").is_empty());
+        assert!(
+            db.search_local("legacy".into())
+                .await
+                .expect("search")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

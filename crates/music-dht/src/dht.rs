@@ -83,15 +83,27 @@ pub(crate) fn validate_store(
     if tokens.len() > MAX_TOKENS_PER_ITEM {
         return Err("too many tokens".into());
     }
-    if item.artist_names.len() > MAX_ARTISTS_PER_ITEM {
+    if item.artist_names.len() + item.featured_artist_names.len() > MAX_ARTISTS_PER_ITEM {
         return Err("too many artists".into());
     }
-    for artist in &item.artist_names {
+    for artist in item
+        .artist_names
+        .iter()
+        .chain(item.featured_artist_names.iter())
+    {
         if artist.len() > MAX_ITEM_NAME_BYTES {
             return Err("artist name too long".into());
         }
         if tokenize(&normalize_name(artist)).len() > MAX_TOKENS_PER_ITEM {
             return Err("artist name has too many tokens".into());
+        }
+    }
+    if let Some(release_title) = &item.release_title {
+        if release_title.len() > MAX_ITEM_NAME_BYTES {
+            return Err("release title too long".into());
+        }
+        if tokenize(&normalize_name(release_title)).len() > MAX_TOKENS_PER_ITEM {
+            return Err("release title has too many tokens".into());
         }
     }
 
@@ -138,8 +150,12 @@ mod tests {
                 name: "Massive Attack".into(),
                 normalized_name: "massive attack".into(),
                 artist_names: Vec::new(),
+                featured_artist_names: Vec::new(),
                 year: None,
                 release_type: None,
+                release_title: None,
+                track_number: None,
+                disc_number: None,
                 duration_seconds: None,
                 revision,
                 deleted,
@@ -160,8 +176,12 @@ mod tests {
                 name: "Teardrop".into(),
                 normalized_name: "teardrop".into(),
                 artist_names: vec!["Massive Attack".into()],
+                featured_artist_names: Vec::new(),
                 year: Some(1998),
                 release_type: None,
+                release_title: None,
+                track_number: None,
+                disc_number: None,
                 duration_seconds: Some(330.0),
                 revision: 1,
                 deleted: false,

@@ -17,7 +17,8 @@ pub type PeerId = EndpointId;
 pub const MAX_ITEM_NAME_BYTES: usize = 512;
 /// Maximum number of tokens a single item name may produce.
 pub const MAX_TOKENS_PER_ITEM: usize = 32;
-/// Maximum number of artist names carried by one release/track record.
+/// Maximum number of artist names carried by one release/track record across
+/// main and featured roles.
 pub const MAX_ARTISTS_PER_ITEM: usize = 16;
 /// Maximum lifetime of an active DHT record.
 pub const ACTIVE_RECORD_TTL: Duration = Duration::from_secs(30 * 60);
@@ -150,13 +151,28 @@ pub struct LibraryItem {
     pub name: String,
     /// Normalized form of the name, used for indexing.
     pub normalized_name: String,
-    /// Display names of the item's artists (empty for artist records).
+    /// Display names of the item's main artists (empty for artist records).
     /// Lets a release or track be found by its artist's name.
     pub artist_names: Vec<String>,
+    /// Display names of featured artists for track records. These names are
+    /// indexed too, so artist lookups can discover guest appearances without
+    /// downloading the track first.
+    #[serde(default)]
+    pub featured_artist_names: Vec<String>,
     /// Release/track year, when known.
     pub year: Option<i32>,
-    /// Release type (album, ep, single, ...) for release records.
+    /// Release type (album, ep, single, ...) for release records and track
+    /// release context.
     pub release_type: Option<String>,
+    /// Release title for track records, when known.
+    #[serde(default)]
+    pub release_title: Option<String>,
+    /// Track number inside the release, when known.
+    #[serde(default)]
+    pub track_number: Option<i32>,
+    /// Disc number inside the release, when known.
+    #[serde(default)]
+    pub disc_number: Option<i32>,
     /// Track duration in seconds for track records.
     pub duration_seconds: Option<f64>,
     /// Monotonically increasing revision; bumped on every change.
@@ -169,9 +185,9 @@ pub struct LibraryItem {
 
 impl LibraryItem {
     /// Returns the DHT keys this item is published under: the exact key of
-    /// the name plus one key per unique token of the name **and of every
-    /// artist name** — so a release or track is also found by searching for
-    /// its artist.
+    /// the name plus one key per unique token of the name, every artist name
+    /// and track release title — so a release/track is also found by searching
+    /// for its artists or release context.
     pub fn dht_keys(&self, network_id: &NetworkId) -> Vec<DhtKey> {
         let mut keys = vec![DhtKey::exact(network_id, &self.normalized_name)];
         let mut seen = std::collections::HashSet::new();
@@ -183,12 +199,19 @@ impl LibraryItem {
         keys
     }
 
-    /// All tokens this item is searchable by: its own name plus the names of
-    /// its artists.
+    /// All tokens this item is searchable by: its own name, its artist names
+    /// and the release title carried by track records.
     pub fn search_tokens(&self) -> Vec<String> {
         let mut tokens = tokenize(&self.normalized_name);
-        for artist in &self.artist_names {
+        for artist in self
+            .artist_names
+            .iter()
+            .chain(self.featured_artist_names.iter())
+        {
             tokens.extend(tokenize(&normalize_name(artist)));
+        }
+        if let Some(release_title) = &self.release_title {
+            tokens.extend(tokenize(&normalize_name(release_title)));
         }
         tokens
     }
@@ -340,8 +363,12 @@ mod tests {
             name: "Attack Attack".into(),
             normalized_name: "attack attack".into(),
             artist_names: Vec::new(),
+            featured_artist_names: Vec::new(),
             year: None,
             release_type: None,
+            release_title: None,
+            track_number: None,
+            disc_number: None,
             duration_seconds: None,
             revision: 1,
             deleted: false,
@@ -353,6 +380,33 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], DhtKey::exact(&net, "attack attack"));
         assert_eq!(keys[1], DhtKey::token(&net, "attack"));
+    }
+
+    #[test]
+    fn search_tokens_cover_featured_artists_and_release_title() {
+        let key = test_peer(7);
+        let item = LibraryItem {
+            id: ItemId::from_bytes([2u8; 32]),
+            owner: key,
+            kind: ItemKind::Track,
+            name: "Karmacoma".into(),
+            normalized_name: "karmacoma".into(),
+            artist_names: vec!["Massive Attack".into()],
+            featured_artist_names: vec!["Tricky".into()],
+            year: Some(1994),
+            release_type: Some("album".into()),
+            release_title: Some("Protection".into()),
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration_seconds: Some(314.0),
+            revision: 1,
+            deleted: false,
+            updated_at_ms: 0,
+        };
+        let tokens = item.search_tokens();
+        assert!(tokens.contains(&"massive".to_string()));
+        assert!(tokens.contains(&"tricky".to_string()));
+        assert!(tokens.contains(&"protection".to_string()));
     }
 
     #[test]
