@@ -46,6 +46,9 @@ fn spec(local_key: &str, kind: ItemKind, name: &str, artists: &[&str]) -> ItemSp
         track_number: (kind == ItemKind::Track).then_some(10),
         disc_number: (kind == ItemKind::Track).then_some(1),
         duration_seconds: (kind == ItemKind::Track).then_some(287.0),
+        content_id: (kind == ItemKind::Track).then(|| {
+            "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
+        }),
     }
 }
 

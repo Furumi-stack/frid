@@ -485,6 +485,7 @@ mod tests {
             track_number: None,
             disc_number: None,
             duration_seconds: None,
+            content_id: None,
             revision,
             deleted,
             updated_at_ms: now_ms(),

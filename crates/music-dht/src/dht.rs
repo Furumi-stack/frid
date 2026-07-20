@@ -5,8 +5,8 @@ use federation_net::NetworkId;
 use crate::message::StoreRecordRequest;
 use crate::normalization::{normalize_name, tokenize};
 use crate::record::{
-    ACTIVE_RECORD_TTL, DhtKey, MAX_ARTISTS_PER_ITEM, MAX_ITEM_NAME_BYTES, MAX_TOKENS_PER_ITEM,
-    StoredRecord, TOMBSTONE_TTL,
+    ACTIVE_RECORD_TTL, DhtKey, ItemKind, MAX_ARTISTS_PER_ITEM, MAX_ITEM_NAME_BYTES,
+    MAX_TOKENS_PER_ITEM, StoredRecord, TOMBSTONE_TTL, normalize_content_id,
 };
 
 /// Outcome of comparing an incoming record with the stored one.
@@ -106,12 +106,24 @@ pub(crate) fn validate_store(
             return Err("release title has too many tokens".into());
         }
     }
+    if let Some(content_id) = &item.content_id {
+        if item.kind != ItemKind::Track {
+            return Err("content id is only valid for track records".into());
+        }
+        if normalize_content_id(content_id).as_deref() != Some(content_id.as_str()) {
+            return Err("invalid content id".into());
+        }
+    }
 
     let key_matches = request.key == DhtKey::exact(network_id, &item.normalized_name)
         || item
             .search_tokens()
             .iter()
-            .any(|token| request.key == DhtKey::token(network_id, token));
+            .any(|token| request.key == DhtKey::token(network_id, token))
+        || item
+            .content_id
+            .as_deref()
+            .is_some_and(|content_id| request.key == DhtKey::content(network_id, content_id));
     if !key_matches {
         return Err("key does not correspond to the record".into());
     }
@@ -157,6 +169,7 @@ mod tests {
                 track_number: None,
                 disc_number: None,
                 duration_seconds: None,
+                content_id: None,
                 revision,
                 deleted,
                 updated_at_ms: 0,
@@ -183,6 +196,9 @@ mod tests {
                 track_number: None,
                 disc_number: None,
                 duration_seconds: Some(330.0),
+                content_id: Some(
+                    "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                ),
                 revision: 1,
                 deleted: false,
                 updated_at_ms: 0,
@@ -355,6 +371,41 @@ mod tests {
                 now,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_content_key() {
+        let net = NetworkId::from_name("test");
+        let now = 1_000_000;
+        let rec = track_with_artist(now + ACTIVE_RECORD_TTL.as_millis() as u64);
+        let content_id = rec.item.content_id.clone().expect("content id");
+
+        assert!(
+            validate_store(
+                StoreRecordRequest {
+                    key: DhtKey::content(&net, &content_id),
+                    record: rec.clone(),
+                },
+                &net,
+                now,
+            )
+            .is_ok()
+        );
+
+        let mut bad = rec;
+        bad.item.content_id =
+            Some("B3:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF".into());
+        assert!(
+            validate_store(
+                StoreRecordRequest {
+                    key: DhtKey::content(&net, &content_id),
+                    record: bad,
+                },
+                &net,
+                now,
+            )
+            .is_err()
         );
     }
 }

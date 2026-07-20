@@ -19,13 +19,13 @@ use crate::node::{Node, record_supersedes};
 use crate::normalization::{normalize_name, tokenize};
 use crate::record::{
     DhtKey, ItemId, ItemKind, LibraryItem, MAX_ARTISTS_PER_ITEM, MAX_ITEM_NAME_BYTES,
-    MAX_TOKENS_PER_ITEM, PeerId, StoredRecord, now_ms, validate_name,
+    MAX_TOKENS_PER_ITEM, PeerId, StoredRecord, normalize_content_id, now_ms, validate_name,
 };
 use crate::routing::{NodeContact, NodeId};
 
 /// Fixed schema of the music-dht protocol; peers with a different schema are
 /// rejected by `federation-net` during the handshake.
-pub const SCHEMA_NAME: &str = "music-dht-poc-v2";
+pub const SCHEMA_NAME: &str = "music-dht-poc-v3";
 
 /// Capacity of the application event channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -108,6 +108,8 @@ pub struct ItemSpec {
     pub disc_number: Option<i32>,
     /// Track duration in seconds for tracks.
     pub duration_seconds: Option<f64>,
+    /// Stable audio content id for tracks (`b3:<64 lowercase hex chars>`).
+    pub content_id: Option<String>,
 }
 
 fn sanitize_artist_names(
@@ -184,6 +186,19 @@ fn same_content(a: &LibraryItem, b: &LibraryItem) -> bool {
         && a.track_number == b.track_number
         && a.disc_number == b.disc_number
         && a.duration_seconds == b.duration_seconds
+        && a.content_id == b.content_id
+}
+
+fn merge_records(merged: &mut HashMap<(ItemId, PeerId), StoredRecord>, records: Vec<StoredRecord>) {
+    for record in records {
+        let key = (record.item.id, record.item.owner);
+        match merged.get(&key) {
+            Some(existing) if !record_supersedes(&record, existing) => {}
+            _ => {
+                merged.insert(key, record);
+            }
+        }
+    }
 }
 
 /// Result of a combined local + network search.
@@ -427,6 +442,11 @@ impl MusicDhtService {
                 &mut seen_artists,
                 MAX_ARTISTS_PER_ITEM.saturating_sub(artist_names.len()),
             );
+            let content_id = if spec.kind == ItemKind::Track {
+                spec.content_id.as_deref().and_then(normalize_content_id)
+            } else {
+                None
+            };
             let mut item = LibraryItem {
                 id,
                 owner,
@@ -441,6 +461,7 @@ impl MusicDhtService {
                 track_number: positive_index(spec.track_number),
                 disc_number: positive_index(spec.disc_number),
                 duration_seconds: spec.duration_seconds.filter(|duration| *duration > 0.0),
+                content_id,
                 revision: 1,
                 deleted: false,
                 updated_at_ms: now_ms(),
@@ -535,21 +556,10 @@ impl MusicDhtService {
         let mut discovered_nodes = 0usize;
         // (item id, owner) -> best record seen so far.
         let mut merged: HashMap<(ItemId, PeerId), StoredRecord> = HashMap::new();
-        fn merge(merged: &mut HashMap<(ItemId, PeerId), StoredRecord>, records: Vec<StoredRecord>) {
-            for record in records {
-                let key = (record.item.id, record.item.owner);
-                match merged.get(&key) {
-                    Some(existing) if !record_supersedes(&record, existing) => {}
-                    _ => {
-                        merged.insert(key, record);
-                    }
-                }
-            }
-        }
 
         // Step 1: the exact key — local replicas, then the network.
         let exact_key = DhtKey::exact(&network_id, &normalized);
-        merge(
+        merge_records(
             &mut merged,
             self.node.db.dht_records_by_key(exact_key, now_ms()).await?,
         );
@@ -559,21 +569,21 @@ impl MusicDhtService {
             .await;
         queried_nodes += outcome.queried;
         discovered_nodes = discovered_nodes.max(outcome.discovered);
-        merge(&mut merged, outcome.records);
+        merge_records(&mut merged, outcome.records);
 
         // Step 2: token keys — always, not only as a fallback. The exact key
         // of "massive attack" carries the artist record only; the artist's
         // releases and tracks live under the token keys.
         for token in &tokens {
             let key = DhtKey::token(&network_id, token);
-            merge(
+            merge_records(
                 &mut merged,
                 self.node.db.dht_records_by_key(key, now_ms()).await?,
             );
             let outcome = self.node.lookup(*key.as_bytes(), Some(key)).await;
             queried_nodes += outcome.queried;
             discovered_nodes = discovered_nodes.max(outcome.discovered);
-            merge(&mut merged, outcome.records);
+            merge_records(&mut merged, outcome.records);
         }
 
         // Drop tombstones and expired records, then rank: full-token matches
@@ -594,6 +604,60 @@ impl MusicDhtService {
             matches_all_tokens(b)
                 .cmp(&matches_all_tokens(a))
                 .then_with(|| a.normalized_name.cmp(&b.normalized_name))
+        });
+
+        Ok(SearchOutcome {
+            local_results,
+            network_results,
+            queried_nodes,
+            discovered_nodes,
+            duration: started.elapsed(),
+        })
+    }
+
+    /// Searches locally and across the DHT for the exact same audio content.
+    ///
+    /// `content_id` must be the canonical `b3:<64 hex>` identifier generated
+    /// from the audio file bytes. This lookup is intended for playback
+    /// fallback: if the originally liked peer is offline, the application can
+    /// find another peer that published the same track bytes.
+    pub async fn search_content_id(&self, content_id: &str) -> Result<SearchOutcome> {
+        self.node.ensure_running()?;
+        let started = Instant::now();
+        let content_id = normalize_content_id(content_id).ok_or(MusicDhtError::InvalidItemName)?;
+        let network_id = self.node.config.network_id;
+
+        let local_results: Vec<LibraryItem> = self
+            .node
+            .db
+            .list_local_items(false)
+            .await?
+            .into_iter()
+            .filter(|item| item.content_id.as_deref() == Some(content_id.as_str()))
+            .collect();
+
+        let key = DhtKey::content(&network_id, &content_id);
+        let mut merged: HashMap<(ItemId, PeerId), StoredRecord> = HashMap::new();
+        merge_records(
+            &mut merged,
+            self.node.db.dht_records_by_key(key, now_ms()).await?,
+        );
+        let outcome = self.node.lookup(*key.as_bytes(), Some(key)).await;
+        let queried_nodes = outcome.queried;
+        let discovered_nodes = outcome.discovered;
+        merge_records(&mut merged, outcome.records);
+
+        let now = now_ms();
+        let mut network_results: Vec<LibraryItem> = merged
+            .into_values()
+            .filter(|record| !record.item.deleted && record.expires_at_ms > now)
+            .filter(|record| record.item.content_id.as_deref() == Some(content_id.as_str()))
+            .map(|record| record.item)
+            .collect();
+        network_results.sort_by(|a, b| {
+            a.normalized_name
+                .cmp(&b.normalized_name)
+                .then_with(|| a.owner.to_string().cmp(&b.owner.to_string()))
         });
 
         Ok(SearchOutcome {

@@ -16,6 +16,9 @@
 //!   one exact key for the whole normalized name plus one key per token of
 //!   the name, every main/featured artist name and the track's release title
 //!   (so a track is found by its artists).
+//! * Track records may also carry a compact `b3:<hex>` content id and are then
+//!   published under a content key, so applications can find another peer with
+//!   the exact same audio bytes.
 //! * Records are replicated to the `K` nodes whose ids are XOR-closest to
 //!   each key, discovered with an iterative Kademlia-style lookup (never a
 //!   broadcast).
@@ -55,6 +58,7 @@
 //!         track_number: Some(10),
 //!         disc_number: Some(1),
 //!         duration_seconds: Some(330.0),
+//!         content_id: None,
 //!     }])
 //!     .await?;
 //!
@@ -99,7 +103,8 @@ pub use message::{
 pub use normalization::{normalize_name, tokenize};
 pub use record::{
     ACTIVE_RECORD_TTL, DhtKey, ItemId, ItemKind, LibraryItem, MAX_ARTISTS_PER_ITEM,
-    MAX_ITEM_NAME_BYTES, MAX_TOKENS_PER_ITEM, PeerId, StoredRecord, TOMBSTONE_TTL,
+    MAX_CONTENT_ID_BYTES, MAX_ITEM_NAME_BYTES, MAX_TOKENS_PER_ITEM, PeerId, StoredRecord,
+    TOMBSTONE_TTL, normalize_content_id,
 };
 pub use request::MAX_PENDING_REQUESTS;
 pub use routing::{

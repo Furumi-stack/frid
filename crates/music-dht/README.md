@@ -16,11 +16,13 @@ an application-oriented API.
 A [`LibraryItem`] carries: `kind` (artist | release | track), `name`,
 `artist_names` (main artists for releases/tracks), `featured_artist_names`
 (for track guest appearances), `year`, `release_type`, `release_title`,
-`track_number`, `disc_number`, `duration_seconds`, plus ownership and
-versioning metadata. Records are published under one exact key (the
+`track_number`, `disc_number`, `duration_seconds`, optional track `content_id`
+(`b3:<64 hex>`), plus ownership and versioning metadata. Records are
+published under one exact key (the
 normalized name) and one token key per word of the name, every main/featured
 artist name and the track release title, so searching for an artist also
-returns their releases, tracks and guest appearances.
+returns their releases, tracks and guest appearances. Track records with a
+`content_id` are also published under a content key for exact-audio fallback.
 
 ## API
 
@@ -43,6 +45,7 @@ service.sync_library(vec![
         track_number: None,
         disc_number: None,
         duration_seconds: None,
+        content_id: None,
     },
     // ...
 ]).await?;

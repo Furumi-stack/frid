@@ -9,7 +9,7 @@ use crate::record::{DhtKey, StoredRecord};
 use crate::routing::{NodeContact, NodeId};
 
 /// Version of the music-dht protocol.
-pub const DHT_PROTOCOL_VERSION: u16 = 2;
+pub const DHT_PROTOCOL_VERSION: u16 = 3;
 /// Maximum number of contacts in a single [`PeerExchange`].
 pub const MAX_PEER_EXCHANGE_CONTACTS: usize = 32;
 /// Maximum number of records in a single [`FindValueResponse`].

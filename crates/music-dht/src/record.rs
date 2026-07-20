@@ -20,6 +20,8 @@ pub const MAX_TOKENS_PER_ITEM: usize = 32;
 /// Maximum number of artist names carried by one release/track record across
 /// main and featured roles.
 pub const MAX_ARTISTS_PER_ITEM: usize = 16;
+/// Maximum canonical content id length in UTF-8 bytes.
+pub const MAX_CONTENT_ID_BYTES: usize = 96;
 /// Maximum lifetime of an active DHT record.
 pub const ACTIVE_RECORD_TTL: Duration = Duration::from_secs(30 * 60);
 /// Maximum lifetime of a tombstone.
@@ -175,6 +177,10 @@ pub struct LibraryItem {
     pub disc_number: Option<i32>,
     /// Track duration in seconds for track records.
     pub duration_seconds: Option<f64>,
+    /// Stable audio content id for track records, currently
+    /// `b3:<64 lowercase hex chars>` (BLAKE3 of the audio file bytes).
+    #[serde(default)]
+    pub content_id: Option<String>,
     /// Monotonically increasing revision; bumped on every change.
     pub revision: u64,
     /// `true` if this record is a deletion tombstone.
@@ -195,6 +201,11 @@ impl LibraryItem {
             if seen.insert(token.clone()) {
                 keys.push(DhtKey::token(network_id, &token));
             }
+        }
+        if self.kind == ItemKind::Track
+            && let Some(content_id) = &self.content_id
+        {
+            keys.push(DhtKey::content(network_id, content_id));
         }
         keys
     }
@@ -255,6 +266,16 @@ impl DhtKey {
         Self(*hasher.finalize().as_bytes())
     }
 
+    /// Key for stable audio content lookups:
+    /// `BLAKE3(NetworkId || "item:content:" || content_id)`.
+    pub fn content(network_id: &NetworkId, content_id: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(network_id.as_bytes());
+        hasher.update(b"item:content:");
+        hasher.update(content_id.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
     /// Creates a key from raw bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -301,6 +322,23 @@ pub(crate) fn validate_name(name: &str) -> Result<String, MusicDhtError> {
         return Err(MusicDhtError::ItemNameTooLong);
     }
     Ok(normalized)
+}
+
+/// Returns a canonical content id accepted by this DHT version.
+///
+/// The current format is `b3:<64 lowercase hex chars>`, where the payload is
+/// the BLAKE3 hash of the audio file bytes. The short algorithm prefix keeps
+/// the DHT key stable if another content-id format is ever added later.
+pub fn normalize_content_id(content_id: &str) -> Option<String> {
+    let value = content_id.trim().to_ascii_lowercase();
+    if value.is_empty() || value.len() > MAX_CONTENT_ID_BYTES {
+        return None;
+    }
+    let hash = value.strip_prefix("b3:")?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(value)
 }
 
 #[cfg(test)]
@@ -370,6 +408,7 @@ mod tests {
             track_number: None,
             disc_number: None,
             duration_seconds: None,
+            content_id: None,
             revision: 1,
             deleted: false,
             updated_at_ms: 0,
@@ -399,6 +438,9 @@ mod tests {
             track_number: Some(3),
             disc_number: Some(1),
             duration_seconds: Some(314.0),
+            content_id: Some(
+                "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
             revision: 1,
             deleted: false,
             updated_at_ms: 0,
@@ -428,5 +470,43 @@ mod tests {
             validate_name(&many_tokens),
             Err(MusicDhtError::ItemNameTooLong)
         ));
+    }
+
+    #[test]
+    fn content_id_validation_and_keying() {
+        let content_id = "B3:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        let canonical = normalize_content_id(content_id).expect("valid content id");
+        assert_eq!(
+            canonical,
+            "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert!(normalize_content_id("sha256:abc").is_none());
+        assert!(normalize_content_id("b3:not-hex").is_none());
+
+        let owner = test_peer(9);
+        let item = LibraryItem {
+            id: ItemId::from_bytes([3u8; 32]),
+            owner,
+            kind: ItemKind::Track,
+            name: "Teardrop".into(),
+            normalized_name: "teardrop".into(),
+            artist_names: vec!["Massive Attack".into()],
+            featured_artist_names: Vec::new(),
+            year: Some(1998),
+            release_type: Some("album".into()),
+            release_title: Some("Mezzanine".into()),
+            track_number: Some(10),
+            disc_number: Some(1),
+            duration_seconds: Some(330.0),
+            content_id: Some(canonical.clone()),
+            revision: 1,
+            deleted: false,
+            updated_at_ms: 0,
+        };
+        let net = NetworkId::from_name("test");
+        assert!(
+            item.dht_keys(&net)
+                .contains(&DhtKey::content(&net, &canonical))
+        );
     }
 }
