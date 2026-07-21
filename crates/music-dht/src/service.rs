@@ -525,6 +525,12 @@ impl MusicDhtService {
         self.node.db.list_local_items(false).await
     }
 
+    /// Counts non-expired DHT replica records stored by this node.
+    pub async fn dht_record_count(&self) -> Result<usize> {
+        self.node.ensure_running()?;
+        self.node.db.dht_record_count(now_ms()).await
+    }
+
     /// Searches only the local database.
     pub async fn search_local(&self, query: &str) -> Result<Vec<LibraryItem>> {
         let normalized = normalize_name(query);

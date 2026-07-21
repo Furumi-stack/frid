@@ -113,6 +113,13 @@ pub trait MusicDhtStorage: std::fmt::Debug + Send + Sync {
     /// Returns non-expired replicas stored under `key`, including tombstones.
     async fn dht_records_by_key(&self, key: DhtKey, now_ms: u64) -> Result<Vec<StoredRecord>>;
 
+    /// Counts non-expired DHT replica records stored by this node.
+    async fn dht_record_count(&self, _now_ms: u64) -> Result<usize> {
+        Err(MusicDhtError::Database(
+            "DHT record counts are not supported by this storage backend".to_string(),
+        ))
+    }
+
     /// Deletes expired replicas. Returns the number of removed rows.
     async fn delete_expired_records(&self, now_ms: u64) -> Result<usize>;
 
@@ -341,6 +348,19 @@ impl Database {
         .await
     }
 
+    /// Counts non-expired DHT replica records stored by this node.
+    pub async fn dht_record_count(&self, now_ms: u64) -> Result<usize> {
+        self.call(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM dht_records WHERE expires_at_ms > ?1",
+                params![now_ms as i64],
+                |row| row.get(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
+        .await
+    }
+
     /// Deletes expired replicas. Returns the number of removed rows.
     pub async fn delete_expired_records(&self, now_ms: u64) -> Result<usize> {
         self.call(move |conn| {
@@ -442,6 +462,10 @@ impl MusicDhtStorage for Database {
 
     async fn dht_records_by_key(&self, key: DhtKey, now_ms: u64) -> Result<Vec<StoredRecord>> {
         Database::dht_records_by_key(self, key, now_ms).await
+    }
+
+    async fn dht_record_count(&self, now_ms: u64) -> Result<usize> {
+        Database::dht_record_count(self, now_ms).await
     }
 
     async fn delete_expired_records(&self, now_ms: u64) -> Result<usize> {
@@ -580,8 +604,10 @@ mod tests {
         };
         assert!(db.store_dht_record(key, record).await.expect("store"));
         assert_eq!(db.dht_records_by_key(key, now).await.expect("get").len(), 1);
+        assert_eq!(db.dht_record_count(now).await.expect("count"), 1);
         // After expiry the record is filtered out and then swept.
         let later = now + 100;
+        assert_eq!(db.dht_record_count(later).await.expect("count"), 0);
         assert!(
             db.dht_records_by_key(key, later)
                 .await

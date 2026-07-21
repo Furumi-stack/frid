@@ -430,7 +430,7 @@ impl Node {
                 match self.db.store_dht_record(key, record).await {
                     Ok(stored) => {
                         if stored {
-                            info!(
+                            debug!(
                                 item = %artist_id,
                                 tombstone = deleted,
                                 from = %sender,
@@ -719,7 +719,7 @@ impl Node {
         candidates.retain(|contact| !self.dial_backoff_active(&contact.peer_id, closest_now));
         candidates.sort_by_key(|contact| distance(contact.node_id.as_bytes(), &target));
         candidates.truncate(K);
-        info!(
+        debug!(
             queried = queried.len(),
             discovered = known.len(),
             records = records.len(),
@@ -796,7 +796,7 @@ impl Node {
                 }
             }
         }
-        info!(
+        debug!(
             item = %item.id,
             tombstone = item.deleted,
             keys = keys.len(),
