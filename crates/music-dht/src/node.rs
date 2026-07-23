@@ -426,47 +426,17 @@ impl Node {
         }
     }
 
-    async fn answer_store(&self, request: StoreRecordRequest, sender: &EndpointId) -> bool {
-        if self.is_shutting_down() {
-            return false;
-        }
-        let key = request.key;
-        match validate_store(request, &self.config.network_id, now_ms()) {
-            Ok(record) => {
-                let artist_id = record.item.id;
-                let deleted = record.item.deleted;
-                match self.db.store_dht_record(key, record).await {
-                    Ok(stored) => {
-                        if stored {
-                            debug!(
-                                item = %artist_id,
-                                tombstone = deleted,
-                                from = %sender,
-                                "stored DHT record"
-                            );
-                        }
-                        stored
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "failed to store DHT record");
-                        false
-                    }
-                }
-            }
-            Err(reason) => {
-                warn!(from = %sender, reason = %reason, "rejected DHT store request");
-                false
-            }
-        }
-    }
-
-    /// Validates and stores every entry of a batch individually: one bad
-    /// entry never poisons the rest.
+    /// Validates every entry of a batch individually — one bad entry never
+    /// poisons the rest — and applies the valid ones in a single write
+    /// transaction.
     async fn answer_store_batch(
         &self,
         request: StoreBatchRequest,
         sender: &EndpointId,
     ) -> StoreBatchResponse {
+        if self.is_shutting_down() {
+            return StoreBatchResponse { stored: 0 };
+        }
         if request.entries.len() > MAX_RECORDS_PER_BATCH {
             warn!(
                 from = %sender,
@@ -475,12 +445,26 @@ impl Node {
             );
             return StoreBatchResponse { stored: 0 };
         }
-        let mut stored = 0u32;
+        let received = request.entries.len();
+        let now = now_ms();
+        let mut valid = Vec::with_capacity(received);
         for entry in request.entries {
-            if self.answer_store(entry, sender).await {
-                stored += 1;
+            let key = entry.key;
+            match validate_store(entry, &self.config.network_id, now) {
+                Ok(record) => valid.push((key, record)),
+                Err(reason) => {
+                    warn!(from = %sender, reason = %reason, "rejected DHT store entry");
+                }
             }
         }
+        let stored = match self.db.store_dht_records(valid).await {
+            Ok(outcomes) => outcomes.into_iter().filter(|stored| *stored).count() as u32,
+            Err(err) => {
+                warn!(error = %err, "failed to store DHT record batch");
+                0
+            }
+        };
+        debug!(from = %sender, received, stored, "stored DHT record batch");
         StoreBatchResponse { stored }
     }
 
@@ -814,6 +798,8 @@ impl Node {
         let mut local_replica = false;
         // Batches under construction, keyed by the index into `contacts`.
         let mut per_peer: HashMap<usize, Vec<StoreRecordRequest>> = HashMap::new();
+        // Own replicas, applied in one write transaction at the end.
+        let mut own_replicas: Vec<(DhtKey, StoredRecord)> = Vec::new();
         // K-closest target sets are memoized per key: token keys repeat
         // heavily across the items of one artist or release.
         let mut targets_memo: HashMap<DhtKey, Vec<usize>> = HashMap::new();
@@ -845,10 +831,7 @@ impl Node {
                             <= distance(contacts[*farthest].node_id.as_bytes(), key.as_bytes())
                     });
                 if self_is_close {
-                    match self.db.store_dht_record(key, record.clone()).await {
-                        Ok(_) => local_replica = true,
-                        Err(err) => warn!(error = %err, "failed to store own replica"),
-                    }
+                    own_replicas.push((key, record.clone()));
                 }
 
                 for index in targets.iter() {
@@ -857,6 +840,13 @@ impl Node {
                         record: record.clone(),
                     });
                 }
+            }
+        }
+
+        if !own_replicas.is_empty() {
+            match self.db.store_dht_records(own_replicas).await {
+                Ok(_) => local_replica = true,
+                Err(err) => warn!(error = %err, "failed to store own replicas"),
             }
         }
 

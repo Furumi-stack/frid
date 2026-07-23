@@ -8,14 +8,17 @@ use serde::{Deserialize, Serialize};
 use crate::record::{DhtKey, StoredRecord};
 use crate::routing::{NodeContact, NodeId};
 
-/// Version of the music-dht protocol.
-pub const DHT_PROTOCOL_VERSION: u16 = 4;
+/// Version of the music-dht protocol. Batch limits are enforced by the
+/// receiver, so raising them is a version bump too.
+pub const DHT_PROTOCOL_VERSION: u16 = 5;
 /// Maximum number of contacts in a single [`PeerExchange`].
 pub const MAX_PEER_EXCHANGE_CONTACTS: usize = 32;
 /// Maximum number of records in a single [`FindValueResponse`].
 pub const MAX_RECORDS_PER_RESPONSE: usize = 256;
-/// Maximum number of entries in a single [`StoreBatchRequest`].
-pub const MAX_RECORDS_PER_BATCH: usize = 64;
+/// Maximum number of entries in a single [`StoreBatchRequest`]. Sized so a
+/// batch of typical records nearly fills the byte budget: replicating a
+/// 20k-track library takes hundreds of requests, not tens of thousands.
+pub const MAX_RECORDS_PER_BATCH: usize = 512;
 
 /// Correlates a response with its request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

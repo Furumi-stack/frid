@@ -110,6 +110,17 @@ pub trait MusicDhtStorage: std::fmt::Debug + Send + Sync {
     /// or refreshed.
     async fn store_dht_record(&self, key: DhtKey, record: StoredRecord) -> Result<bool>;
 
+    /// Applies a batch of validated incoming records, one flag per entry in
+    /// order. Backends should override this with a single write transaction:
+    /// per-record commits dominate the cost of replicating a large library.
+    async fn store_dht_records(&self, entries: Vec<(DhtKey, StoredRecord)>) -> Result<Vec<bool>> {
+        let mut stored = Vec::with_capacity(entries.len());
+        for (key, record) in entries {
+            stored.push(self.store_dht_record(key, record).await?);
+        }
+        Ok(stored)
+    }
+
     /// Returns non-expired replicas stored under `key`, including tombstones.
     async fn dht_records_by_key(&self, key: DhtKey, now_ms: u64) -> Result<Vec<StoredRecord>>;
 
@@ -272,44 +283,24 @@ impl Database {
     /// the revision/tombstone rules. Returns `true` if the record was written
     /// or refreshed.
     pub async fn store_dht_record(&self, key: DhtKey, record: StoredRecord) -> Result<bool> {
+        self.call(move |conn| store_record_in_conn(conn, &key, &record))
+            .await
+    }
+
+    /// Applies a whole batch of records inside one transaction: one commit
+    /// instead of one per record.
+    pub async fn store_dht_records(
+        &self,
+        entries: Vec<(DhtKey, StoredRecord)>,
+    ) -> Result<Vec<bool>> {
         self.call(move |conn| {
-            let existing: Option<(i64, i64, i64)> = conn
-                .query_row(
-                    "SELECT revision, deleted, expires_at_ms FROM dht_records
-                     WHERE dht_key = ?1 AND artist_id = ?2 AND owner_peer_id = ?3",
-                    params![
-                        key.as_bytes().as_slice(),
-                        record.item.id.as_bytes().as_slice(),
-                        record.item.owner.to_string(),
-                    ],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            let existing =
-                existing.map(|(rev, del, exp)| (rev as u64, del != 0, exp as u64));
-            match decide_store(existing, &record) {
-                StoreDecision::Ignore => Ok(false),
-                StoreDecision::Write | StoreDecision::RefreshExpiry(_) => {
-                    let payload = postcard::to_stdvec(&record).map_err(|err| {
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                    })?;
-                    conn.execute(
-                        "INSERT OR REPLACE INTO dht_records
-                         (dht_key, artist_id, owner_peer_id, payload, revision, deleted, expires_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            key.as_bytes().as_slice(),
-                            record.item.id.as_bytes().as_slice(),
-                            record.item.owner.to_string(),
-                            payload,
-                            record.item.revision as i64,
-                            record.item.deleted as i64,
-                            record.expires_at_ms as i64,
-                        ],
-                    )?;
-                    Ok(true)
-                }
+            let tx = conn.unchecked_transaction()?;
+            let mut stored = Vec::with_capacity(entries.len());
+            for (key, record) in &entries {
+                stored.push(store_record_in_conn(&tx, key, record)?);
             }
+            tx.commit()?;
+            Ok(stored)
         })
         .await
     }
@@ -460,6 +451,10 @@ impl MusicDhtStorage for Database {
         Database::store_dht_record(self, key, record).await
     }
 
+    async fn store_dht_records(&self, entries: Vec<(DhtKey, StoredRecord)>) -> Result<Vec<bool>> {
+        Database::store_dht_records(self, entries).await
+    }
+
     async fn dht_records_by_key(&self, key: DhtKey, now_ms: u64) -> Result<Vec<StoredRecord>> {
         Database::dht_records_by_key(self, key, now_ms).await
     }
@@ -482,6 +477,51 @@ impl MusicDhtStorage for Database {
 
     async fn load_known_peers(&self) -> Result<Vec<NodeContact>> {
         Database::load_known_peers(self).await
+    }
+}
+
+/// Applies one validated record to the replica store, following the
+/// revision/tombstone rules. Returns `true` if the record was written or
+/// refreshed. Runs against a plain connection or an open transaction.
+fn store_record_in_conn(
+    conn: &Connection,
+    key: &DhtKey,
+    record: &StoredRecord,
+) -> rusqlite::Result<bool> {
+    let existing: Option<(i64, i64, i64)> = conn
+        .query_row(
+            "SELECT revision, deleted, expires_at_ms FROM dht_records
+             WHERE dht_key = ?1 AND artist_id = ?2 AND owner_peer_id = ?3",
+            params![
+                key.as_bytes().as_slice(),
+                record.item.id.as_bytes().as_slice(),
+                record.item.owner.to_string(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let existing = existing.map(|(rev, del, exp)| (rev as u64, del != 0, exp as u64));
+    match decide_store(existing, record) {
+        StoreDecision::Ignore => Ok(false),
+        StoreDecision::Write | StoreDecision::RefreshExpiry(_) => {
+            let payload = postcard::to_stdvec(record)
+                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO dht_records
+                 (dht_key, artist_id, owner_peer_id, payload, revision, deleted, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    key.as_bytes().as_slice(),
+                    record.item.id.as_bytes().as_slice(),
+                    record.item.owner.to_string(),
+                    payload,
+                    record.item.revision as i64,
+                    record.item.deleted as i64,
+                    record.expires_at_ms as i64,
+                ],
+            )?;
+            Ok(true)
+        }
     }
 }
 
@@ -588,6 +628,40 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(found, vec![track]);
+    }
+
+    #[tokio::test]
+    async fn record_batch_stores_in_one_call() {
+        let (_dir, db) = open_temp().await;
+        let owner = test_peer(1);
+        let net = federation_net::NetworkId::from_name("t");
+        let now = now_ms();
+        let entry = |name: &str, revision: u64| {
+            let item = item(owner, name, revision, false);
+            (
+                DhtKey::exact(&net, &item.normalized_name),
+                StoredRecord {
+                    item,
+                    publisher: owner,
+                    expires_at_ms: now + 60_000,
+                },
+            )
+        };
+
+        let stored = db
+            .store_dht_records(vec![entry("Massive Attack", 1), entry("Portishead", 1)])
+            .await
+            .expect("store batch");
+        assert_eq!(stored, vec![true, true]);
+        assert_eq!(db.dht_record_count(now).await.expect("count"), 2);
+
+        // A replay of the same batch changes nothing but reports it honestly.
+        let replayed = db
+            .store_dht_records(vec![entry("Massive Attack", 1), entry("Portishead", 2)])
+            .await
+            .expect("store batch");
+        assert_eq!(replayed, vec![false, true]);
+        assert_eq!(db.dht_record_count(now).await.expect("count"), 2);
     }
 
     #[tokio::test]
