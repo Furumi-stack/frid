@@ -9,11 +9,13 @@ use crate::record::{DhtKey, StoredRecord};
 use crate::routing::{NodeContact, NodeId};
 
 /// Version of the music-dht protocol.
-pub const DHT_PROTOCOL_VERSION: u16 = 3;
+pub const DHT_PROTOCOL_VERSION: u16 = 4;
 /// Maximum number of contacts in a single [`PeerExchange`].
 pub const MAX_PEER_EXCHANGE_CONTACTS: usize = 32;
 /// Maximum number of records in a single [`FindValueResponse`].
 pub const MAX_RECORDS_PER_RESPONSE: usize = 256;
+/// Maximum number of entries in a single [`StoreBatchRequest`].
+pub const MAX_RECORDS_PER_BATCH: usize = 64;
 
 /// Correlates a response with its request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,7 +129,8 @@ pub enum FindValueResponse {
     },
 }
 
-/// Asks the receiver to store a replica of a record.
+/// One record replica to store, always carried inside a
+/// [`StoreBatchRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreRecordRequest {
     /// The key the record is published under.
@@ -136,11 +139,22 @@ pub struct StoreRecordRequest {
     pub record: StoredRecord,
 }
 
-/// Reply to [`StoreRecordRequest`].
+/// Asks the receiver to store replicas of several records at once.
+///
+/// Batching keeps a full-library republish at roughly O(peers) requests
+/// instead of O(records × keys): each receiver validates every entry
+/// individually, so one bad entry never poisons the rest of the batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoreRecordResponse {
-    /// `true` if the record was accepted and stored (or refreshed).
-    pub stored: bool,
+pub struct StoreBatchRequest {
+    /// At most [`MAX_RECORDS_PER_BATCH`] entries.
+    pub entries: Vec<StoreRecordRequest>,
+}
+
+/// Reply to [`StoreBatchRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreBatchResponse {
+    /// How many entries were accepted and stored (or refreshed).
+    pub stored: u32,
 }
 
 /// Every message exchanged between music-dht peers.
@@ -167,8 +181,8 @@ pub enum MusicDhtMessage {
     /// Reply to `FindValue`.
     FindValueResult(ResponseEnvelope<FindValueResponse>),
 
-    /// Replication request.
-    StoreRecord(RequestEnvelope<StoreRecordRequest>),
-    /// Reply to `StoreRecord`.
-    StoreRecordResult(ResponseEnvelope<StoreRecordResponse>),
+    /// Batched replication request.
+    StoreBatch(RequestEnvelope<StoreBatchRequest>),
+    /// Reply to `StoreBatch`.
+    StoreBatchResult(ResponseEnvelope<StoreBatchResponse>),
 }

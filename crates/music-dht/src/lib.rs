@@ -96,9 +96,9 @@ pub use dht::{StoreDecision, decide_store};
 pub use error::{MusicDhtError, Result};
 pub use message::{
     DHT_PROTOCOL_VERSION, FindNodeRequest, FindNodeResponse, FindValueRequest, FindValueResponse,
-    Hello, MAX_PEER_EXCHANGE_CONTACTS, MAX_RECORDS_PER_RESPONSE, MusicDhtMessage, PeerExchange,
-    PingRequest, PongResponse, RequestEnvelope, RequestId, ResponseEnvelope, StoreRecordRequest,
-    StoreRecordResponse,
+    Hello, MAX_PEER_EXCHANGE_CONTACTS, MAX_RECORDS_PER_BATCH, MAX_RECORDS_PER_RESPONSE,
+    MusicDhtMessage, PeerExchange, PingRequest, PongResponse, RequestEnvelope, RequestId,
+    ResponseEnvelope, StoreBatchRequest, StoreBatchResponse, StoreRecordRequest,
 };
 pub use normalization::{normalize_name, tokenize};
 pub use record::{

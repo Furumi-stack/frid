@@ -19,8 +19,9 @@ use crate::dht::validate_store;
 use crate::error::{MusicDhtError, Result};
 use crate::message::{
     DHT_PROTOCOL_VERSION, FindNodeRequest, FindNodeResponse, FindValueRequest, FindValueResponse,
-    Hello, MAX_PEER_EXCHANGE_CONTACTS, MusicDhtMessage, PeerExchange, PingRequest, PongResponse,
-    RequestEnvelope, RequestId, ResponseEnvelope, StoreRecordRequest, StoreRecordResponse,
+    Hello, MAX_PEER_EXCHANGE_CONTACTS, MAX_RECORDS_PER_BATCH, MusicDhtMessage, PeerExchange,
+    PingRequest, PongResponse, RequestEnvelope, RequestId, ResponseEnvelope, StoreBatchRequest,
+    StoreBatchResponse, StoreRecordRequest,
 };
 use crate::record::{ACTIVE_RECORD_TTL, DhtKey, LibraryItem, StoredRecord, TOMBSTONE_TTL, now_ms};
 use crate::request::{DhtResponse, PendingRequests};
@@ -59,15 +60,22 @@ enum OutboundRequest {
     Ping,
     FindNode(FindNodeRequest),
     FindValue(FindValueRequest),
-    Store(Box<StoreRecordRequest>),
+    StoreBatch(Box<StoreBatchRequest>),
 }
+
+/// Upper bound on the estimated payload bytes of one [`StoreBatchRequest`].
+/// Kept far below federation-net's frame limit so envelope overhead and
+/// estimation error never push a frame over it.
+const MAX_BATCH_BYTES: usize = 128 * 1024;
+
+/// Items processed per publish wave; bounds the memory used for per-peer
+/// batch construction during a full-library republish.
+const PUBLISH_WAVE_ITEMS: usize = 256;
 
 /// Result of one iterative lookup.
 pub(crate) struct LookupOutcome {
     /// Records found (value lookups only).
     pub records: Vec<StoredRecord>,
-    /// Closest known contacts to the target, best first, at most `K`.
-    pub closest: Vec<NodeContact>,
     /// Number of distinct peers actually queried.
     pub queried: usize,
     /// Number of distinct nodes known to the lookup (seeds + discovered).
@@ -330,11 +338,11 @@ impl Node {
                 });
                 let _ = self.send_message(peer, &response).await;
             }
-            MusicDhtMessage::StoreRecord(env) => {
-                let stored = self.answer_store(env.payload, &peer).await;
-                let response = MusicDhtMessage::StoreRecordResult(ResponseEnvelope {
+            MusicDhtMessage::StoreBatch(env) => {
+                let payload = self.answer_store_batch(env.payload, &peer).await;
+                let response = MusicDhtMessage::StoreBatchResult(ResponseEnvelope {
                     request_id: env.request_id,
-                    payload: StoreRecordResponse { stored },
+                    payload,
                 });
                 let _ = self.send_message(peer, &response).await;
             }
@@ -350,9 +358,9 @@ impl Node {
                 self.pending
                     .complete(&env.request_id, &peer, DhtResponse::FindValue(env.payload));
             }
-            MusicDhtMessage::StoreRecordResult(env) => {
+            MusicDhtMessage::StoreBatchResult(env) => {
                 self.pending
-                    .complete(&env.request_id, &peer, DhtResponse::Store(env.payload));
+                    .complete(&env.request_id, &peer, DhtResponse::StoreBatch(env.payload));
             }
         }
     }
@@ -450,6 +458,30 @@ impl Node {
                 false
             }
         }
+    }
+
+    /// Validates and stores every entry of a batch individually: one bad
+    /// entry never poisons the rest.
+    async fn answer_store_batch(
+        &self,
+        request: StoreBatchRequest,
+        sender: &EndpointId,
+    ) -> StoreBatchResponse {
+        if request.entries.len() > MAX_RECORDS_PER_BATCH {
+            warn!(
+                from = %sender,
+                count = request.entries.len(),
+                "rejected oversized store batch"
+            );
+            return StoreBatchResponse { stored: 0 };
+        }
+        let mut stored = 0u32;
+        for entry in request.entries {
+            if self.answer_store(entry, sender).await {
+                stored += 1;
+            }
+        }
+        StoreBatchResponse { stored }
     }
 
     /// Makes sure a connection to the contact exists, dialing its ticket if
@@ -561,7 +593,7 @@ impl Node {
                 request_id,
                 payload,
             }),
-            OutboundRequest::Store(payload) => MusicDhtMessage::StoreRecord(RequestEnvelope {
+            OutboundRequest::StoreBatch(payload) => MusicDhtMessage::StoreBatch(RequestEnvelope {
                 request_id,
                 payload: *payload,
             }),
@@ -601,13 +633,22 @@ impl Node {
     ///
     /// With `find_value: None` this is a node lookup converging on the
     /// closest known nodes to `target`; with `Some(key)` it sends `FindValue`
-    /// and returns as soon as the **first** records arrive — in-flight
-    /// requests to slower or unreachable peers are cancelled instead of
-    /// awaited. Contacts in dial backoff are skipped. Never broadcasts: at
-    /// most [`ALPHA`] requests run concurrently and at most
+    /// and stops as soon as records arrive. How it stops depends on
+    /// `drain_round`: `false` returns on the **first** records and cancels
+    /// the in-flight requests (right when any single replica suffices, e.g.
+    /// a content-id resolution); `true` awaits the rest of the started round
+    /// first, so up to [`ALPHA`] peers contribute records (right for name
+    /// searches, where different peers store different records under the
+    /// same token key). Contacts in dial backoff are skipped. Never
+    /// broadcasts: at most [`ALPHA`] requests run concurrently and at most
     /// [`MAX_LOOKUP_REQUESTS`] are sent in total, all hard-bounded by the
     /// lookup timeout.
-    pub async fn lookup(&self, target: [u8; 32], find_value: Option<DhtKey>) -> LookupOutcome {
+    pub async fn lookup(
+        &self,
+        target: [u8; 32],
+        find_value: Option<DhtKey>,
+        drain_round: bool,
+    ) -> LookupOutcome {
         let started = Instant::now();
         let deadline = tokio::time::Instant::now() + self.config.lookup_timeout;
         let mut candidates: Vec<NodeContact> = lock(&self.routing).closest(&target, K);
@@ -698,10 +739,15 @@ impl Node {
                         last_seen_ms: now_ms(),
                     });
                 }
-                if find_value.is_some() && found_records {
+                if find_value.is_some() && found_records && !drain_round {
                     // Dropping `in_flight` cancels the outstanding requests.
                     break 'rounds;
                 }
+            }
+            if find_value.is_some() && !records.is_empty() {
+                // Drain mode: the round that produced records has completed;
+                // no further rounds are needed.
+                break;
             }
             if tokio::time::Instant::now() >= deadline {
                 debug!("lookup deadline reached");
@@ -713,12 +759,6 @@ impl Node {
             }
         }
 
-        // The closest set feeds publishes (store targets); contacts that are
-        // currently backed off would only burn a dial timeout each.
-        let closest_now = now_ms();
-        candidates.retain(|contact| !self.dial_backoff_active(&contact.peer_id, closest_now));
-        candidates.sort_by_key(|contact| distance(contact.node_id.as_bytes(), &target));
-        candidates.truncate(K);
         debug!(
             queried = queried.len(),
             discovered = known.len(),
@@ -728,84 +768,144 @@ impl Node {
         );
         LookupOutcome {
             records: records.into_values().collect(),
-            closest: candidates,
             queried: queried.len(),
             discovered: known.len(),
         }
     }
 
-    /// Publishes one item record (active or tombstone) under all its DHT
-    /// keys to the closest known nodes. Returns
-    /// `(keys, remote nodes stored, local replica stored)`.
-    pub async fn publish_item(&self, item: &LibraryItem) -> Result<PublishStats> {
+    /// Publishes item records (active or tombstones) under all their DHT
+    /// keys to the closest known nodes.
+    ///
+    /// Publish targets come straight from the routing table instead of one
+    /// iterative network lookup per key: hello/gossip and search lookups keep
+    /// the table fresh, and while the network is small every peer is in it,
+    /// so the K closest to any key are exact. On larger networks this is the
+    /// usual Kademlia approximation — a value lookup still converges onto the
+    /// same neighborhood through `CloserNodes` hops, and every record also
+    /// lives on its owner. This turns a full-library republish into
+    /// O(peers) batched requests instead of O(items × keys) lookups.
+    pub async fn publish_items(&self, items: &[LibraryItem]) -> Result<PublishStats> {
         self.ensure_running()?;
-        let ttl = if item.deleted {
-            TOMBSTONE_TTL
-        } else {
-            ACTIVE_RECORD_TTL
-        };
-        let record = StoredRecord {
-            item: item.clone(),
-            publisher: self.endpoint_id,
-            expires_at_ms: now_ms() + ttl.as_millis() as u64,
-        };
-        let keys = item.dht_keys(&self.config.network_id);
-        let mut remote_nodes: HashSet<EndpointId> = HashSet::new();
+        let mut total = PublishStats::default();
+        for wave in items.chunks(PUBLISH_WAVE_ITEMS) {
+            let stats = self.publish_wave(wave).await?;
+            total.records += stats.records;
+            total.keys += stats.keys;
+            // remote_nodes counts unique nodes per wave; report the widest
+            // replication seen across waves.
+            total.remote_nodes = total.remote_nodes.max(stats.remote_nodes);
+            total.local_replica |= stats.local_replica;
+        }
+        Ok(total)
+    }
+
+    /// Publishes one bounded wave of items: groups all (key, record) pairs
+    /// by receiving peer and sends them as [`StoreBatchRequest`]s, one peer
+    /// pipeline at a time per peer, all peers concurrently.
+    async fn publish_wave(&self, items: &[LibraryItem]) -> Result<PublishStats> {
+        let now = now_ms();
+        let contacts: Vec<NodeContact> = self
+            .known_contacts()
+            .into_iter()
+            .filter(|contact| !self.dial_backoff_active(&contact.peer_id, now))
+            .collect();
+
+        let mut keys_total = 0usize;
         let mut local_replica = false;
+        // Batches under construction, keyed by the index into `contacts`.
+        let mut per_peer: HashMap<usize, Vec<StoreRecordRequest>> = HashMap::new();
+        // K-closest target sets are memoized per key: token keys repeat
+        // heavily across the items of one artist or release.
+        let mut targets_memo: HashMap<DhtKey, Vec<usize>> = HashMap::new();
 
-        for key in &keys {
-            let outcome = self.lookup(*key.as_bytes(), None).await;
-            let targets = outcome.closest;
+        for item in items {
+            let ttl = if item.deleted {
+                TOMBSTONE_TTL
+            } else {
+                ACTIVE_RECORD_TTL
+            };
+            let record = StoredRecord {
+                item: item.clone(),
+                publisher: self.endpoint_id,
+                expires_at_ms: now + ttl.as_millis() as u64,
+            };
+            let keys = item.dht_keys(&self.config.network_id);
+            keys_total += keys.len();
+            for key in keys {
+                let targets = targets_memo
+                    .entry(key)
+                    .or_insert_with(|| closest_contact_indices(&contacts, &key, K));
 
-            // The record belongs on this node too if it is among the K
-            // closest (always true while the network is smaller than K).
-            let own_distance = distance(self.node_id.as_bytes(), key.as_bytes());
-            let self_is_close = targets.len() < K
-                || targets.last().is_none_or(|farthest| {
-                    own_distance <= distance(farthest.node_id.as_bytes(), key.as_bytes())
-                });
-            if self_is_close {
-                match self.db.store_dht_record(*key, record.clone()).await {
-                    Ok(_) => local_replica = true,
-                    Err(err) => warn!(error = %err, "failed to store own replica"),
+                // The record belongs on this node too if it is among the K
+                // closest (always true while the network is smaller than K).
+                let own_distance = distance(self.node_id.as_bytes(), key.as_bytes());
+                let self_is_close = targets.len() < K
+                    || targets.last().is_none_or(|farthest| {
+                        own_distance
+                            <= distance(contacts[*farthest].node_id.as_bytes(), key.as_bytes())
+                    });
+                if self_is_close {
+                    match self.db.store_dht_record(key, record.clone()).await {
+                        Ok(_) => local_replica = true,
+                        Err(err) => warn!(error = %err, "failed to store own replica"),
+                    }
                 }
-            }
 
-            let stores = targets.iter().map(|contact| async {
-                let result = self
-                    .request(
-                        contact,
-                        OutboundRequest::Store(Box::new(StoreRecordRequest {
-                            key: *key,
-                            record: record.clone(),
-                        })),
-                    )
-                    .await;
-                (contact.peer_id, result)
-            });
-            for (peer, result) in join_all(stores).await {
-                match result {
-                    Ok(DhtResponse::Store(StoreRecordResponse { stored: true })) => {
-                        remote_nodes.insert(peer);
-                    }
-                    Ok(DhtResponse::Store(StoreRecordResponse { stored: false })) => {
-                        debug!(peer = %peer, "peer declined to store the record");
-                    }
-                    Ok(_) => {}
-                    Err(err) => debug!(peer = %peer, error = %err, "store request failed"),
+                for index in targets.iter() {
+                    per_peer.entry(*index).or_default().push(StoreRecordRequest {
+                        key,
+                        record: record.clone(),
+                    });
                 }
             }
         }
+
+        // One concurrent pipeline per peer; batches within a pipeline are
+        // sequential so a slow peer only throttles itself.
+        let sends = per_peer.into_iter().map(|(index, entries)| {
+            let contact = &contacts[index];
+            async move {
+                let mut accepted_any = false;
+                for entries in chunk_store_batches(entries) {
+                    let sent = entries.len();
+                    let request =
+                        OutboundRequest::StoreBatch(Box::new(StoreBatchRequest { entries }));
+                    match self.request(contact, request).await {
+                        Ok(DhtResponse::StoreBatch(StoreBatchResponse { stored })) => {
+                            accepted_any |= stored > 0;
+                            if (stored as usize) < sent {
+                                debug!(
+                                    peer = %contact.peer_id,
+                                    sent,
+                                    stored,
+                                    "peer declined part of the store batch"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            debug!(peer = %contact.peer_id, error = %err, "store batch failed");
+                        }
+                    }
+                }
+                (contact.peer_id, accepted_any)
+            }
+        });
+        let mut remote_nodes: HashSet<EndpointId> = HashSet::new();
+        for (peer, accepted) in join_all(sends).await {
+            if accepted {
+                remote_nodes.insert(peer);
+            }
+        }
         debug!(
-            item = %item.id,
-            tombstone = item.deleted,
-            keys = keys.len(),
+            items = items.len(),
+            keys = keys_total,
             nodes = remote_nodes.len(),
-            "published item record"
+            "published item wave"
         );
         Ok(PublishStats {
-            records: 1,
-            keys: keys.len(),
+            records: items.len(),
+            keys: keys_total,
             remote_nodes: remote_nodes.len(),
             local_replica,
         })
@@ -815,16 +915,7 @@ impl Node {
     pub async fn republish_all(&self) -> Result<PublishStats> {
         self.ensure_running()?;
         let items = self.db.local_items_for_republish(now_ms()).await?;
-        let mut total = PublishStats::default();
-        for item in &items {
-            let stats = self.publish_item(item).await?;
-            total.records += 1;
-            total.keys += stats.keys;
-            // remote_nodes counts unique nodes per record; report the widest
-            // replication seen across records.
-            total.remote_nodes = total.remote_nodes.max(stats.remote_nodes);
-            total.local_replica |= stats.local_replica;
-        }
+        let total = self.publish_items(&items).await?;
         info!(
             records = total.records,
             keys = total.keys,
@@ -841,6 +932,40 @@ impl Node {
             Err(err) => warn!(error = %err, "failed to sweep expired records"),
         }
     }
+}
+
+/// Indices of the up-to-`count` contacts closest to `key` by XOR distance.
+fn closest_contact_indices(contacts: &[NodeContact], key: &DhtKey, count: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..contacts.len()).collect();
+    indices.sort_by_key(|index| distance(contacts[*index].node_id.as_bytes(), key.as_bytes()));
+    indices.truncate(count);
+    indices
+}
+
+/// Splits store entries into batches respecting both the entry-count and the
+/// estimated byte limits, so a batch always fits one transport frame.
+fn chunk_store_batches(entries: Vec<StoreRecordRequest>) -> Vec<Vec<StoreRecordRequest>> {
+    let mut batches = Vec::new();
+    let mut current: Vec<StoreRecordRequest> = Vec::new();
+    let mut current_bytes = 0usize;
+    for entry in entries {
+        let bytes = postcard::to_stdvec(&entry)
+            .map(|encoded| encoded.len())
+            .unwrap_or(MAX_BATCH_BYTES);
+        if !current.is_empty()
+            && (current.len() >= MAX_RECORDS_PER_BATCH
+                || current_bytes.saturating_add(bytes) > MAX_BATCH_BYTES)
+        {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += bytes;
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 /// `true` if `candidate` should replace `existing` in a search result set.
@@ -882,6 +1007,79 @@ mod tests {
             ticket: format!("fnet-test-{seed}"),
             last_seen_ms: 0,
         }
+    }
+
+    fn store_entry(name: &str) -> StoreRecordRequest {
+        let owner = test_peer(1);
+        let normalized = crate::normalization::normalize_name(name);
+        StoreRecordRequest {
+            key: DhtKey::exact(&federation_net::NetworkId::from_name("test"), &normalized),
+            record: StoredRecord {
+                item: LibraryItem {
+                    id: crate::record::ItemId::from_bytes([7u8; 32]),
+                    owner,
+                    kind: crate::record::ItemKind::Artist,
+                    name: name.to_string(),
+                    normalized_name: normalized,
+                    artist_names: Vec::new(),
+                    featured_artist_names: Vec::new(),
+                    year: None,
+                    release_type: None,
+                    release_title: None,
+                    track_number: None,
+                    disc_number: None,
+                    duration_seconds: None,
+                    content_id: None,
+                    revision: 1,
+                    deleted: false,
+                    updated_at_ms: 0,
+                },
+                publisher: owner,
+                expires_at_ms: 1000,
+            },
+        }
+    }
+
+    #[test]
+    fn store_batches_respect_count_and_byte_limits() {
+        // Count limit: MAX_RECORDS_PER_BATCH small entries per batch.
+        let entries: Vec<_> = (0..MAX_RECORDS_PER_BATCH + 1)
+            .map(|_| store_entry("Massive Attack"))
+            .collect();
+        let batches = chunk_store_batches(entries);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), MAX_RECORDS_PER_BATCH);
+        assert_eq!(batches[1].len(), 1);
+
+        // Byte limit: huge entries split well before the count limit.
+        let huge = "x".repeat(crate::record::MAX_ITEM_NAME_BYTES);
+        let entries: Vec<_> = (0..MAX_RECORDS_PER_BATCH).map(|_| store_entry(&huge)).collect();
+        for batch in chunk_store_batches(entries) {
+            assert!(!batch.is_empty());
+            let bytes: usize = batch
+                .iter()
+                .map(|entry| postcard::to_stdvec(entry).expect("encodes").len())
+                .sum();
+            assert!(bytes <= MAX_BATCH_BYTES);
+        }
+
+        assert!(chunk_store_batches(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn closest_indices_sort_by_key_distance() {
+        let contacts: Vec<NodeContact> = (1..=12u8).map(contact).collect();
+        let key = DhtKey::from_bytes([0x42u8; 32]);
+        let indices = closest_contact_indices(&contacts, &key, K);
+        assert_eq!(indices.len(), K);
+        for pair in indices.windows(2) {
+            assert!(
+                distance(contacts[pair[0]].node_id.as_bytes(), key.as_bytes())
+                    <= distance(contacts[pair[1]].node_id.as_bytes(), key.as_bytes())
+            );
+        }
+        // Fewer contacts than requested: everyone is a target.
+        assert_eq!(closest_contact_indices(&contacts[..3], &key, K).len(), 3);
     }
 
     #[test]

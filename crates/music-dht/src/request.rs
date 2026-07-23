@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 
 use crate::error::{MusicDhtError, Result};
 use crate::message::{
-    FindNodeResponse, FindValueResponse, PongResponse, RequestId, StoreRecordResponse,
+    FindNodeResponse, FindValueResponse, PongResponse, RequestId, StoreBatchResponse,
 };
 
 /// Maximum number of simultaneously pending requests.
@@ -20,7 +20,7 @@ pub(crate) enum DhtResponse {
     Pong(PongResponse),
     FindNode(FindNodeResponse),
     FindValue(FindValueResponse),
-    Store(StoreRecordResponse),
+    StoreBatch(StoreBatchResponse),
 }
 
 struct PendingEntry {

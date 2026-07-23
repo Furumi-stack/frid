@@ -502,11 +502,13 @@ impl MusicDhtService {
             to_publish.push(item);
         }
 
-        for item in &to_publish {
-            if let Err(err) = self.node.publish_item(item).await {
-                tracing::warn!(item = %item.id, error = %err, "failed to publish item");
-                stats.failed += 1;
-            }
+        if let Err(err) = self.node.publish_items(&to_publish).await {
+            tracing::warn!(
+                items = to_publish.len(),
+                error = %err,
+                "failed to publish changed items"
+            );
+            stats.failed += to_publish.len();
         }
         if stats.added + stats.updated + stats.removed > 0 {
             info!(
@@ -558,35 +560,38 @@ impl MusicDhtService {
 
         let local_results = self.node.db.search_local(normalized.clone()).await?;
 
-        let mut queried_nodes = 0usize;
-        let mut discovered_nodes = 0usize;
+        // The exact key plus one key per unique token — always, not only as
+        // a fallback. The exact key of "massive attack" carries the artist
+        // record only; the artist's releases and tracks live under the token
+        // keys.
+        let mut keys = vec![DhtKey::exact(&network_id, &normalized)];
+        let mut seen_keys: HashSet<DhtKey> = keys.iter().copied().collect();
+        for token in &tokens {
+            let key = DhtKey::token(&network_id, token);
+            if seen_keys.insert(key) {
+                keys.push(key);
+            }
+        }
+
         // (item id, owner) -> best record seen so far.
         let mut merged: HashMap<(ItemId, PeerId), StoredRecord> = HashMap::new();
 
-        // Step 1: the exact key — local replicas, then the network.
-        let exact_key = DhtKey::exact(&network_id, &normalized);
-        merge_records(
-            &mut merged,
-            self.node.db.dht_records_by_key(exact_key, now_ms()).await?,
-        );
-        let outcome = self
-            .node
-            .lookup(*exact_key.as_bytes(), Some(exact_key))
-            .await;
-        queried_nodes += outcome.queried;
-        discovered_nodes = discovered_nodes.max(outcome.discovered);
-        merge_records(&mut merged, outcome.records);
-
-        // Step 2: token keys — always, not only as a fallback. The exact key
-        // of "massive attack" carries the artist record only; the artist's
-        // releases and tracks live under the token keys.
-        for token in &tokens {
-            let key = DhtKey::token(&network_id, token);
+        // Local replicas first, then all network lookups concurrently: one
+        // slow key must not serialize the others.
+        for key in &keys {
             merge_records(
                 &mut merged,
-                self.node.db.dht_records_by_key(key, now_ms()).await?,
+                self.node.db.dht_records_by_key(*key, now_ms()).await?,
             );
-            let outcome = self.node.lookup(*key.as_bytes(), Some(key)).await;
+        }
+        let outcomes = futures::future::join_all(
+            keys.iter()
+                .map(|key| self.node.lookup(*key.as_bytes(), Some(*key), true)),
+        )
+        .await;
+        let mut queried_nodes = 0usize;
+        let mut discovered_nodes = 0usize;
+        for outcome in outcomes {
             queried_nodes += outcome.queried;
             discovered_nodes = discovered_nodes.max(outcome.discovered);
             merge_records(&mut merged, outcome.records);
@@ -648,7 +653,8 @@ impl MusicDhtService {
             &mut merged,
             self.node.db.dht_records_by_key(key, now_ms()).await?,
         );
-        let outcome = self.node.lookup(*key.as_bytes(), Some(key)).await;
+        // Any single replica resolves a content id, so the first records win.
+        let outcome = self.node.lookup(*key.as_bytes(), Some(key), false).await;
         let queried_nodes = outcome.queried;
         let discovered_nodes = outcome.discovered;
         merge_records(&mut merged, outcome.records);

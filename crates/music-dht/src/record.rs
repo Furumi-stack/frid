@@ -22,10 +22,13 @@ pub const MAX_TOKENS_PER_ITEM: usize = 32;
 pub const MAX_ARTISTS_PER_ITEM: usize = 16;
 /// Maximum canonical content id length in UTF-8 bytes.
 pub const MAX_CONTENT_ID_BYTES: usize = 96;
-/// Maximum lifetime of an active DHT record.
-pub const ACTIVE_RECORD_TTL: Duration = Duration::from_secs(30 * 60);
-/// Maximum lifetime of a tombstone.
-pub const TOMBSTONE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Maximum lifetime of an active DHT record. Long enough that replicas — and
+/// the share links resolved through them — survive the owner going offline
+/// for a workday; the owner refreshes the expiry on every republish.
+pub const ACTIVE_RECORD_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// Maximum lifetime of a tombstone. Must exceed [`ACTIVE_RECORD_TTL`] so a
+/// stale active replica can never outlive the tombstone that deletes it.
+pub const TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn fmt_hex(bytes: &[u8; 32], f: &mut fmt::Formatter<'_>) -> fmt::Result {
     for byte in bytes {
