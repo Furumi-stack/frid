@@ -20,8 +20,10 @@
 //!   published under a content key, so applications can find another peer with
 //!   the exact same audio bytes.
 //! * Records are replicated to the `K` nodes whose ids are XOR-closest to
-//!   each key, discovered with an iterative Kademlia-style lookup (never a
-//!   broadcast).
+//!   each key. Publishers pick the targets from their routing table and send
+//!   batched store requests (one pipeline per peer), so even a large library
+//!   republishes in seconds; searches discover records with an iterative
+//!   Kademlia-style lookup (never a broadcast).
 //! * Peers learn about each other through a Hello/PeerExchange gossip that
 //!   runs automatically on every new connection; connections to further
 //!   nodes are opened on demand from stored tickets.

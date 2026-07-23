@@ -155,17 +155,25 @@ async fn library_sync_and_distributed_search() {
         })
         .await;
 
-        // A content change is republished with a higher revision.
+        // A content change is republished with a higher revision. The
+        // "mezzanine" query also returns the track (its release title is
+        // indexed), so pick the release out of the results.
         let mut changed = library.clone();
         changed[1].year = Some(1997);
         let stats = b.sync_library(changed.clone()).await.expect("sync");
         assert_eq!(stats.updated, 1);
         assert_eq!(stats.unchanged, 2);
         let results = search_until("A to see the updated release", &a, "mezzanine", |items| {
-            items.len() == 1 && items[0].year == Some(1997)
+            items
+                .iter()
+                .any(|item| item.kind == ItemKind::Release && item.year == Some(1997))
         })
         .await;
-        assert!(results[0].revision >= 2);
+        let release = results
+            .iter()
+            .find(|item| item.kind == ItemKind::Release)
+            .expect("release in results");
+        assert!(release.revision >= 2);
 
         // Removing the track from the library tombstones it network-wide.
         let mut shrunk = changed.clone();
