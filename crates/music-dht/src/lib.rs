@@ -79,6 +79,7 @@
 
 mod config;
 mod database;
+pub mod device_sync;
 mod dht;
 mod error;
 mod message;
