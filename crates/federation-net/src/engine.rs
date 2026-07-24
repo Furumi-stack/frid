@@ -100,6 +100,119 @@ pub struct ByteStream {
     _connection: Connection,
 }
 
+/// The currently selected transport path kind for a byte stream connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPathKind {
+    /// A direct UDP path to the remote peer.
+    Direct,
+    /// A path through the peer's home relay.
+    Relay,
+    /// A custom transport path.
+    Custom,
+    /// Iroh has not reported a selected path yet.
+    Unknown,
+}
+
+impl ConnectionPathKind {
+    /// Returns a compact stable label for logs and UI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Custom => "custom",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for ConnectionPathKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Snapshot of low-level transport statistics for a byte stream connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteStreamConnectionStats {
+    /// The authenticated peer on the other side of the stream.
+    pub peer_id: EndpointId,
+    /// The transport path currently selected for application traffic.
+    pub selected_path: ConnectionPathKind,
+    /// Number of open paths on the underlying Iroh connection.
+    pub open_paths: usize,
+    /// Number of open direct paths.
+    pub direct_paths: usize,
+    /// Number of open relay paths.
+    pub relay_paths: usize,
+    /// Number of open custom transport paths.
+    pub custom_paths: usize,
+    /// RTT of the selected path, when available.
+    pub selected_rtt: Option<Duration>,
+    /// UDP bytes transmitted on the selected path.
+    pub selected_tx_bytes: u64,
+    /// UDP bytes received on the selected path.
+    pub selected_rx_bytes: u64,
+    /// UDP bytes transmitted on the whole connection.
+    pub total_tx_bytes: u64,
+    /// UDP bytes received on the whole connection.
+    pub total_rx_bytes: u64,
+    /// Packets lost on the whole connection.
+    pub lost_packets: u64,
+    /// Bytes lost on the whole connection.
+    pub lost_bytes: u64,
+}
+
+impl ByteStreamConnectionStats {
+    fn from_connection(peer_id: EndpointId, connection: &Connection) -> Self {
+        let totals = connection.stats();
+        let paths = connection.paths();
+        let mut stats = Self {
+            peer_id,
+            selected_path: ConnectionPathKind::Unknown,
+            open_paths: paths.len(),
+            direct_paths: 0,
+            relay_paths: 0,
+            custom_paths: 0,
+            selected_rtt: None,
+            selected_tx_bytes: 0,
+            selected_rx_bytes: 0,
+            total_tx_bytes: totals.udp_tx.bytes,
+            total_rx_bytes: totals.udp_rx.bytes,
+            lost_packets: totals.lost_packets,
+            lost_bytes: totals.lost_bytes,
+        };
+
+        for path in paths.iter() {
+            let path_kind = if path.is_ip() {
+                stats.direct_paths += 1;
+                ConnectionPathKind::Direct
+            } else if path.is_relay() {
+                stats.relay_paths += 1;
+                ConnectionPathKind::Relay
+            } else {
+                stats.custom_paths += 1;
+                ConnectionPathKind::Custom
+            };
+            if path.is_selected() {
+                let path_stats = path.stats();
+                stats.selected_path = path_kind;
+                stats.selected_rtt = Some(path_stats.rtt);
+                stats.selected_tx_bytes = path_stats.udp_tx.bytes;
+                stats.selected_rx_bytes = path_stats.udp_rx.bytes;
+            }
+        }
+
+        stats
+    }
+}
+
+impl ByteStream {
+    /// Returns a point-in-time snapshot of the underlying Iroh connection.
+    pub fn connection_stats(&self) -> ByteStreamConnectionStats {
+        ByteStreamConnectionStats::from_connection(self.peer_id, &self._connection)
+    }
+}
+
 impl fmt::Debug for ByteStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ByteStream")

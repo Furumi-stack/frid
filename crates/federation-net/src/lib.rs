@@ -65,7 +65,10 @@ pub use config::{
     DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_MAX_CONCURRENT_STREAMS_PER_PEER,
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_REQUEST_TIMEOUT, NetworkConfig, NetworkConfigBuilder,
 };
-pub use engine::{ByteStream, Message, NetworkEngine, StreamAcceptor};
+pub use engine::{
+    ByteStream, ByteStreamConnectionStats, ConnectionPathKind, Message, NetworkEngine,
+    StreamAcceptor,
+};
 pub use error::{NetworkError, Result};
 pub use event::{ConnectionDirection, NetworkEvent, NetworkEventReceiver};
 pub use protocol::{ALPN, NetworkId, PROTOCOL_VERSION, SchemaId};
