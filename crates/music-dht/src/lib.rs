@@ -77,6 +77,7 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 mod config;
 mod database;
 pub mod device_sync;
