@@ -62,7 +62,7 @@ Start with the crate documentation:
 
 ## Development
 
-Frid uses Rust edition 2024 and requires Rust 1.91 or newer.
+Frid uses Rust edition 2024 and requires Rust 1.97 or newer.
 
 ```bash
 cargo fmt --all -- --check

@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "WTFPL"
-rust-version = "1.91"
+rust-version = "1.97"
 repository = "https://gt.hexor.cy/ab/frid"
 
 [workspace.dependencies]

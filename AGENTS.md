@@ -14,7 +14,7 @@ rendezvous, tickets, identity, or record derivation.
 
 ## Required checks
 
-The workspace uses Rust edition 2024 and Rust 1.91 or newer.
+The workspace uses Rust edition 2024 and Rust 1.97 or newer.
 
 ```bash
 cargo fmt --all -- --check
