@@ -2,6 +2,11 @@
 name = "music-dht"
 version = "0.1.0"
 description = "Distributed music library search: a Kademlia-style DHT on top of federation-net"
+readme = "README.md"
+documentation = "https://docs.rs/music-dht"
+repository.workspace = true
+keywords = ["p2p", "dht", "music", "kademlia", "iroh"]
+categories = ["network-programming", "multimedia::audio"]
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

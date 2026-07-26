@@ -2,19 +2,18 @@
 resolver = "3"
 members = [
     "crates/federation-net",
-    "crates/artist-dht",
     "crates/music-dht",
     "apps/federation-net-demo",
-    "apps/artist-dht-cli",
 ]
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "WTFPL"
 rust-version = "1.91"
+repository = "https://gt.hexor.cy/ab/frid"
 
 [workspace.dependencies]
-federation-net = { path = "crates/federation-net" }
+federation-net = { path = "crates/federation-net", version = "0.1.0" }
 iroh = "1"
 iroh-base = "1"
 iroh-tickets = "1"
@@ -25,7 +24,6 @@ serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
 blake3 = "1"
 futures = "0.3"
-uuid = { version = "1", features = ["v7"] }
 unicode-normalization = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
@@ -34,7 +32,6 @@ tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-rustyline = "18"
 data-encoding = "2"
 rand = "0.9"
 tempfile = "3"

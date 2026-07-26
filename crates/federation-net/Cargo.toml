@@ -2,6 +2,11 @@
 name = "federation-net"
 version = "0.1.0"
 description = "Generic peer-to-peer networking engine built on Iroh"
+readme = "README.md"
+documentation = "https://docs.rs/federation-net"
+repository.workspace = true
+keywords = ["p2p", "iroh", "quic", "networking", "dht"]
+categories = ["network-programming", "asynchronous"]
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

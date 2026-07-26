@@ -5,8 +5,7 @@
 //! small metadata, never files) into a Kademlia-style DHT and search each
 //! other's libraries. Every running node is simultaneously a client, a DHT
 //! router and a storage node — there are no dedicated bootstrap, index or
-//! search servers. This crate is the grown-up sibling of the minimal
-//! `artist-dht` example.
+//! search servers.
 //!
 //! ## How it works
 //!

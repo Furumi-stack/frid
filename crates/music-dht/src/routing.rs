@@ -120,8 +120,9 @@ impl RoutingTable {
     /// Inserts or refreshes a contact. Returns `true` if the contact was not
     /// known before.
     ///
-    /// A full bucket evicts its least recently seen contact; the PoC skips
-    /// the classic ping-before-evict procedure.
+    /// A full bucket evicts its least recently seen contact. Active liveness
+    /// handling stays in the node layer so routing-table updates remain
+    /// deterministic.
     pub fn upsert(&mut self, contact: NodeContact) -> bool {
         let Some(index) =
             distance(self.own_id.as_bytes(), contact.node_id.as_bytes()).bucket_index()

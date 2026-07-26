@@ -835,10 +835,13 @@ impl Node {
                 }
 
                 for index in targets.iter() {
-                    per_peer.entry(*index).or_default().push(StoreRecordRequest {
-                        key,
-                        record: record.clone(),
-                    });
+                    per_peer
+                        .entry(*index)
+                        .or_default()
+                        .push(StoreRecordRequest {
+                            key,
+                            record: record.clone(),
+                        });
                 }
             }
         }
@@ -1043,7 +1046,9 @@ mod tests {
 
         // Byte limit: huge entries split well before the count limit.
         let huge = "x".repeat(crate::record::MAX_ITEM_NAME_BYTES);
-        let entries: Vec<_> = (0..MAX_RECORDS_PER_BATCH).map(|_| store_entry(&huge)).collect();
+        let entries: Vec<_> = (0..MAX_RECORDS_PER_BATCH)
+            .map(|_| store_entry(&huge))
+            .collect();
         for batch in chunk_store_batches(entries) {
             assert!(!batch.is_empty());
             let bytes: usize = batch

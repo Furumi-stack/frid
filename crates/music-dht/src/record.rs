@@ -236,9 +236,9 @@ impl LibraryItem {
 pub struct StoredRecord {
     /// The item record itself.
     pub item: LibraryItem,
-    /// Peer that pushed this replica. Not cryptographically verified in the
-    /// PoC: the connection authenticates the direct sender, not the origin
-    /// of a replicated record.
+    /// Peer that pushed this replica. The connection authenticates the direct
+    /// sender, not the origin embedded in a forwarded record. Revision
+    /// ordering provides convergence, not end-to-end origin authentication.
     pub publisher: PeerId,
     /// Unix timestamp (milliseconds) after which the replica must be dropped.
     pub expires_at_ms: u64,

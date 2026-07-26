@@ -23,8 +23,11 @@ use crate::record::{
 };
 use crate::routing::{NodeContact, NodeId};
 
-/// Fixed schema of the music-dht protocol; peers with a different schema are
-/// rejected by `federation-net` during the handshake.
+/// Fixed compatibility identifier of the music-dht protocol; peers with a
+/// different schema are rejected by `federation-net` during the handshake.
+///
+/// The historical value is retained because changing it would partition
+/// existing deployments.
 pub const SCHEMA_NAME: &str = "music-dht-poc-v3";
 
 /// Capacity of the application event channel.

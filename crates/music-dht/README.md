@@ -7,9 +7,8 @@ files**) — into a Kademlia-style DHT and search each other's libraries.
 Every running node is simultaneously a client, a DHT router and a storage
 node; there are no dedicated servers of any kind.
 
-This crate is the grown-up sibling of the minimal
-[`artist-dht`](../artist-dht) example: same DHT machinery, richer records and
-an application-oriented API.
+It combines the original DHT proof of concept with the richer record model and
+application-oriented API used by Furumi.
 
 ## Records
 

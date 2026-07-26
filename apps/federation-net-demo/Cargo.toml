@@ -2,6 +2,8 @@
 name = "federation-net-demo"
 version = "0.1.0"
 description = "CLI demo for the federation-net P2P engine"
+publish = false
+repository.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
