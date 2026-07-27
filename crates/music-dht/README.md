@@ -74,6 +74,84 @@ network.
 federation feature: every instance publishes its library index and can search
 the libraries of all other instances on the same network.
 
+## Trusted-device sync and listening history
+
+`music_dht::device_sync` is the canonical wire contract shared by Furumi
+clients. Applications own persistence and UI policy, but must import the
+protocol types from this module instead of maintaining local serde-compatible
+copies.
+
+Trusted-device sync is private user state and is separate from the public music
+DHT. A sync group may contain desktop, web and future mobile clients. A
+multi-user server behaves as one independent sync client per user and sync
+group.
+
+Protocol v2 adds append-only listening history:
+
+```rust
+use music_dht::device_sync::{
+    ListenEndReason, ListenEvent, ListenTrackMetadata, SyncOpPayload,
+};
+
+let event = ListenEvent {
+    // Generate when playback starts and reuse for every retry.
+    listen_id: "0195d0b0-...".into(),
+    content_id: "b3:...".into(),
+    started_at_ms: 1_740_000_000_000,
+    listened_ms: 151_000,
+    track_duration_ms: Some(300_000),
+    ended_reason: ListenEndReason::Skipped,
+    track: ListenTrackMetadata {
+        title: "Teardrop".into(),
+        artist_names: vec!["Massive Attack".into()],
+        featured_artist_names: vec![],
+        release_title: Some("Mezzanine".into()),
+    },
+};
+
+if event.should_record() {
+    let payload = SyncOpPayload::ListenRecorded { event };
+    // Append `payload` through the client's ordinary per-origin sync op log.
+}
+```
+
+Client requirements:
+
+1. Generate a stable `listen_id` at playback start. Retried HTTP requests and
+   sync delivery must reuse it.
+2. Accumulate actual listening time, excluding pauses and large seek jumps.
+3. Finalize one immutable event when the track finishes, is skipped, is
+   stopped, or is replaced.
+4. Reject invalid events and interrupted listens shorter than
+   `MIN_RECORDED_LISTEN_MS`. Use `ListenEvent::should_record`; do not implement
+   a client-specific threshold.
+5. Use `ListenEvent::qualifies_as_play` for play counts and the default history
+   view. Natural completion qualifies; otherwise the threshold is the smaller
+   of half the track duration and four minutes.
+6. Materialize under unique `(sync_group, listen_id)`. The transport `op_id`
+   remains independently unique and provides delivery deduplication.
+7. Resolve tracks by `content_id`, never by another client's numeric database
+   id. Keep `local_track_id` nullable and retain the metadata snapshot so
+   network-only history remains displayable and scrobblable.
+8. Preserve `origin_device_id` from `SyncOpWire`; resolve its current display
+   name from the replicated device registry when rendering history.
+9. Do not place history in `SyncSnapshot`. Catch up missing immutable listen
+   operations through vector clocks and bounded op batches.
+10. Do not publish listening history into DHT records or expose it outside the
+    trusted-device group.
+
+The library defines scrobble-neutral facts only. A client may implement an
+optional integration such as Last.fm after materializing a qualifying event.
+It must deduplicate that side effect by `listen_id`; other clients do not need
+to know that the integration exists.
+
+### Compatibility
+
+Protocol v1 uses `furumi/sync/1`; v2 uses `furumi/sync/2`. During migration,
+new clients should accept both ALPNs and only send `ListenRecorded` when
+`supports_listen_history(peer.protocol_version)` returns true. Likes,
+playlists, membership and playback coordination remain compatible with v1.
+
 ## Verification
 
 ```bash

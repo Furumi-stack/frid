@@ -13,11 +13,32 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{MusicDhtError, Result};
 
-/// Auxiliary ALPN used for personal-device sync streams.
-pub const SYNC_ALPN: &[u8] = b"furumi/sync/1";
+/// Legacy ALPN used by personal-device sync v1.
+pub const SYNC_ALPN_V1: &[u8] = b"furumi/sync/1";
+
+/// Current ALPN used by personal-device sync v2.
+///
+/// Version 2 adds content-addressed, append-only listening history. Clients
+/// should accept both v1 and v2 while older devices remain in a sync group,
+/// but must only send [`SyncOpPayload::ListenRecorded`] to v2 peers.
+pub const SYNC_ALPN_V2: &[u8] = b"furumi/sync/2";
+
+/// Auxiliary ALPN used by current personal-device sync streams.
+pub const SYNC_ALPN: &[u8] = SYNC_ALPN_V2;
 
 /// Version of the personal-device sync wire protocol.
-pub const DEVICE_SYNC_PROTOCOL_VERSION: u16 = 1;
+pub const DEVICE_SYNC_PROTOCOL_VERSION: u16 = 2;
+
+/// Minimum actual listening time retained for an interrupted listen.
+pub const MIN_RECORDED_LISTEN_MS: i64 = 5_000;
+
+/// Maximum listening time required to qualify a listen as a play.
+pub const MAX_QUALIFYING_LISTEN_MS: i64 = 4 * 60 * 1_000;
+
+/// Returns whether a peer may receive listening-history operations.
+pub const fn supports_listen_history(protocol_version: u16) -> bool {
+    protocol_version >= 2
+}
 
 /// Default invite lifetime used by applications unless they need a custom TTL.
 pub const DEFAULT_INVITE_TTL_MS: i64 = 10 * 60 * 1000;
@@ -100,6 +121,122 @@ pub struct SyncedFedTrack {
     pub track_number: Option<i32>,
     /// Disc number.
     pub disc_number: Option<i32>,
+}
+
+/// Why a listening session ended.
+///
+/// This is deliberately factual rather than a client-specific `completed`
+/// flag. All clients use [`ListenEvent::qualifies_as_play`] to derive the
+/// shared play-count meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenEndReason {
+    /// Playback reached the natural end of the track.
+    Finished,
+    /// The listener explicitly moved to another track.
+    Skipped,
+    /// Playback was stopped without selecting a replacement.
+    Stopped,
+    /// Another queue item or playback session replaced this one.
+    Replaced,
+    /// The client cannot determine why playback ended.
+    Unknown,
+}
+
+/// Portable metadata kept with a listening event.
+///
+/// Metadata is a snapshot, not identity: [`ListenEvent::content_id`] is the
+/// stable track identity. Keeping the snapshot lets a device display and
+/// scrobble a listen even when it does not have that track in its own catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenTrackMetadata {
+    /// Track title.
+    pub title: String,
+    /// Main artist names.
+    #[serde(default)]
+    pub artist_names: Vec<String>,
+    /// Featured artist names.
+    #[serde(default)]
+    pub featured_artist_names: Vec<String>,
+    /// Release title, when known.
+    #[serde(default)]
+    pub release_title: Option<String>,
+}
+
+/// One immutable, content-addressed listening-history event.
+///
+/// `listen_id` is generated when playback starts and must be reused for every
+/// retry of the same report. Receivers materialize it under a unique key, so
+/// browser retries and repeated sync delivery never duplicate history.
+///
+/// Events are append-only and belong to one trusted-device sync group. They
+/// must never be published through the public music DHT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenEvent {
+    /// Stable id for this playback session, normally a UUID.
+    pub listen_id: String,
+    /// Stable audio content id (`b3:<hex>`).
+    pub content_id: String,
+    /// Playback start time as Unix milliseconds.
+    pub started_at_ms: i64,
+    /// Actual accumulated listening time in milliseconds.
+    pub listened_ms: i64,
+    /// Track duration in milliseconds, when known.
+    #[serde(default)]
+    pub track_duration_ms: Option<i64>,
+    /// Factual reason the session ended.
+    pub ended_reason: ListenEndReason,
+    /// Portable display and scrobbling metadata.
+    pub track: ListenTrackMetadata,
+}
+
+impl ListenEvent {
+    /// Returns whether the event contains the minimum portable identity.
+    pub fn is_valid(&self) -> bool {
+        !self.listen_id.trim().is_empty()
+            && crate::normalize_content_id(&self.content_id).is_some()
+            && self.started_at_ms >= 0
+            && self.listened_ms >= 0
+            && self.track_duration_ms.is_none_or(|duration| duration > 0)
+            && !self.track.title.trim().is_empty()
+            && self
+                .track
+                .artist_names
+                .iter()
+                .any(|artist| !artist.trim().is_empty())
+    }
+
+    /// Returns whether this event should be retained in listening history.
+    ///
+    /// Natural track completion is always retained. Interrupted sessions are
+    /// retained after five seconds of actual listening.
+    pub fn should_record(&self) -> bool {
+        self.is_valid()
+            && (self.ended_reason == ListenEndReason::Finished
+                || self.listened_ms >= MIN_RECORDED_LISTEN_MS)
+    }
+
+    /// Returns whether this event contributes to play counts.
+    ///
+    /// A natural finish qualifies immediately. Otherwise a listen qualifies
+    /// after the smaller of half the known track duration and four minutes.
+    /// Without a known duration only the four-minute threshold applies.
+    pub fn qualifies_as_play(&self) -> bool {
+        if !self.should_record() {
+            return false;
+        }
+        if self.ended_reason == ListenEndReason::Finished {
+            return true;
+        }
+        self.listened_ms >= self.qualifying_threshold_ms()
+    }
+
+    /// Returns the shared listening threshold for this event.
+    pub fn qualifying_threshold_ms(&self) -> i64 {
+        self.track_duration_ms
+            .map(|duration| (duration / 2 + duration % 2).min(MAX_QUALIFYING_LISTEN_MS))
+            .unwrap_or(MAX_QUALIFYING_LISTEN_MS)
+    }
 }
 
 /// Portable playback queue track.
@@ -325,6 +462,14 @@ pub enum SyncOpPayload {
         /// Command.
         command: PlaybackCommand,
     },
+    /// Append one immutable listening-history event.
+    ///
+    /// This operation is valid only on device-sync protocol v2. The event is
+    /// deduplicated by `event.listen_id`, independently of transport `op_id`.
+    ListenRecorded {
+        /// Portable listening event.
+        event: ListenEvent,
+    },
 }
 
 impl SyncOpPayload {
@@ -341,6 +486,11 @@ impl SyncOpPayload {
 }
 
 /// Materialized sync snapshot sent with every handshake.
+///
+/// Listening history is intentionally absent: it is an unbounded append-only
+/// log, not last-write-wins state. New devices catch it up from missing
+/// [`SyncOpPayload::ListenRecorded`] operations using the existing per-origin
+/// vector and bounded operation batches.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncSnapshot {
     /// Current likes.
@@ -730,4 +880,78 @@ fn protocol_err(err: impl std::fmt::Display) -> MusicDhtError {
 
 fn network_err(err: impl std::fmt::Display) -> MusicDhtError {
     MusicDhtError::Network(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listen(
+        listened_ms: i64,
+        duration_ms: Option<i64>,
+        ended_reason: ListenEndReason,
+    ) -> ListenEvent {
+        ListenEvent {
+            listen_id: "018f-test-listen".to_string(),
+            content_id: format!("b3:{}", "a".repeat(64)),
+            started_at_ms: 1_700_000_000_000,
+            listened_ms,
+            track_duration_ms: duration_ms,
+            ended_reason,
+            track: ListenTrackMetadata {
+                title: "Teardrop".to_string(),
+                artist_names: vec!["Massive Attack".to_string()],
+                featured_artist_names: Vec::new(),
+                release_title: Some("Mezzanine".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn finished_track_is_recorded_and_qualifies() {
+        let event = listen(1_000, Some(300_000), ListenEndReason::Finished);
+        assert!(event.should_record());
+        assert!(event.qualifies_as_play());
+    }
+
+    #[test]
+    fn interrupted_listens_under_five_seconds_are_noise() {
+        let event = listen(4_999, Some(300_000), ListenEndReason::Skipped);
+        assert!(!event.should_record());
+        assert!(!event.qualifies_as_play());
+    }
+
+    #[test]
+    fn half_duration_qualifies_for_tracks_under_eight_minutes() {
+        let before = listen(149_999, Some(300_000), ListenEndReason::Skipped);
+        let at = listen(150_000, Some(300_000), ListenEndReason::Skipped);
+        assert!(!before.qualifies_as_play());
+        assert!(at.qualifies_as_play());
+    }
+
+    #[test]
+    fn qualifying_threshold_is_capped_at_four_minutes() {
+        let event = listen(240_000, Some(900_000), ListenEndReason::Stopped);
+        assert_eq!(event.qualifying_threshold_ms(), 240_000);
+        assert!(event.qualifies_as_play());
+    }
+
+    #[test]
+    fn listen_payload_round_trips_with_portable_metadata() {
+        let payload = SyncOpPayload::ListenRecorded {
+            event: listen(150_000, Some(300_000), ListenEndReason::Replaced),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains(r#""kind":"listen_recorded""#));
+        assert_eq!(
+            serde_json::from_str::<SyncOpPayload>(&json).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn v1_peers_do_not_support_listening_history() {
+        assert!(!supports_listen_history(1));
+        assert!(supports_listen_history(2));
+    }
 }
