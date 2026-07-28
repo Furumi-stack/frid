@@ -51,6 +51,8 @@ applications from exchanging domain payloads.
 
 Changing serialized messages incompatibly requires a new schema ID. Changing
 the transport handshake incompatibly requires a protocol-version/ALPN plan.
+The music DHT currently derives its schema id from `music-dht-v5`; the former
+proof-of-concept name is no longer part of the production protocol identity.
 
 ### Discovery is not authorization
 
@@ -66,6 +68,12 @@ higher-level protocol.
 Tickets provide explicit discovery and carry enough connection information to
 dial a peer directly. They remain useful when public rendezvous is disabled or
 unavailable.
+
+Jam control uses its own auxiliary ALPN and an opaque `frid://j/...`
+capability. It reuses the portable playback state and command vocabulary from
+personal-device sync, but never carries trusted membership, likes, playlists,
+or listening history. Possession of the runtime capability authorizes control
+of that host player only.
 
 ### Two data paths
 
@@ -142,6 +150,14 @@ traffic through DHT messages. `music-dht` exposes the underlying authenticated
 stream capability and defines shared wire models for Furumi catalog and device
 sync protocols. Audio transfer, rich catalog exchange, and synchronization can
 therefore use dedicated ALPNs while sharing identity and connectivity.
+
+Capability discovery is the narrow exception to schema isolation. The bounded,
+self-versioned `furumi/capabilities/1` stream still validates the federation
+transport version and network id, but remains reachable across application
+schema upgrades. A peer publishes the versions it actually supports; consumers
+retain the highest versions observed during the current run and may recommend a
+manual application update. Capability data is informational only and never
+authorizes a peer or triggers an automatic update.
 
 ## Failure model
 

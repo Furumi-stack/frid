@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/federation-net",
     "crates/music-dht",
-    "apps/federation-net-demo",
 ]
 
 [workspace.package]
@@ -13,7 +12,7 @@ rust-version = "1.97"
 repository = "https://gt.hexor.cy/ab/frid"
 
 [workspace.dependencies]
-federation-net = { path = "crates/federation-net", version = "0.1.0" }
+federation-net = { path = "crates/federation-net", version = "0.2.0" }
 iroh = "1"
 iroh-base = "1"
 iroh-tickets = "1"

@@ -76,12 +76,14 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod capabilities;
 pub mod catalog;
 mod config;
 mod database;
 pub mod device_sync;
 mod dht;
 mod error;
+pub mod jam;
 mod message;
 mod node;
 mod normalization;

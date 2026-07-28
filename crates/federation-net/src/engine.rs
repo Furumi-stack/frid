@@ -383,6 +383,28 @@ impl<M: Message> Shared<M> {
         }
     }
 
+    fn validate_stream_handshake(
+        &self,
+        alpn: &[u8],
+        handshake: &Handshake,
+    ) -> Option<HandshakeErrorCode> {
+        if handshake.protocol_version != PROTOCOL_VERSION {
+            Some(HandshakeErrorCode::UnsupportedProtocolVersion)
+        } else if handshake.network_id != self.config.network_id {
+            Some(HandshakeErrorCode::NetworkMismatch)
+        } else if !self
+            .config
+            .schema_independent_stream_protocols
+            .iter()
+            .any(|protocol| protocol.as_slice() == alpn)
+            && handshake.schema_id != self.config.schema_id
+        {
+            Some(HandshakeErrorCode::SchemaMismatch)
+        } else {
+            None
+        }
+    }
+
     /// Drives an established connection: accepts message streams until the
     /// connection closes, then cleans up the registry entry.
     async fn connection_loop(
@@ -627,7 +649,7 @@ impl<M: Message> Shared<M> {
         .and_then(|res| res);
 
         let verdict = match &handshake {
-            Ok(handshake) => self.validate_handshake(handshake),
+            Ok(handshake) => self.validate_stream_handshake(alpn, handshake),
             Err(_) => Some(HandshakeErrorCode::InvalidHandshake),
         };
         if let Some(code) = verdict {
@@ -948,6 +970,7 @@ impl<M: Message> NetworkEngine<M> {
         let stream_acceptors = config
             .stream_protocols
             .iter()
+            .chain(config.schema_independent_stream_protocols.iter())
             .map(|alpn| {
                 let (sender, receiver) = mpsc::channel(STREAM_ACCEPT_QUEUE);
                 (
@@ -976,6 +999,13 @@ impl<M: Message> NetworkEngine<M> {
         };
         let mut router_builder = Router::builder(endpoint).accept(ALPN, handler);
         for alpn in &shared.config.stream_protocols {
+            let handler = StreamProtocol::<M> {
+                shared: Arc::downgrade(&shared),
+                alpn: alpn.clone(),
+            };
+            router_builder = router_builder.accept(alpn.clone(), handler);
+        }
+        for alpn in &shared.config.schema_independent_stream_protocols {
             let handler = StreamProtocol::<M> {
                 shared: Arc::downgrade(&shared),
                 alpn: alpn.clone(),

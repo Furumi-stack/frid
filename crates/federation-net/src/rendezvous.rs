@@ -38,7 +38,8 @@ pub const DEFAULT_RENDEZVOUS_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_RENDEZVOUS_ENTRY_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Version of the rendezvous record wire format.
-const RECORD_VERSION: u16 = 1;
+/// Version of the Mainline-DHT rendezvous record envelope.
+pub const RENDEZVOUS_RECORD_VERSION: u16 = 1;
 /// Domain separation context for deriving the record signing key.
 const KEY_DERIVATION_CONTEXT: &str = "federation-net:rendezvous:v1";
 /// BEP44 caps mutable values at 1000 bytes; stay safely below.
@@ -104,7 +105,7 @@ pub(crate) fn now_ms() -> u64 {
 
 fn decode_record(bytes: &[u8]) -> Option<Vec<RendezvousEntry>> {
     let record: RendezvousRecord = postcard::from_bytes(bytes).ok()?;
-    (record.version == RECORD_VERSION).then_some(record.entries)
+    (record.version == RENDEZVOUS_RECORD_VERSION).then_some(record.entries)
 }
 
 /// Merges entries from every record instance seen this round with our own,
@@ -144,7 +145,7 @@ fn merge_entries(
 fn encode_record_capped(mut entries: Vec<RendezvousEntry>) -> Result<Vec<u8>> {
     loop {
         let record = RendezvousRecord {
-            version: RECORD_VERSION,
+            version: RENDEZVOUS_RECORD_VERSION,
             entries,
         };
         let encoded = postcard::to_stdvec(&record).map_err(|err| {
@@ -279,7 +280,7 @@ mod tests {
     fn malformed_and_wrong_version_records_are_ignored() {
         assert!(decode_record(b"garbage").is_none());
         let record = RendezvousRecord {
-            version: RECORD_VERSION + 1,
+            version: RENDEZVOUS_RECORD_VERSION + 1,
             entries: vec![],
         };
         let encoded = postcard::to_stdvec(&record).expect("encode");

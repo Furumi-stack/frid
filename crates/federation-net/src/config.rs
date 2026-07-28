@@ -41,6 +41,9 @@ pub struct NetworkConfig {
     /// Auxiliary ALPN protocols on which this peer accepts raw byte streams
     /// (see [`crate::NetworkEngine::stream_acceptor`]).
     pub stream_protocols: Vec<Vec<u8>>,
+    /// Auxiliary stream protocols whose handshake is independent of the
+    /// application schema. Intended for compatibility/capability discovery.
+    pub schema_independent_stream_protocols: Vec<Vec<u8>>,
 }
 
 impl NetworkConfig {
@@ -65,6 +68,7 @@ pub struct NetworkConfigBuilder {
     max_concurrent_streams_per_peer: Option<usize>,
     rendezvous: Option<RendezvousConfig>,
     stream_protocols: Vec<Vec<u8>>,
+    schema_independent_stream_protocols: Vec<Vec<u8>>,
 }
 
 impl NetworkConfigBuilder {
@@ -121,6 +125,17 @@ impl NetworkConfigBuilder {
     /// called multiple times, once per protocol.
     pub fn stream_protocol(mut self, alpn: impl Into<Vec<u8>>) -> Self {
         self.stream_protocols.push(alpn.into());
+        self
+    }
+
+    /// Declares an auxiliary ALPN protocol that validates the network and
+    /// federation transport version, but deliberately does not require the
+    /// application schema id to match.
+    ///
+    /// This is suitable for bounded, self-versioned capability discovery
+    /// protocols that must remain reachable across schema upgrades.
+    pub fn schema_independent_stream_protocol(mut self, alpn: impl Into<Vec<u8>>) -> Self {
+        self.schema_independent_stream_protocols.push(alpn.into());
         self
     }
 
@@ -210,6 +225,27 @@ impl NetworkConfigBuilder {
                 )));
             }
         }
+        for (index, alpn) in self.schema_independent_stream_protocols.iter().enumerate() {
+            if alpn.is_empty() {
+                return Err(NetworkError::InvalidConfig(
+                    "schema-independent stream protocol ALPN must not be empty".into(),
+                ));
+            }
+            if alpn.as_slice() == ALPN {
+                return Err(NetworkError::InvalidConfig(
+                    "schema-independent stream protocol ALPN must differ from the engine ALPN"
+                        .into(),
+                ));
+            }
+            if self.schema_independent_stream_protocols[..index].contains(alpn)
+                || self.stream_protocols.contains(alpn)
+            {
+                return Err(NetworkError::InvalidConfig(format!(
+                    "duplicate stream protocol ALPN: {}",
+                    String::from_utf8_lossy(alpn)
+                )));
+            }
+        }
 
         Ok(NetworkConfig {
             data_dir,
@@ -221,6 +257,7 @@ impl NetworkConfigBuilder {
             max_concurrent_streams_per_peer,
             rendezvous: self.rendezvous,
             stream_protocols: self.stream_protocols,
+            schema_independent_stream_protocols: self.schema_independent_stream_protocols,
         })
     }
 }
@@ -325,6 +362,22 @@ mod tests {
                 .stream_protocol("dup/1")
                 .build()
                 .is_err()
+        );
+        assert!(
+            base_builder()
+                .stream_protocol("dup/1")
+                .schema_independent_stream_protocol("dup/1")
+                .build()
+                .is_err()
+        );
+
+        let config = base_builder()
+            .schema_independent_stream_protocol("furumi/capabilities/1")
+            .build()
+            .expect("valid schema-independent stream protocol");
+        assert_eq!(
+            config.schema_independent_stream_protocols,
+            vec![b"furumi/capabilities/1".to_vec()]
         );
     }
 }

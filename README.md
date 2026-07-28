@@ -41,8 +41,6 @@ failure handling, and compatibility rules.
 crates/
   federation-net/       generic iroh transport and rendezvous
   music-dht/            distributed music catalog and content discovery
-apps/
-  federation-net-demo/  small interactive transport example
 ```
 
 ## Using the libraries

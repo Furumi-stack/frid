@@ -12,6 +12,7 @@ use federation_net::{
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Timeout used when waiting for a single event.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+const CAPABILITY_ALPN: &[u8] = b"test/capabilities/1";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum TestMessage {
@@ -199,6 +200,64 @@ async fn schema_mismatch_is_rejected() {
         };
         let err = engine_b.connect(forged).await.expect_err("must fail");
         assert!(matches!(err, NetworkError::SchemaMismatch), "got {err:?}");
+
+        engine_a.shutdown().await.expect("shutdown a");
+        engine_b.shutdown().await.expect("shutdown b");
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn schema_independent_stream_crosses_schema_versions() {
+    let _net = NET_LOCK.lock().await;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let config_a = NetworkConfig::builder()
+            .data_dir(dir_a.path())
+            .network_id(NetworkId::from_name("same-network"))
+            .schema_id(SchemaId::from_name("schema-one"))
+            .schema_independent_stream_protocol(CAPABILITY_ALPN)
+            .build()
+            .expect("config a");
+        let config_b = NetworkConfig::builder()
+            .data_dir(dir_b.path())
+            .network_id(NetworkId::from_name("same-network"))
+            .schema_id(SchemaId::from_name("schema-two"))
+            .schema_independent_stream_protocol(CAPABILITY_ALPN)
+            .build()
+            .expect("config b");
+        let (engine_a, _events_a) = Engine::start(config_a).await.expect("engine a");
+        let (engine_b, _events_b) = Engine::start(config_b).await.expect("engine b");
+        let mut acceptor = engine_a
+            .stream_acceptor(CAPABILITY_ALPN)
+            .expect("capability acceptor");
+        let address = engine_a.ticket().await.expect("ticket").endpoint_addr;
+
+        let accepting = tokio::spawn(async move {
+            let mut stream = acceptor.accept().await.expect("incoming stream");
+            let value = stream.recv.read_to_end(16).await.expect("read request");
+            assert_eq!(value, b"versions?");
+            stream.send.write_all(b"v2").await.expect("write response");
+            stream.send.finish().expect("finish response");
+            let _ = stream.send.stopped().await;
+        });
+        let mut stream = engine_b
+            .open_stream(address, CAPABILITY_ALPN)
+            .await
+            .expect("schema-independent stream");
+        stream
+            .send
+            .write_all(b"versions?")
+            .await
+            .expect("write request");
+        stream.send.finish().expect("finish request");
+        assert_eq!(
+            stream.recv.read_to_end(16).await.expect("read response"),
+            b"v2"
+        );
+        accepting.await.expect("accept task");
 
         engine_a.shutdown().await.expect("shutdown a");
         engine_b.shutdown().await.expect("shutdown b");

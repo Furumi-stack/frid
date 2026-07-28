@@ -55,6 +55,9 @@ pub struct MusicDhtConfig {
     /// Auxiliary ALPN protocols on which this peer accepts raw byte streams
     /// (see [`crate::MusicDhtService::stream_acceptor`]).
     pub stream_protocols: Vec<Vec<u8>>,
+    /// Auxiliary stream protocols that remain reachable across DHT schema
+    /// upgrades, such as bounded capability discovery.
+    pub schema_independent_stream_protocols: Vec<Vec<u8>>,
 }
 
 impl MusicDhtConfig {
@@ -80,6 +83,7 @@ pub struct MusicDhtConfigBuilder {
     dial_timeout: Option<Duration>,
     rendezvous: Option<RendezvousConfig>,
     stream_protocols: Vec<Vec<u8>>,
+    schema_independent_stream_protocols: Vec<Vec<u8>>,
 }
 
 impl MusicDhtConfigBuilder {
@@ -146,6 +150,13 @@ impl MusicDhtConfigBuilder {
         self
     }
 
+    /// Declares a self-versioned auxiliary protocol that does not require the
+    /// local and remote DHT schema ids to match.
+    pub fn schema_independent_stream_protocol(mut self, alpn: impl Into<Vec<u8>>) -> Self {
+        self.schema_independent_stream_protocols.push(alpn.into());
+        self
+    }
+
     /// Validates and builds the configuration.
     pub fn build(self) -> Result<MusicDhtConfig> {
         let data_dir = self
@@ -171,6 +182,7 @@ impl MusicDhtConfigBuilder {
             dial_timeout: self.dial_timeout.unwrap_or(DEFAULT_DIAL_TIMEOUT),
             rendezvous: self.rendezvous,
             stream_protocols: self.stream_protocols,
+            schema_independent_stream_protocols: self.schema_independent_stream_protocols,
         };
         for (name, value) in [
             ("republish_interval", config.republish_interval),

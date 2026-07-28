@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 /// ALPN of the Furumi catalog stream protocol.
 pub const CATALOG_ALPN: &[u8] = b"furumi-fd/catalog/1";
+/// Version of the Furumi catalog stream protocol.
+pub const CATALOG_PROTOCOL_VERSION: u16 = 1;
 
 /// Request sent by a catalog client.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

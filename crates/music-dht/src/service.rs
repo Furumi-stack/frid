@@ -28,7 +28,7 @@ use crate::routing::{NodeContact, NodeId};
 ///
 /// The historical value is retained because changing it would partition
 /// existing deployments.
-pub const SCHEMA_NAME: &str = "music-dht-poc-v3";
+pub const SCHEMA_NAME: &str = "music-dht-v5";
 
 /// Capacity of the application event channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -284,6 +284,9 @@ impl MusicDhtService {
         }
         for alpn in &config.stream_protocols {
             engine_builder = engine_builder.stream_protocol(alpn.clone());
+        }
+        for alpn in &config.schema_independent_stream_protocols {
+            engine_builder = engine_builder.schema_independent_stream_protocol(alpn.clone());
         }
         let engine_config = engine_builder
             .build()

@@ -1,6 +1,6 @@
 [package]
 name = "federation-net"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generic peer-to-peer networking engine built on Iroh"
 readme = "README.md"
 documentation = "https://docs.rs/federation-net"
