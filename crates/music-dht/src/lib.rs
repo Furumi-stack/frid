@@ -18,6 +18,8 @@
 //! * Track records may also carry a compact `b3:<hex>` content id and are then
 //!   published under a content key, so applications can find another peer with
 //!   the exact same audio bytes.
+//! * [`similarity`] defines the bounded, model-neutral stream contract used by
+//!   clients that independently generate compatible music embeddings.
 //! * Records are replicated to the `K` nodes whose ids are XOR-closest to
 //!   each key. Publishers pick the targets from their routing table and send
 //!   batched store requests (one pipeline per peer), so even a large library
@@ -91,6 +93,7 @@ mod record;
 mod request;
 mod routing;
 mod service;
+pub mod similarity;
 
 pub use config::{
     DEFAULT_EXPIRE_INTERVAL, DEFAULT_LOOKUP_TIMEOUT, DEFAULT_REPUBLISH_INTERVAL,

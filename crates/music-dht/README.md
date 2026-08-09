@@ -74,6 +74,23 @@ network.
 federation feature: every instance publishes its library index and can search
 the libraries of all other instances on the same network.
 
+## Similarity protocol
+
+`music_dht::similarity` is the shared, model-neutral wire contract for finding
+tracks by a compatible embedding. It provides the versioned ALPN, bounded
+request/response types, validation, and JSON byte-stream framing. It does not
+generate embeddings or prescribe a vector database, model, preprocessing
+pipeline, peer-routing policy, or user-consent UI; those remain client-owned.
+
+Requests carry an L2-normalized vector and an exact model/profile fingerprint.
+A peer must reject fingerprints it cannot search. This lets native, web, and
+future Furumi clients implement local inference differently while remaining
+wire-compatible when they choose the same embedding contract.
+
+Results may carry a shared 128-bit SimHash of their embedding. Clients can use
+its Hamming distance to suppress near-duplicate recordings across peers without
+transmitting every result vector.
+
 ## Trusted-device sync and listening history
 
 `music_dht::device_sync` is the canonical wire contract shared by Furumi

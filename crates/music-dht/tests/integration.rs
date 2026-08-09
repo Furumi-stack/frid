@@ -279,3 +279,84 @@ async fn byte_stream_to_item_owner() {
     .await
     .expect("test timed out");
 }
+
+#[tokio::test]
+async fn similarity_request_response_uses_the_shared_stream_contract() {
+    use music_dht::similarity::{
+        self, SIMILARITY_ALPN, SimilarityHit, SimilarityRequest, SimilarityResponse,
+    };
+
+    let _net = NET_LOCK.lock().await;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let network = NetworkId::from_name("similarity-stream-test-net");
+        let config_a = MusicDhtConfig::builder()
+            .data_dir(dir_a.path())
+            .network_id(network)
+            .stream_protocol(SIMILARITY_ALPN)
+            .build()
+            .expect("valid config");
+        let (node_a, _events_a) = MusicDhtService::start(config_a)
+            .await
+            .expect("service starts");
+        let mut acceptor = node_a
+            .stream_acceptor(SIMILARITY_ALPN)
+            .expect("similarity acceptor");
+        let serve_task = tokio::spawn(async move {
+            let mut stream = acceptor.accept().await.expect("incoming stream");
+            let request = similarity::read_request(&mut stream)
+                .await
+                .expect("valid request");
+            assert_eq!(request.profile_id, "sim1:test");
+            let response = SimilarityResponse::success(vec![SimilarityHit {
+                score: 0.75,
+                item_id: "00aa".to_string(),
+                title: "Similar track".to_string(),
+                artist_names: vec!["Artist".to_string()],
+                embedding_signature: Some(
+                    similarity::embedding_signature(&[0.5; 4]).expect("valid signature"),
+                ),
+                ..SimilarityHit::default()
+            }])
+            .expect("valid response");
+            similarity::write_response(&mut stream, &response)
+                .await
+                .expect("write response");
+            stream.send.finish().expect("finish response");
+            let _ = stream.send.stopped().await;
+        });
+
+        let config_b = MusicDhtConfig::builder()
+            .data_dir(dir_b.path())
+            .network_id(network)
+            .stream_protocol(SIMILARITY_ALPN)
+            .build()
+            .expect("valid config");
+        let (node_b, _events_b) = MusicDhtService::start(config_b)
+            .await
+            .expect("service starts");
+        node_b
+            .connect(node_a.ticket().await.expect("ticket"))
+            .await
+            .expect("connect");
+        let mut stream = node_b
+            .open_stream(node_a.endpoint_id(), SIMILARITY_ALPN)
+            .await
+            .expect("open similarity stream");
+        let request = SimilarityRequest::new("sim1:test", vec![0.5; 4], 10).expect("valid request");
+        let response = similarity::exchange(&mut stream, &request)
+            .await
+            .expect("similarity exchange");
+        assert!(response.ok);
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].title, "Similar track");
+        assert!(response.hits[0].embedding_signature.is_some());
+        serve_task.await.expect("serve task");
+
+        node_a.shutdown().await.expect("shutdown a");
+        node_b.shutdown().await.expect("shutdown b");
+    })
+    .await
+    .expect("test timed out");
+}

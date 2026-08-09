@@ -151,6 +151,14 @@ stream capability and defines shared wire models for Furumi catalog and device
 sync protocols. Audio transfer, rich catalog exchange, and synchronization can
 therefore use dedicated ALPNs while sharing identity and connectivity.
 
+Music similarity is another shared extension protocol. `music-dht` owns its
+versioned ALPN, bounded request/response models, validation, and byte-stream
+framing. Applications own model selection, user consent, audio preprocessing,
+embedding generation and storage, nearest-neighbor search, peer selection, and
+result presentation. Compatible clients can therefore use different local
+implementations while exchanging vectors only when their exact profile
+fingerprints match.
+
 Capability discovery is the narrow exception to schema isolation. The bounded,
 self-versioned `furumi/capabilities/1` stream still validates the federation
 transport version and network id, but remains reachable across application

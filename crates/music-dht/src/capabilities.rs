@@ -31,6 +31,8 @@ pub const RENDEZVOUS_ID: &str = "rendezvous";
 pub const MUSIC_DHT_ID: &str = "music_dht";
 /// Stable protocol identifier for rich catalog streams.
 pub const CATALOG_ID: &str = "catalog";
+/// Stable protocol identifier for music-similarity streams.
+pub const SIMILARITY_ID: &str = "similarity";
 /// Stable protocol identifier for personal-device synchronization.
 pub const DEVICE_SYNC_ID: &str = "device_sync";
 /// Stable protocol identifier for Jam playback control.
@@ -66,6 +68,10 @@ impl CapabilityManifest {
         protocols.insert(
             CATALOG_ID.to_string(),
             crate::catalog::CATALOG_PROTOCOL_VERSION,
+        );
+        protocols.insert(
+            SIMILARITY_ID.to_string(),
+            crate::similarity::SIMILARITY_PROTOCOL_VERSION,
         );
         protocols.insert(
             DEVICE_SYNC_ID.to_string(),
@@ -205,6 +211,7 @@ mod tests {
             RENDEZVOUS_ID,
             MUSIC_DHT_ID,
             CATALOG_ID,
+            SIMILARITY_ID,
             DEVICE_SYNC_ID,
             JAM_ID,
         ] {
