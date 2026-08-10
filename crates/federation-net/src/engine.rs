@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, Signature};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -1039,6 +1039,15 @@ impl<M: Message> NetworkEngine<M> {
     /// Returns the stable identifier of this peer.
     pub fn endpoint_id(&self) -> EndpointId {
         self.shared.endpoint.id()
+    }
+
+    /// Signs application data with this peer's persistent transport identity.
+    ///
+    /// The secret key never leaves the engine. Protocols can attach the
+    /// returned signature to records that may be forwarded by other peers;
+    /// recipients verify it against [`Self::endpoint_id`].
+    pub fn sign_identity(&self, message: &[u8]) -> Signature {
+        self.shared.endpoint.secret_key().sign(message)
     }
 
     /// Returns the network this engine participates in.

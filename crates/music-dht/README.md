@@ -91,6 +91,22 @@ Results may carry a shared 128-bit SimHash of their embedding. Clients can use
 its Hamming distance to suppress near-duplicate recordings across peers without
 transmitting every result vector.
 
+`music_dht::similarity_lsh` and `music_dht::similarity_dht` add decentralized
+peer routing without putting models or vector storage into this crate. Every
+client computes the same 256-bit SimHash, groups its local signatures into a
+fixed two-level LSH (`12 × 20` bits, split into a 10-bit DHT key and a compact
+10-bit suffix), and publishes one anonymous summary per peer and coarse bucket.
+The summaries contain no track metadata, only the owner's self-contained route,
+and are signed by its existing iroh identity, so a forwarding peer cannot alter
+or impersonate them.
+
+The routing overlay has its own schema-independent ALPN. Old clients therefore
+remain compatible with ordinary catalog federation while upgraded peers find
+one another and replicate expiring LSH summaries without a coordinator or a
+global calibration file. Applications provide local routing signatures through
+`SimilarityDht::sync_local_signatures`, use `SimilarityDht::find_peers` before
+the direct similarity stream, and continue to perform exact search locally.
+
 ## Trusted-device sync and listening history
 
 `music_dht::device_sync` is the canonical wire contract shared by Furumi

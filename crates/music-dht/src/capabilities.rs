@@ -33,6 +33,8 @@ pub const MUSIC_DHT_ID: &str = "music_dht";
 pub const CATALOG_ID: &str = "catalog";
 /// Stable protocol identifier for music-similarity streams.
 pub const SIMILARITY_ID: &str = "similarity";
+/// Stable protocol identifier for DHT-routed similarity discovery.
+pub const SIMILARITY_DHT_ID: &str = "similarity_dht";
 /// Stable protocol identifier for personal-device synchronization.
 pub const DEVICE_SYNC_ID: &str = "device_sync";
 /// Stable protocol identifier for Jam playback control.
@@ -72,6 +74,10 @@ impl CapabilityManifest {
         protocols.insert(
             SIMILARITY_ID.to_string(),
             crate::similarity::SIMILARITY_PROTOCOL_VERSION,
+        );
+        protocols.insert(
+            SIMILARITY_DHT_ID.to_string(),
+            crate::similarity_lsh::SIMILARITY_DHT_PROTOCOL_VERSION,
         );
         protocols.insert(
             DEVICE_SYNC_ID.to_string(),
@@ -212,6 +218,7 @@ mod tests {
             MUSIC_DHT_ID,
             CATALOG_ID,
             SIMILARITY_ID,
+            SIMILARITY_DHT_ID,
             DEVICE_SYNC_ID,
             JAM_ID,
         ] {

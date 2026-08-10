@@ -154,10 +154,27 @@ therefore use dedicated ALPNs while sharing identity and connectivity.
 Music similarity is another shared extension protocol. `music-dht` owns its
 versioned ALPN, bounded request/response models, validation, and byte-stream
 framing. Applications own model selection, user consent, audio preprocessing,
-embedding generation and storage, nearest-neighbor search, peer selection, and
-result presentation. Compatible clients can therefore use different local
-implementations while exchanging vectors only when their exact profile
-fingerprints match.
+embedding generation and storage, nearest-neighbor search, participation
+policy, and result presentation. Compatible clients can therefore use
+different local implementations while exchanging vectors only when their exact
+profile fingerprints match.
+
+Similarity peer selection uses a second, schema-independent Kademlia overlay.
+It derives a model-neutral 256-bit SimHash, maps fixed subsets into twelve
+two-level LSH tables, and publishes one summary per owner and occupied coarse
+bucket. The coarse key is routed through the overlay; compact fine-bucket
+suffixes, one anonymous representative signature, and the owner's self-contained
+connection ticket are carried in the value. This bounds a peer's presence in a
+hot bucket independently of how many tracks it owns, makes multi-hop results
+dialable, and avoids a canonical calibration file.
+
+Routing summaries are signed by the owner's persistent transport identity.
+Replicas validate the owner signature, network, profile, derived key, bucket
+bounds, issue time and TTL before storing or forwarding a record. The routing
+cache uses a separate SQLite database because it is replaceable federation
+state, not application embedding storage. Its ALPN is additive: peers that do
+not implement it continue to use the unchanged `music-dht-v5` catalog network,
+while upgraded peers bootstrap and gossip their own routing contacts.
 
 Capability discovery is the narrow exception to schema isolation. The bounded,
 self-versioned `furumi/capabilities/1` stream still validates the federation

@@ -78,6 +78,6 @@ pub use ticket::{PeerTicket, TICKET_VERSION};
 
 // Re-exported Iroh types that appear in the public API.
 pub use iroh::endpoint::{RecvStream, SendStream};
-pub use iroh::{EndpointAddr, EndpointId, SecretKey};
+pub use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
 // Re-exported so applications can use the generic ticket helpers.
 pub use iroh_tickets::Ticket;

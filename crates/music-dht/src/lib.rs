@@ -20,6 +20,9 @@
 //!   the exact same audio bytes.
 //! * [`similarity`] defines the bounded, model-neutral stream contract used by
 //!   clients that independently generate compatible music embeddings.
+//! * [`similarity_lsh`] turns those embeddings into deterministic compact
+//!   routing summaries, while [`similarity_dht`] stores and discovers signed
+//!   peer summaries without owning model inference or an embedding database.
 //! * Records are replicated to the `K` nodes whose ids are XOR-closest to
 //!   each key. Publishers pick the targets from their routing table and send
 //!   batched store requests (one pipeline per peer), so even a large library
@@ -94,6 +97,10 @@ mod request;
 mod routing;
 mod service;
 pub mod similarity;
+pub mod similarity_dht;
+pub mod similarity_lsh;
+
+pub use similarity_lsh::SimilarityRouteEntry;
 
 pub use config::{
     DEFAULT_EXPIRE_INTERVAL, DEFAULT_LOOKUP_TIMEOUT, DEFAULT_REPUBLISH_INTERVAL,

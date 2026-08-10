@@ -12,7 +12,8 @@ The workspace has two layers:
   Mainline DHT.
 - [`music-dht`](crates/music-dht) builds a Kademlia-style distributed music
   directory on top of that transport, including catalog discovery, content-id
-  lookup, direct byte streams, and shared Furumi wire types.
+  lookup, signed similarity-LSH routing, direct byte streams, and shared Furumi
+  wire types.
 
 Each participant is a client, router, and storage peer. Automatic rendezvous
 has no Frid-operated bootstrap service, while self-contained peer tickets

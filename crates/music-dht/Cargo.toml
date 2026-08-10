@@ -1,6 +1,6 @@
 [package]
 name = "music-dht"
-version = "0.3.1"
+version = "0.4.0"
 description = "Distributed music library search: a Kademlia-style DHT on top of federation-net"
 readme = "README.md"
 documentation = "https://docs.rs/music-dht"

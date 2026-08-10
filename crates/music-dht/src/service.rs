@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use federation_net::{
-    ByteStream, EndpointAddr, EndpointId, NetworkConfig, NetworkEngine, PeerTicket, SchemaId,
-    SecretKey, StreamAcceptor,
+    ByteStream, EndpointAddr, EndpointId, NetworkConfig, NetworkEngine, NetworkId, PeerTicket,
+    SchemaId, SecretKey, Signature, StreamAcceptor,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -335,6 +335,17 @@ impl MusicDhtService {
         self.node.endpoint_id
     }
 
+    /// Returns the federation network this service participates in.
+    pub fn network_id(&self) -> NetworkId {
+        self.node.config.network_id
+    }
+
+    /// Signs a forwarded application record with this peer's persistent
+    /// transport identity without exposing the secret key.
+    pub fn sign_identity(&self, message: &[u8]) -> Signature {
+        self.node.engine.sign_identity(message)
+    }
+
     /// Returns the DHT identifier of this peer.
     pub fn node_id(&self) -> NodeId {
         self.node.node_id
@@ -398,6 +409,24 @@ impl MusicDhtService {
         self.node
             .engine
             .open_stream(addr, alpn)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Opens a raw byte stream using a self-contained peer ticket.
+    ///
+    /// This is used by schema-independent overlays whose contacts can be
+    /// learned independently of the main music-DHT routing table.
+    pub async fn open_stream_to(&self, ticket: &PeerTicket, alpn: &[u8]) -> Result<ByteStream> {
+        self.node.ensure_running()?;
+        if ticket.network_id != self.node.config.network_id {
+            return Err(MusicDhtError::Network(
+                "peer ticket belongs to another network".to_string(),
+            ));
+        }
+        self.node
+            .engine
+            .open_stream(ticket.endpoint_addr.clone(), alpn)
             .await
             .map_err(Into::into)
     }
