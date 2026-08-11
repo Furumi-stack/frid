@@ -1,10 +1,10 @@
 # frid
 
-Frid is the decentralized networking core behind Furumi. It provides reusable
-Rust libraries for building equal-peer applications with no application
-server, central peer registry, or privileged node.
+Frid is the shared infrastructure core behind Furumi. It provides reusable
+Rust libraries for local music persistence and equal-peer networking without
+an application server, central peer registry, or privileged node.
 
-The workspace has two layers:
+The workspace has three layers:
 
 - [`federation-net`](crates/federation-net) establishes authenticated,
   NAT-traversing P2P connections over iroh, isolates independent networks and
@@ -14,6 +14,9 @@ The workspace has two layers:
   directory on top of that transport, including catalog discovery, content-id
   lookup, signed similarity-LSH routing, direct byte streams, and shared Furumi
   wire types.
+- [`furumi-library`](crates/furumi-library) owns the shared local `library.db`
+  contract, migrations, catalog operations, metadata import, artwork,
+  playlists, likes, history, and similarity persistence used by Furumi clients.
 
 Each participant is a client, router, and storage peer. Automatic rendezvous
 has no Frid-operated bootstrap service, while self-contained peer tickets
@@ -42,6 +45,7 @@ failure handling, and compatibility rules.
 crates/
   federation-net/       generic iroh transport and rendezvous
   music-dht/            distributed music catalog and content discovery
+  furumi-library/       client-independent local music database and import
 ```
 
 ## Using the libraries
@@ -52,12 +56,14 @@ Until crates are published to a registry, depend on the repository directly:
 [dependencies]
 federation-net = { git = "https://gt.hexor.cy/ab/frid.git" }
 music-dht = { git = "https://gt.hexor.cy/ab/frid.git" }
+furumi-library = { git = "https://gt.hexor.cy/ab/frid.git" }
 ```
 
 Start with the crate documentation:
 
 - [`federation-net` guide](crates/federation-net/README.md)
 - [`music-dht` guide](crates/music-dht/README.md)
+- [`furumi-library` guide](crates/furumi-library/README.md)
 
 ## Development
 

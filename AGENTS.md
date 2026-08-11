@@ -4,10 +4,11 @@ These instructions apply to the entire Frid workspace.
 
 ## Project role
 
-Frid is shared networking infrastructure. `federation-net` is the generic
-transport; `music-dht` is the distributed music-directory overlay used by
-Furumi applications. Treat public APIs, persisted state, hash derivations, and
-wire formats as compatibility-sensitive.
+Frid is shared Furumi infrastructure. `federation-net` is the generic
+transport; `music-dht` is the distributed music-directory overlay; and
+`furumi-library` owns the client-independent local music database and import
+contract. Treat public APIs, persisted state, hash derivations, and wire
+formats as compatibility-sensitive.
 
 Read `ARCHITECTURE.md` before changing protocols, routing, persistence,
 rendezvous, tickets, identity, or record derivation.
@@ -51,6 +52,9 @@ breaking wire change even when serde would accept the Rust source change.
   authorization logic.
 - `music-dht` owns Kademlia routing, requests, records, replication, search,
   content lookup, and its persistence abstraction.
+- `furumi-library` owns the local catalog schema and migrations, metadata
+  import, artwork, playlists, likes, history, and similarity persistence. It
+  must not acquire UI, playback-engine, or client-runtime responsibilities.
 - Rich catalogs, audio, and device sync use dedicated ALPN stream protocols;
   do not push bulk data through the typed DHT event channel.
 - Applications own policy: knowing a network ID or discovering a peer is not

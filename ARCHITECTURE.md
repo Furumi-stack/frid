@@ -7,8 +7,11 @@ queried**.
 
 ```text
 application
+    ├── UI, playback, runtime, policy
     │
-    ├── domain API, persistence, policy
+furumi-library
+    ├── local catalog, import, migrations
+    ├── playlists, likes, history, similarity persistence
     │
 music-dht
     ├── Kademlia routing and iterative lookup
@@ -22,7 +25,25 @@ federation-net
     └── optional Mainline-DHT rendezvous
 ```
 
-Neither layer assigns a permanent server role to a peer.
+No layer assigns a permanent server role to a peer.
+
+`furumi-library` is client-independent local persistence. It may reuse stable
+music-domain identifiers and device-sync DTOs from `music-dht`, but it does
+not start networking, own an application runtime, or depend on a particular
+UI or playback engine. Dependency direction remains one-way:
+`federation-net <- music-dht <- furumi-library <- applications`.
+
+## Local library: furumi-library
+
+All Furumi clients share one platform-native `library.db` contract. The crate
+owns its SQLite schema and migrations, local catalog models and queries,
+metadata import, artwork resolution, playlists, likes, listening history, and
+similarity index storage. Connections enable foreign keys, WAL, and a bounded
+busy timeout so independently running clients can safely share the database.
+
+Filesystem scanning schedules, playback, federation lifecycle, and UI state
+remain application responsibilities. Database and metadata work must stay off
+interactive and async reactor threads.
 
 ## Transport: federation-net
 
