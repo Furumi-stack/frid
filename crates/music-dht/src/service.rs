@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use federation_net::{
-    ByteStream, EndpointAddr, EndpointId, NetworkConfig, NetworkEngine, NetworkId, PeerTicket,
-    SchemaId, SecretKey, Signature, StreamAcceptor,
+    ByteStream, EndpointAddr, EndpointId, NetworkConfig, NetworkEngine, NetworkHealthSnapshot,
+    NetworkId, PeerTicket, SchemaId, SecretKey, Signature, StreamAcceptor,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -373,6 +373,11 @@ impl MusicDhtService {
     /// Transport connections that are currently open.
     pub fn connected_peers(&self) -> Vec<EndpointId> {
         self.node.engine.connected_peers()
+    }
+
+    /// Returns a point-in-time snapshot of transport and rendezvous health.
+    pub fn network_health(&self) -> NetworkHealthSnapshot {
+        self.node.engine.health()
     }
 
     /// Returns `true` if a transport connection to `peer` is open.

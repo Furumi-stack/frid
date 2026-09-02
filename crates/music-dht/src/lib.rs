@@ -133,6 +133,7 @@ pub use service::{
 
 // Re-exported types from the transport layer that appear in this API.
 pub use federation_net::{
-    ByteStream, ByteStreamConnectionStats, ConnectionPathKind, EndpointAddr, EndpointId, NetworkId,
-    PeerTicket, RecvStream, RendezvousConfig, SecretKey, SendStream, StreamAcceptor,
+    ByteStream, ByteStreamConnectionStats, ConnectionPathKind, EndpointAddr, EndpointId,
+    NetworkHealthSnapshot, NetworkHealthState, NetworkId, PeerTicket, RecvStream, RendezvousConfig,
+    SecretKey, SendStream, StreamAcceptor,
 };

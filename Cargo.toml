@@ -13,8 +13,8 @@ rust-version = "1.97"
 repository = "https://gt.hexor.cy/ab/frid"
 
 [workspace.dependencies]
-federation-net = { path = "crates/federation-net", version = "0.3.0" }
-music-dht = { path = "crates/music-dht", version = "0.4.0" }
+federation-net = { path = "crates/federation-net", version = "0.3.1" }
+music-dht = { path = "crates/music-dht", version = "0.4.1" }
 iroh = "1"
 iroh-base = "1"
 iroh-tickets = "1"

@@ -27,7 +27,7 @@ use iroh::{EndpointAddr, EndpointId};
 use mainline::async_dht::AsyncDht;
 use mainline::{Dht, MutableItem, SigningKey};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::{NetworkError, Result};
 use crate::protocol::NetworkId;
@@ -171,6 +171,12 @@ pub(crate) struct RendezvousClient {
     entry_ttl: Duration,
 }
 
+/// Result of one read/merge/publish cycle.
+pub(crate) struct RendezvousRound {
+    pub(crate) peers: Vec<EndpointAddr>,
+    pub(crate) publish_error: Option<String>,
+}
+
 impl RendezvousClient {
     /// Binds a mainline DHT client for the rendezvous record of `network_id`.
     pub(crate) fn new(network_id: NetworkId, config: &RendezvousConfig) -> Result<Self> {
@@ -201,7 +207,7 @@ impl RendezvousClient {
         &self,
         self_addr: Option<EndpointAddr>,
         now_ms: u64,
-    ) -> Result<Vec<EndpointAddr>> {
+    ) -> Result<RendezvousRound> {
         let public_key = self.key.verifying_key().to_bytes();
         let mut items = self.dht.get_mutable(&public_key, None, None);
         let mut seen = Vec::new();
@@ -222,21 +228,28 @@ impl RendezvousClient {
         let publish = self_entry.is_some();
         let merged = merge_entries(seen, self_entry, now_ms, self.entry_ttl);
 
-        if publish {
+        let publish_error = if publish {
             let encoded = encode_record_capped(merged.clone())?;
             // Strictly newer than every instance seen this round; concurrent
             // writers race, but merging on read makes lost updates benign.
             let item = MutableItem::new(self.key.clone(), &encoded, max_seq + 1, None);
-            if let Err(err) = self.dht.put_mutable(item, None).await {
-                warn!(error = %err, "failed to publish the rendezvous record");
-            }
-        }
+            self.dht
+                .put_mutable(item, None)
+                .await
+                .err()
+                .map(|err| format!("failed to publish the rendezvous record: {err}"))
+        } else {
+            None
+        };
 
-        Ok(merged
-            .into_iter()
-            .map(|entry| entry.addr)
-            .filter(|addr| Some(addr.id) != self_id)
-            .collect())
+        Ok(RendezvousRound {
+            peers: merged
+                .into_iter()
+                .map(|entry| entry.addr)
+                .filter(|addr| Some(addr.id) != self_id)
+                .collect(),
+            publish_error,
+        })
     }
 }
 

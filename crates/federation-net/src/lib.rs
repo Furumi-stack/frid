@@ -55,6 +55,7 @@ mod config;
 mod engine;
 mod error;
 mod event;
+mod health;
 mod identity;
 mod protocol;
 mod rendezvous;
@@ -71,6 +72,7 @@ pub use engine::{
 };
 pub use error::{NetworkError, Result};
 pub use event::{ConnectionDirection, NetworkEvent, NetworkEventReceiver};
+pub use health::{NetworkHealthSnapshot, NetworkHealthState};
 pub use protocol::{ALPN, NetworkId, PROTOCOL_VERSION, SchemaId};
 pub use rendezvous::RENDEZVOUS_RECORD_VERSION;
 pub use rendezvous::{DEFAULT_RENDEZVOUS_ENTRY_TTL, DEFAULT_RENDEZVOUS_INTERVAL, RendezvousConfig};

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use crate::config::NetworkConfig;
 use crate::error::{NetworkError, Result};
 use crate::event::{ConnectionDirection, NetworkEvent, NetworkEventReceiver};
+use crate::health::{NetworkHealthSnapshot, NetworkHealthState};
 use crate::identity;
 use crate::protocol::{
     ALPN, Handshake, HandshakeAck, HandshakeErrorCode, MAX_HANDSHAKE_FRAME_SIZE,
@@ -50,6 +51,12 @@ const REJECT_LINGER: Duration = Duration::from_secs(3);
 const SHUTDOWN_TASK_GRACE: Duration = Duration::from_secs(5);
 /// Upper bound of the rendezvous round delay while no peer is connected yet.
 const RENDEZVOUS_LONELY_INTERVAL: Duration = Duration::from_secs(15);
+/// A stuck Mainline-DHT operation must not stall discovery forever.
+const RENDEZVOUS_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Recreate the Mainline-DHT client after this many consecutive failures.
+const RENDEZVOUS_REBUILD_AFTER_FAILURES: u32 = 2;
+/// Recommend an application-owned full restart after sustained discovery failure.
+const RENDEZVOUS_RESTART_AFTER_FAILURES: u32 = 4;
 /// Capacity of the queue of accepted-but-not-yet-consumed incoming byte
 /// streams, per stream protocol. A full queue delays the handshake ack of
 /// further incoming streams (natural backpressure).
@@ -260,6 +267,27 @@ struct StreamAcceptorSlot {
     receiver: Option<mpsc::Receiver<ByteStream>>,
 }
 
+#[derive(Debug)]
+struct RendezvousHealth {
+    last_success: Option<Instant>,
+    consecutive_failures: u32,
+    consecutive_peer_dial_failures: u32,
+    client_restarts: u64,
+    last_error: Option<String>,
+}
+
+impl RendezvousHealth {
+    fn new() -> Self {
+        Self {
+            last_success: None,
+            consecutive_failures: 0,
+            consecutive_peer_dial_failures: 0,
+            client_restarts: 0,
+            last_error: None,
+        }
+    }
+}
+
 fn alpn_display(alpn: &[u8]) -> String {
     String::from_utf8_lossy(alpn).into_owned()
 }
@@ -276,6 +304,7 @@ struct Shared<M> {
     tasks: Mutex<JoinSet<()>>,
     next_generation: AtomicU64,
     shutting_down: AtomicBool,
+    rendezvous_health: Mutex<Option<RendezvousHealth>>,
     /// Broadcasts the start of the shutdown to long-running background
     /// loops so they can stop promptly instead of being aborted.
     shutdown_signal: watch::Sender<bool>,
@@ -291,6 +320,97 @@ impl<M: Message> Shared<M> {
             Err(NetworkError::ShuttingDown)
         } else {
             Ok(())
+        }
+    }
+
+    fn record_rendezvous_success(&self) {
+        if let Some(health) = lock(&self.rendezvous_health).as_mut() {
+            health.last_success = Some(Instant::now());
+            health.consecutive_failures = 0;
+            health.last_error = None;
+        }
+    }
+
+    fn record_rendezvous_failure(&self, error: String) -> u32 {
+        let mut guard = lock(&self.rendezvous_health);
+        let Some(health) = guard.as_mut() else {
+            return 0;
+        };
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.last_error = Some(error);
+        health.consecutive_failures
+    }
+
+    fn record_rendezvous_restart(&self) {
+        if let Some(health) = lock(&self.rendezvous_health).as_mut() {
+            health.client_restarts = health.client_restarts.saturating_add(1);
+        }
+    }
+
+    fn record_peer_connection_success(&self) {
+        if let Some(health) = lock(&self.rendezvous_health).as_mut() {
+            health.consecutive_peer_dial_failures = 0;
+        }
+    }
+
+    fn record_rendezvous_peer_dials(&self, candidates: usize, attempts: usize, successes: usize) {
+        let mut guard = lock(&self.rendezvous_health);
+        let Some(health) = guard.as_mut() else {
+            return;
+        };
+        if candidates == 0 || successes > 0 {
+            health.consecutive_peer_dial_failures = 0;
+        } else if attempts > 0 {
+            health.consecutive_peer_dial_failures =
+                health.consecutive_peer_dial_failures.saturating_add(1);
+            health.last_error = Some(format!(
+                "failed to connect to all {attempts} peer(s) discovered by rendezvous"
+            ));
+        }
+    }
+
+    fn health(&self) -> NetworkHealthSnapshot {
+        let connected_peers = lock(&self.peers).len();
+        let guard = lock(&self.rendezvous_health);
+        let Some(health) = guard.as_ref() else {
+            return NetworkHealthSnapshot {
+                state: if connected_peers == 0 {
+                    NetworkHealthState::Discovering
+                } else {
+                    NetworkHealthState::Healthy
+                },
+                connected_peers,
+                rendezvous_enabled: false,
+                consecutive_rendezvous_failures: 0,
+                consecutive_peer_dial_failures: 0,
+                rendezvous_restarts: 0,
+                last_rendezvous_success_ago: None,
+                last_rendezvous_error: None,
+                restart_recommended: false,
+            };
+        };
+        let restart_recommended = connected_peers == 0
+            && (health.consecutive_failures >= RENDEZVOUS_RESTART_AFTER_FAILURES
+                || health.consecutive_peer_dial_failures >= RENDEZVOUS_RESTART_AFTER_FAILURES);
+        let state = if restart_recommended {
+            NetworkHealthState::Degraded
+        } else if health.consecutive_failures > 0 || health.consecutive_peer_dial_failures > 0 {
+            NetworkHealthState::Recovering
+        } else if health.last_success.is_some() {
+            NetworkHealthState::Healthy
+        } else {
+            NetworkHealthState::Discovering
+        };
+        NetworkHealthSnapshot {
+            state,
+            connected_peers,
+            rendezvous_enabled: true,
+            consecutive_rendezvous_failures: health.consecutive_failures,
+            consecutive_peer_dial_failures: health.consecutive_peer_dial_failures,
+            rendezvous_restarts: health.client_restarts,
+            last_rendezvous_success_ago: health.last_success.map(|at| at.elapsed()),
+            last_rendezvous_error: health.last_error.clone(),
+            restart_recommended,
         }
     }
 
@@ -335,6 +455,7 @@ impl<M: Message> Shared<M> {
             generation,
         };
         let replaced = lock(&self.peers).insert(peer_id, state);
+        self.record_peer_connection_success();
         if let Some(old) = replaced {
             debug!(peer = %peer_id, "replacing existing connection");
             old.connection
@@ -786,39 +907,92 @@ impl<M: Message> Shared<M> {
 /// Failures of a single round or dial are logged and retried on the next
 /// round; the loop only ends when the engine shuts down (the task is
 /// aborted).
-async fn rendezvous_loop<M: Message>(
-    shared: Arc<Shared<M>>,
-    client: RendezvousClient,
-    config: RendezvousConfig,
-) {
+async fn rendezvous_loop<M: Message>(shared: Arc<Shared<M>>, config: RendezvousConfig) {
     let mut shutdown = shared.shutdown_signal.subscribe();
     // Give the endpoint a moment to learn its relay and direct addresses so
     // the very first published record is already dialable.
     let _ = timeout(shared.config.request_timeout, shared.endpoint.online()).await;
     let self_id = shared.endpoint.id();
+    let mut client = None;
     loop {
         if shared.is_shutting_down() {
             return;
         }
+        if client.is_none() {
+            match RendezvousClient::new(shared.config.network_id, &config) {
+                Ok(new_client) => client = Some(new_client),
+                Err(err) => {
+                    let failures = shared.record_rendezvous_failure(err.to_string());
+                    warn!(error = %err, failures, "failed to start peer rendezvous; retrying");
+                }
+            }
+        }
         let round = async {
+            let Some(active_client) = client.as_ref() else {
+                return;
+            };
             let addr = shared.endpoint.addr();
             let self_addr = (!addr.is_empty()).then_some(addr);
-            match client.round(self_addr, now_ms()).await {
-                Ok(peers) => {
-                    for peer_addr in peers {
+            if self_addr.is_none() {
+                let failures = shared.record_rendezvous_failure(
+                    "local endpoint has no dialable address".to_string(),
+                );
+                debug!(failures, "rendezvous waiting for a dialable local address");
+                return;
+            }
+            match timeout(
+                RENDEZVOUS_ROUND_TIMEOUT,
+                active_client.round(self_addr, now_ms()),
+            )
+            .await
+            {
+                Ok(Ok(round)) => {
+                    let candidates = round.peers.len();
+                    let mut attempts = 0;
+                    let mut successes = 0;
+                    for peer_addr in round.peers {
                         let peer = peer_addr.id;
                         if peer == self_id || lock(&shared.peers).contains_key(&peer) {
                             continue;
                         }
                         debug!(peer = %peer, "rendezvous discovered a peer; connecting");
-                        if let Err(err) = shared.connect_to_addr(peer_addr).await {
-                            // Stale entries (peers that left) fail here; they
-                            // age out of the record by TTL.
-                            debug!(peer = %peer, error = %err, "rendezvous connect attempt failed");
+                        attempts += 1;
+                        match shared.connect_to_addr(peer_addr).await {
+                            Ok(_) => successes += 1,
+                            Err(err) => {
+                                // Stale entries (peers that left) fail here;
+                                // they age out of the record by TTL.
+                                debug!(peer = %peer, error = %err, "rendezvous connect attempt failed");
+                            }
                         }
                     }
+                    if let Some(error) = round.publish_error {
+                        let failures = shared.record_rendezvous_failure(error.clone());
+                        debug!(%error, failures, "rendezvous publish failed");
+                    } else {
+                        shared.record_rendezvous_success();
+                    }
+                    shared.record_rendezvous_peer_dials(candidates, attempts, successes);
                 }
-                Err(err) => debug!(error = %err, "rendezvous round failed"),
+                Ok(Err(err)) => {
+                    let failures = shared.record_rendezvous_failure(err.to_string());
+                    debug!(error = %err, failures, "rendezvous round failed");
+                }
+                Err(_) => {
+                    let failures = shared.record_rendezvous_failure(format!(
+                        "rendezvous round timed out after {}s",
+                        RENDEZVOUS_ROUND_TIMEOUT.as_secs()
+                    ));
+                    warn!(failures, "rendezvous round timed out");
+                }
+            }
+            let failures = lock(&shared.rendezvous_health)
+                .as_ref()
+                .map_or(0, |health| health.consecutive_failures);
+            if failures >= RENDEZVOUS_REBUILD_AFTER_FAILURES {
+                client = None;
+                shared.record_rendezvous_restart();
+                info!(failures, "rebuilding the rendezvous client");
             }
         };
         tokio::select! {
@@ -960,6 +1134,7 @@ impl<M: Message> NetworkEngine<M> {
         config: NetworkConfig,
         secret_key: SecretKey,
     ) -> Result<(Self, NetworkEventReceiver<M>)> {
+        let rendezvous_enabled = config.rendezvous.is_some();
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .bind()
@@ -992,6 +1167,7 @@ impl<M: Message> NetworkEngine<M> {
             tasks: Mutex::new(JoinSet::new()),
             next_generation: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
+            rendezvous_health: Mutex::new(rendezvous_enabled.then(RendezvousHealth::new)),
             shutdown_signal: watch::Sender::new(false),
         });
         let handler = FederationProtocol {
@@ -1015,17 +1191,10 @@ impl<M: Message> NetworkEngine<M> {
         let router = router_builder.spawn();
         *lock(&shared.router) = Some(router);
         if let Some(rendezvous) = shared.config.rendezvous.clone() {
-            match RendezvousClient::new(shared.config.network_id, &rendezvous) {
-                Ok(client) => {
-                    let loop_shared = shared.clone();
-                    shared.spawn_task(async move {
-                        rendezvous_loop(loop_shared, client, rendezvous).await;
-                    });
-                }
-                // Rendezvous is a convenience; the engine stays usable via
-                // tickets even when the DHT client cannot start.
-                Err(err) => warn!(error = %err, "peer rendezvous disabled"),
-            }
+            let loop_shared = shared.clone();
+            shared.spawn_task(async move {
+                rendezvous_loop(loop_shared, rendezvous).await;
+            });
         }
         info!(
             endpoint_id = %endpoint_id,
@@ -1255,6 +1424,11 @@ impl<M: Message> NetworkEngine<M> {
     /// Returns the ids of all currently connected peers.
     pub fn connected_peers(&self) -> Vec<EndpointId> {
         lock(&self.shared.peers).keys().copied().collect()
+    }
+
+    /// Returns a point-in-time snapshot of transport and rendezvous health.
+    pub fn health(&self) -> NetworkHealthSnapshot {
+        self.shared.health()
     }
 
     /// Returns `true` if there is an active connection to `peer`.

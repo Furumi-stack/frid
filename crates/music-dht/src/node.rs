@@ -36,8 +36,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// Upper bound of the dial backoff.
 const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
-/// Consecutive failed dials after which a contact is evicted entirely.
-const DIAL_FAILURES_BEFORE_EVICT: u32 = 5;
+/// Consecutive failed dials after which a contact is considered cold.
+const DIAL_FAILURES_BEFORE_COLD: u32 = 5;
 
 /// Dial-failure state of one currently unreachable contact.
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +97,8 @@ pub(crate) struct Node {
     exchange_sent: Mutex<HashSet<EndpointId>>,
     /// Contacts that recently failed to dial, with their backoff state.
     dial_failures: Mutex<HashMap<EndpointId, DialFailure>>,
+    /// Serializes on-demand connection attempts to the same contact.
+    dial_locks: Mutex<HashMap<EndpointId, Arc<tokio::sync::Mutex<()>>>>,
     events: Mutex<Option<mpsc::Sender<MusicDhtEvent>>>,
     /// Set once the post-startup republish has been triggered.
     initial_republish_done: AtomicBool,
@@ -123,6 +125,7 @@ impl Node {
             hello_sent: Mutex::new(HashSet::new()),
             exchange_sent: Mutex::new(HashSet::new()),
             dial_failures: Mutex::new(HashMap::new()),
+            dial_locks: Mutex::new(HashMap::new()),
             events: Mutex::new(Some(events)),
             initial_republish_done: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -478,6 +481,18 @@ impl Node {
         if self.engine.is_connected(contact.peer_id) {
             return Ok(contact.peer_id);
         }
+        let dial_lock = lock(&self.dial_locks)
+            .entry(contact.peer_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _dial_guard = dial_lock.lock().await;
+        self.ensure_running()?;
+        if self.engine.is_connected(contact.peer_id) {
+            return Ok(contact.peer_id);
+        }
+        if self.dial_backoff_active(&contact.peer_id, now_ms()) {
+            return Err(MusicDhtError::Timeout);
+        }
         let ticket: PeerTicket = contact
             .ticket
             .parse()
@@ -493,7 +508,7 @@ impl Node {
                 Ok(peer)
             }
             Err(err) => {
-                self.note_dial_failure(contact).await;
+                self.note_dial_failure(contact);
                 Err(err)
             }
         }
@@ -519,35 +534,36 @@ impl Node {
         }
     }
 
-    /// Records a failed dial; after [`DIAL_FAILURES_BEFORE_EVICT`] failures
-    /// in a row the contact is dropped from the routing table and the
-    /// database (gossip re-adds it with a clean slate if it comes back).
-    async fn note_dial_failure(&self, contact: &NodeContact) {
+    /// Records a failed dial and increases its bounded retry backoff.
+    ///
+    /// The contact remains in memory and durable storage: temporary network
+    /// loss or system sleep must not erase the only route back to a peer.
+    fn note_dial_failure(&self, contact: &NodeContact) {
         let consecutive = {
             let mut failures = lock(&self.dial_failures);
             let failure = failures.entry(contact.peer_id).or_insert(DialFailure {
                 consecutive: 0,
                 last_attempt_ms: 0,
             });
-            failure.consecutive += 1;
+            failure.consecutive = failure.consecutive.saturating_add(1);
             failure.last_attempt_ms = now_ms();
             failure.consecutive
         };
-        if consecutive < DIAL_FAILURES_BEFORE_EVICT {
+        if consecutive == DIAL_FAILURES_BEFORE_COLD {
+            info!(
+                peer = %contact.peer_id,
+                consecutive,
+                backoff_s = dial_backoff(consecutive).as_secs(),
+                "DHT contact remains unavailable; retaining it for later recovery"
+            );
+        } else {
             debug!(
                 peer = %contact.peer_id,
                 consecutive,
                 backoff_s = dial_backoff(consecutive).as_secs(),
                 "dial failed; backing off"
             );
-            return;
         }
-        lock(&self.dial_failures).remove(&contact.peer_id);
-        lock(&self.routing).remove(&contact.peer_id);
-        if let Err(err) = self.db.delete_known_peer(contact.peer_id).await {
-            warn!(error = %err, "failed to delete evicted peer from the database");
-        }
-        info!(peer = %contact.peer_id, "evicted unreachable DHT contact");
     }
 
     /// Sends one request and awaits its response, cleaning up the pending
