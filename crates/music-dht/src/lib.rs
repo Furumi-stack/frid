@@ -137,3 +137,5 @@ pub use federation_net::{
     NetworkHealthSnapshot, NetworkHealthState, NetworkId, PeerTicket, RecvStream, RendezvousConfig,
     SecretKey, SendStream, StreamAcceptor,
 };
+
+pub mod playback;

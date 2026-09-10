@@ -27,7 +27,7 @@ pub const SYNC_ALPN_V2: &[u8] = b"furumi/sync/2";
 pub const SYNC_ALPN: &[u8] = SYNC_ALPN_V2;
 
 /// Version of the personal-device sync wire protocol.
-pub const DEVICE_SYNC_PROTOCOL_VERSION: u16 = 2;
+pub const DEVICE_SYNC_PROTOCOL_VERSION: u16 = 3;
 
 /// Minimum actual listening time retained for an interrupted listen.
 pub const MIN_RECORDED_LISTEN_MS: i64 = 5_000;
@@ -327,43 +327,10 @@ pub struct PlaybackStateWire {
     pub repeat: PlaybackRepeat,
 }
 
-/// Playback status broadcast by a device during sync.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlaybackSnapshot {
-    /// Device id.
-    pub device_id: String,
-    /// Device name.
-    pub device_name: String,
-    /// Whether this device considers itself active.
-    pub active: bool,
-    /// Update timestamp in unix milliseconds.
-    pub updated_at_ms: i64,
-    /// Playback state.
-    pub state: PlaybackStateWire,
-}
-
-/// Playback command delivered through the sync op log.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PlaybackCommand {
-    /// Replace target state. `seek` means the target should also seek audio.
-    SetState {
-        /// New state.
-        state: PlaybackStateWire,
-        /// Whether to seek the audio sink to `state.position_secs`.
-        #[serde(default)]
-        seek: bool,
-    },
-    /// Another device became active.
-    ActiveChanged {
-        /// New active device id.
-        active_device_id: String,
-        /// New active device name.
-        active_device_name: String,
-        /// Transferred playback state.
-        state: PlaybackStateWire,
-    },
-}
+/// Playback snapshot with the common coordination envelope.
+pub type PlaybackSnapshot = crate::playback::Snapshot<PlaybackStateWire>;
+/// Shared command vocabulary with the portable music queue DTO.
+pub type PlaybackCommand = crate::playback::Command<PlaybackStateWire>;
 
 /// One operation in the device-sync log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -461,6 +428,9 @@ pub enum SyncOpPayload {
         target_device_id: String,
         /// Command.
         command: PlaybackCommand,
+        /// Ownership and ordering fence. Legacy commands cannot change v3 playback.
+        #[serde(default)]
+        authority: Option<crate::playback::CommandStamp>,
     },
     /// Append one immutable listening-history event.
     ///

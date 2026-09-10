@@ -166,6 +166,24 @@ node.
 
 ### Extension protocols
 
+Personal playback coordination is a pure domain state machine in
+`music_dht::playback`. It owns the common claim ordering, output-heartbeat
+rules, command fences, configurable startup/failover policy and generic
+snapshot/command envelopes. Applications supply authenticated events,
+monotonic time and actual output availability, persist scoped checkpoints,
+and apply the resolved owner to their UI/audio adapters. They must not elect
+an owner from an online-device list or reject a winning claim just because
+their local output is playing. The web gateway uses a passive server profile;
+browser startup and explicit selection are separate inputs.
+
+This register provides eventual exclusivity after a partition heals, not a
+quorum lock during a partition. Device-sync profiles now advertise version 3;
+the additive coordination envelope is independently versioned and transported
+over the existing JSON `furumi/sync/2` stream. Legacy library records remain
+readable, but legacy unfenced personal playback messages cannot control an
+upgraded output. See [PLAYBACK_PROTOCOL.md](PLAYBACK_PROTOCOL.md) for the
+contract, adapter obligations, configuration and rollout rules.
+
 Music discovery identifies an owner and content; it does not force all domain
 traffic through DHT messages. `music-dht` exposes the underlying authenticated
 stream capability and defines shared wire models for Furumi catalog and device

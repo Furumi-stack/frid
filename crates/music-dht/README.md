@@ -183,7 +183,15 @@ to know that the integration exists.
 Protocol v1 uses `furumi/sync/1`; v2 uses `furumi/sync/2`. During migration,
 new clients should accept both ALPNs and only send `ListenRecorded` when
 `supports_listen_history(peer.protocol_version)` returns true. Likes,
-playlists, membership and playback coordination remain compatible with v1.
+playlists and membership remain compatible with v1. Profile version 3 adds
+versioned personal playback coordination over the existing JSON sync stream;
+legacy unfenced playback messages are ignored by upgraded clients.
+
+`music_dht::playback` provides the shared pure ownership engine and generic
+snapshot/command envelopes. Configure startup and failover with `Config`, feed
+actual output reports, and persist `Checkpoint` before applying decisions.
+`Config::passive()` is intended for always-running gateways. See the workspace
+`PLAYBACK_PROTOCOL.md` for invariants, configuration and migration details.
 
 ## Verification
 
