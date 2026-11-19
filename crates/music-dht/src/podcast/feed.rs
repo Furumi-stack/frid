@@ -61,7 +61,8 @@ pub struct ParsedFeed {
     pub author: Option<String>,
     /// Plain-text description, at most [`MAX_DESCRIPTION_CHARS`].
     pub description: Option<String>,
-    /// Publisher web page.
+    /// Publisher web page: `<link>` text or Atom `href`, trimmed, verbatim
+    /// (identity material, see [`resolve_episode_ids`]).
     pub link: Option<String>,
     /// Absolute http(s) artwork URL.
     pub image_url: Option<String>,
@@ -101,7 +102,8 @@ pub struct ParsedEpisode {
     pub mime_type: Option<String>,
     /// Enclosure length in bytes.
     pub byte_len: Option<u64>,
-    /// Item web page.
+    /// Item web page: `<link>` text or Atom `href`, trimmed, verbatim
+    /// (identity material, see [`resolve_episode_ids`]).
     pub link: Option<String>,
     /// Absolute http(s) artwork URL.
     pub image_url: Option<String>,
@@ -662,7 +664,7 @@ impl Parser {
                     let rel = attrs.get("rel").unwrap_or_default().to_ascii_lowercase();
                     if rel.is_empty() || rel == "alternate" {
                         let href = attrs.get("href").unwrap_or_default();
-                        set_once(&mut self.feed.link, clean_short(&href));
+                        set_once(&mut self.feed.link, href.trim().to_string());
                     }
                     None
                 }
@@ -770,7 +772,7 @@ impl Parser {
                             });
                         }
                     } else if rel.is_empty() || rel == "alternate" {
-                        set_once(&mut item.link, clean_short(&href));
+                        set_once(&mut item.link, href.trim().to_string());
                     }
                     None
                 }
@@ -970,11 +972,7 @@ impl Parser {
             audio_url: media.url,
             mime_type: media.mime,
             byte_len: media.len,
-            link: item
-                .link
-                .as_deref()
-                .map(clean_short)
-                .filter(|s| !s.is_empty()),
+            link: item.link.as_deref().and_then(raw_link),
             image_url: [item.itunes_image, item.thumbnail]
                 .into_iter()
                 .flatten()
@@ -1016,11 +1014,7 @@ impl Parser {
             title,
             author,
             description,
-            link: feed
-                .link
-                .as_deref()
-                .map(clean_short)
-                .filter(|s| !s.is_empty()),
+            link: feed.link.as_deref().and_then(raw_link),
             image_url,
             new_feed_url: feed
                 .new_feed_url
@@ -1199,6 +1193,17 @@ fn parse_number(text: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 // Text cleanup
 
+/// `<link>` text (already XML-unescaped) or Atom `href`, trimmed.
+///
+/// Links are identity material for GUID-less episodes (`EpisodeKey::Link`),
+/// so they are deliberately **not** passed through the display text cleaner:
+/// no tag stripping, second entity decoding, whitespace collapsing or
+/// truncation. Links that are empty or longer than `MAX_URL_BYTES` are absent.
+fn raw_link(text: &str) -> Option<String> {
+    let link = text.trim();
+    (!link.is_empty() && link.len() <= super::MAX_URL_BYTES).then(|| link.to_string())
+}
+
 fn clean_short(text: &str) -> String {
     html_to_text(text, MAX_TITLE_CHARS)
 }
@@ -1248,10 +1253,17 @@ pub(crate) fn html_to_text(input: &str, max_chars: usize) -> String {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'));
-        let Some(gt) = after.find('>').filter(|_| looks_like_tag) else {
+        if !looks_like_tag {
             stripped.push('<');
             rest = after;
             continue;
+        }
+        let Some(gt) = after.find('>') else {
+            // No '>' anywhere after this point: nothing else can be a tag.
+            // Stopping here keeps the scan linear on text full of '<'.
+            stripped.push('<');
+            rest = after;
+            break;
         };
         let tag = &after[..gt];
         rest = &after[gt + 1..];

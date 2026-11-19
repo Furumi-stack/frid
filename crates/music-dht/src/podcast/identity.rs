@@ -57,6 +57,9 @@ impl EpisodeIdentityHints {
     }
 }
 
+/// One matching stage of the no-GUID rule: does `known` match `item`?
+type StageMatcher<'f> = &'f dyn Fn(&Usable<'_>, &EpisodeIdentityHints) -> bool;
+
 struct Usable<'a> {
     link: Option<&'a str>,
     enclosure: Option<&'a str>,
@@ -103,11 +106,13 @@ pub fn resolve_episode_id(
 ///
 /// 1. An item with a GUID gets `EpisodeId::from_guid`. A GUID never matches
 ///    a different known episode, so the id is independent of local history.
-/// 2. An item without a GUID first looks for a known episode, in this order:
-///    same enclosure URL, then same `<link>`, then same publication second and
-///    [`normalize_episode_title`]. The first stage with candidates wins; among
-///    candidates the smallest id is reused. A known episode already claimed by
-///    another item of this document is not a candidate.
+/// 2. Items without a GUID then look for known episodes in three stages run
+///    over the whole document: same enclosure URL, then same `<link>`, then
+///    same publication second and [`normalize_episode_title`]. A stage
+///    assigns matches for all remaining items before the next stage starts;
+///    among candidates the smallest id is reused. A known episode already
+///    claimed (by a GUID item or an earlier stage) is not a candidate, so the
+///    result does not depend on item order.
 /// 3. Otherwise a new id is derived from the first available key: `<link>`,
 ///    then `(date, title)`, then enclosure URL.
 ///
@@ -166,40 +171,47 @@ pub fn resolve_episode_ids(
         }
     }
 
-    // Pass 2: GUID-less items reuse a matching known episode.
-    let mut pending = Vec::new();
-    for (index, item) in items.iter().enumerate() {
-        if item.guid_key().is_some() {
-            continue;
-        }
-        let own = &usable[index];
-        let stages: [&dyn Fn(&EpisodeIdentityHints) -> bool; 3] = [
-            &|candidate| {
-                own.enclosure
-                    .is_some_and(|url| candidate.enclosure() == Some(url))
-            },
-            &|candidate| own.link.is_some_and(|link| candidate.link() == Some(link)),
-            &|candidate| {
-                own.date_title
-                    .as_ref()
-                    .is_some_and(|pair| candidate.date_title().as_ref() == Some(pair))
-            },
-        ];
-        let reused = stages.iter().find_map(|matches| {
-            known
+    // Pass 2: GUID-less items reuse a matching known episode. Stages run
+    // across the whole document: every enclosure match is assigned before any
+    // link match, and every link match before any (date, title) match, so a
+    // weak match of an earlier item cannot steal the known episode that a
+    // later item matches strongly. Within one stage an item's key is unique in
+    // the document, so two items never compete for the same known episode
+    // and the result does not depend on item order.
+    let mut pending: Vec<usize> = (0..items.len())
+        .filter(|index| items[*index].guid_key().is_none())
+        .collect();
+    let stages: [StageMatcher<'_>; 3] = [
+        &|own, candidate| {
+            own.enclosure
+                .is_some_and(|url| candidate.enclosure() == Some(url))
+        },
+        &|own, candidate| own.link.is_some_and(|link| candidate.link() == Some(link)),
+        &|own, candidate| {
+            own.date_title
+                .as_ref()
+                .is_some_and(|pair| candidate.date_title().as_ref() == Some(pair))
+        },
+    ];
+    for matches in stages {
+        let mut unmatched = Vec::with_capacity(pending.len());
+        for index in pending {
+            let own = &usable[index];
+            let reused = known
                 .iter()
-                .filter(|known| !claimed.contains(&known.episode_id) && matches(&known.hints))
+                .filter(|known| !claimed.contains(&known.episode_id) && matches(own, &known.hints))
                 .map(|known| &known.episode_id)
                 .min()
-                .cloned()
-        });
-        match reused {
-            Some(id) => {
-                claimed.insert(id.clone());
-                out[index] = Some(id);
+                .cloned();
+            match reused {
+                Some(id) => {
+                    claimed.insert(id.clone());
+                    out[index] = Some(id);
+                }
+                None => unmatched.push(index),
             }
-            None => pending.push(index),
         }
+        pending = unmatched;
     }
 
     // Pass 3: derive new ids from the first available fallback key.
@@ -508,5 +520,85 @@ mod tests {
         known.reverse();
         assert_eq!(resolve_episode_ids(&p, None, &items, &known), forward);
         assert!(forward.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn strong_matches_beat_earlier_weak_matches_in_any_item_order() {
+        let p = podcast();
+        let k1 = EpisodeId::from_guid(&p, "legacy-k1").unwrap();
+        let known = [KnownEpisode {
+            episode_id: k1.clone(),
+            hints: hints(
+                None,
+                Some("https://cdn/e1.mp3"),
+                None,
+                Some(5_000),
+                Some("Same"),
+            ),
+        }];
+        // A new item that only matches K1 by (date, title), and the real K1
+        // (same enclosure) renamed and re-dated by the publisher.
+        let weak = hints(
+            None,
+            Some("https://cdn/new.mp3"),
+            None,
+            Some(5_000),
+            Some("Same"),
+        );
+        let strong = hints(
+            None,
+            Some("https://cdn/e1.mp3"),
+            None,
+            Some(9_000),
+            Some("Renamed"),
+        );
+        let forward = resolve_episode_ids(&p, None, &[weak.clone(), strong.clone()], &known);
+        assert_eq!(forward[1].as_ref(), Some(&k1), "enclosure match keeps K1");
+        assert_ne!(forward[0].as_ref(), Some(&k1));
+        let reverse = resolve_episode_ids(&p, None, &[strong, weak], &known);
+        assert_eq!(reverse, vec![forward[1].clone(), forward[0].clone()]);
+    }
+
+    #[test]
+    fn result_is_independent_of_item_order() {
+        let p = podcast();
+        let items: Vec<EpisodeIdentityHints> = (0..5)
+            .map(|i| {
+                hints(
+                    None,
+                    Some(&format!("https://cdn/{i}.mp3")),
+                    (i % 2 == 0).then(|| format!("https://e/{i}")).as_deref(),
+                    Some((i % 3) * 1_000),
+                    Some(&format!("Ep {}", i % 2)),
+                )
+            })
+            .collect();
+        // Known episodes whose hints overlap different items at different
+        // stages.
+        let known: Vec<KnownEpisode> = (0..5)
+            .map(|i| KnownEpisode {
+                episode_id: EpisodeId::from_guid(&p, &format!("legacy-{i}")).unwrap(),
+                hints: hints(
+                    None,
+                    Some(&format!("https://cdn/{}.mp3", (i + 2) % 7)),
+                    Some(&format!("https://e/{}", (i + 1) % 5)),
+                    Some((i % 3) * 1_000),
+                    Some(&format!("Ep {}", i % 2)),
+                ),
+            })
+            .collect();
+        let reference = resolve_episode_ids(&p, None, &items, &known);
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        for _ in 0..20 {
+            order.rotate_left(1);
+            let middle = order.len() / 2;
+            order.swap(0, middle);
+            let shuffled: Vec<EpisodeIdentityHints> =
+                order.iter().map(|i| items[*i].clone()).collect();
+            let result = resolve_episode_ids(&p, None, &shuffled, &known);
+            for (position, index) in order.iter().enumerate() {
+                assert_eq!(result[position], reference[*index], "order {order:?}");
+            }
+        }
     }
 }

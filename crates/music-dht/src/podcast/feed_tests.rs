@@ -663,3 +663,69 @@ fn hostile_sizes_stay_bounded() {
         None
     );
 }
+
+#[test]
+fn text_full_of_unclosed_angle_brackets_is_linear() {
+    // '<a' repeated up to the capture cap, with no '>' anywhere: the old
+    // scanner searched for '>' to the end of the text at every '<'.
+    let body = "&lt;a".repeat(MAX_CAPTURE_BYTES / 2);
+    let xml = rss(
+        "",
+        &format!(
+            r#"<item><guid>lt</guid><title>{body}</title><description>{body}</description><enclosure url="https://c.test/lt.mp3"/></item>"#
+        ),
+    );
+    let started = std::time::Instant::now();
+    let feed = parse_feed(xml.as_bytes()).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
+    let episode = &feed.episodes[0];
+    assert!(episode.title.starts_with("<a<a"));
+    assert!(episode.title.chars().count() <= MAX_TITLE_CHARS);
+    assert_eq!(
+        html_to_text("a < b and <b>bold</b> <c", 100),
+        "a < b and bold <c"
+    );
+}
+
+#[test]
+fn links_are_identity_material_and_kept_verbatim() {
+    // Entities are decoded once by the XML reader and never again; tag-like
+    // text, inner whitespace and long links are not rewritten by the display
+    // cleaner.
+    let long_path = "p".repeat(1_500);
+    let items = format!(
+        r#"<item><title>A</title><link>  https://e.test/a?x=1&amp;amp;y=&lt;b&gt;  </link><enclosure url="https://c.test/a.mp3"/></item>
+<item><title>B</title><link>https://e.test/{long_path}</link><enclosure url="https://c.test/b.mp3"/></item>"#
+    );
+    let feed = parse_feed(rss("", &items).as_bytes()).unwrap();
+    assert_eq!(
+        feed.episodes[0].link.as_deref(),
+        Some("https://e.test/a?x=1&amp;y=<b>")
+    );
+    let long = format!("https://e.test/{long_path}");
+    assert_eq!(feed.episodes[1].link.as_deref(), Some(long.as_str()));
+    let podcast_id =
+        PodcastId::from_feed_url(&FeedUrl::parse("https://example.test/feed").unwrap());
+    let ids = feed.resolve_episode_ids(&podcast_id, &[]);
+    assert_eq!(
+        ids[1],
+        Some(EpisodeId::derive(
+            &podcast_id,
+            &crate::podcast::EpisodeKey::link(&long).unwrap()
+        ))
+    );
+    let atom = r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>T</title>
+<link href=" https://e.test/home?a=1&amp;b=2 "/>
+<entry><title>E</title><link rel="alternate" href="https://e.test/e?q=&lt;x&gt;"/>
+<link rel="enclosure" href="https://c.test/e.mp3" type="audio/mpeg"/></entry></feed>"#;
+    let feed = parse_feed(atom.as_bytes()).unwrap();
+    assert_eq!(feed.link.as_deref(), Some("https://e.test/home?a=1&b=2"));
+    assert_eq!(
+        feed.episodes[0].link.as_deref(),
+        Some("https://e.test/e?q=<x>")
+    );
+}
