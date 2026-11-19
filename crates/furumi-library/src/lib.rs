@@ -6,9 +6,13 @@
 //!
 //! All methods take `&self` and lock the connection internally, so an
 //! `Arc<Library>` can be shared across blocking tasks.
+//!
+//! Podcasts live in a separate database, [`podcasts::PodcastStore`]
+//! (`podcasts.sqlite3`); the music library never stores episodes.
 
 pub mod import;
 pub mod models;
+pub mod podcasts;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
