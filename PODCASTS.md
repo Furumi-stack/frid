@@ -30,7 +30,8 @@ offered for P2P transfer. RSS refreshes fetch metadata only.
 
 | Data | Trusted devices | Public federation | Local only |
 | --- | --- | --- | --- |
-| Subscription state, channel metadata, feed aliases | `podcast_subscription_set` + snapshot | never | |
+| Subscription state, channel metadata | `podcast_subscription_set` + snapshot | never | |
+| Feed aliases | `podcast_feed_aliases_added`, `podcast_subscription_set` + snapshot | never | |
 | Share decision | `podcast_share_set` + snapshot | only the published card (future overlay) | |
 | Episode progress | `podcast_progress_set` + snapshot | never | |
 | Listening sessions, play counts | `podcast_listen_recorded` + snapshot | never | |
@@ -92,19 +93,31 @@ It never changes afterwards.
 Redirect targets (permanent redirects), `itunes:new-feed-url` and URLs used to
 subscribe again are feed aliases of an existing podcast:
 
-* the subscription record carries `feed_aliases`, a grow-only set merged
-  independently of the last-writer-wins register (`merge_feed_aliases`). The
-  URL that derives the podcast id is always kept, plus the 8 smallest other
+* aliases form a grow-only set per podcast, merged independently of the
+  subscription register (`merge_feed_aliases`). The URL that derives the
+  podcast id is always kept, plus the 8 lexicographically smallest other
   URLs; this bounded union is commutative, associative and idempotent;
-* `podcast.feed_url` is the URL currently fetched and is always added to the
-  aliases;
+* aliases travel in their own operation, `podcast_feed_aliases_added`. A
+  background refresh that learns a URL emits it, but only when merging the
+  URL changes the stored set (a URL outside the bound is not sent again on
+  every refresh). The operation never touches the subscription or share
+  register, so it cannot resurrect a subscription or reset a share decision.
+  Subscribe and unsubscribe operations also carry the aliases known at that
+  time;
+* `podcast.feed_url` of the subscription register is the URL used at the last
+  explicit subscribe or unsubscribe. It can fall outside the bounded alias
+  set, so the URLs that identify a podcast are
+  `SubscriptionRecord::feed_urls()`: the aliases plus `podcast.feed_url`;
 * before deriving a new id for a URL, clients call `resolve_podcast_id` with
-  every known `(podcast_id, url)` pair. A match reuses the existing podcast,
-  its progress and its history. With several matches the smallest id wins.
+  every known `(podcast_id, url)` pair, including `feed_urls()` and the URL
+  each device currently fetches. A match reuses the existing podcast, its
+  progress and its history. With several matches the smallest id wins.
 
-Limitation: two devices that subscribe offline, through different URLs of
-the same feed, before either learns the alias, create two podcast ids. The
-contract does not merge podcast ids automatically in this version.
+Limitations: two devices that subscribe offline, through different URLs of
+the same feed, before either learns the alias, create two podcast ids; the
+contract does not merge podcast ids automatically in this version. A podcast
+with more than 8 aliases can lose a larger URL from the synced set; a device
+that only knows that URL derives a new id.
 
 ### Episode id
 
@@ -115,7 +128,7 @@ episode_id = "ep1:" + base32_lower_nopad(BLAKE3("furumi-podcast:episode:v1" || 0
 | Key | Material |
 | --- | --- |
 | GUID | `guid:` + RSS `<guid>` / Atom `<id>` trimmed, case-sensitive |
-| link | `link:` + item `<link>` trimmed |
+| link | `link:` + item `<link>` text (XML-unescaped once) or Atom `href`, trimmed of surrounding whitespace; no other cleanup |
 | date + title | `date-title:` + publication unix seconds + `\0` + normalized title |
 | enclosure | `enclosure:` + enclosure URL trimmed |
 
@@ -131,11 +144,13 @@ For one parsed feed document:
 
 1. Items with a GUID get the GUID id. A GUID never matches another known
    episode, so the result does not depend on local history.
-2. An item without GUID first searches the known episodes of the podcast,
-   stage by stage: same enclosure URL, then same `<link>`, then same
-   publication second and normalized title. The first stage with candidates
-   wins and the smallest candidate id is reused. A known episode can be
-   claimed by only one item of the document.
+2. Items without GUID then search the known episodes of the podcast in three
+   stages, each run over the **whole document** before the next one starts:
+   same enclosure URL, then same `<link>`, then same publication second and
+   normalized title. Among candidates the smallest id is reused. A known
+   episode can be claimed by only one item. Because a weak match of an
+   earlier item cannot take a known episode that a later item matches by
+   enclosure, the result does not depend on the order of items.
 3. Otherwise a new id is derived from the first available key: `<link>`,
    then date + title, then enclosure URL.
 
@@ -145,15 +160,28 @@ Enclosure URLs and date + title pairs shared by several GUID-less items are
 not identifying either. Items without any usable key, and duplicates of an
 earlier item of the same document, get no id and are skipped.
 
+The identity hints (GUID, enclosure, link, publication time, title) are the
+ones `music_dht::podcast::feed` produces: which enclosure or `media:content`
+is chosen, how relative URLs are resolved, which date field is used and how
+it is parsed, how the title is cleaned. They are part of the rule; clients
+must use that parser (or an implementation that passes its tests). Relative
+media URLs are resolved against the URL the document was fetched from.
+
 "Known episodes" include episodes from earlier refreshes **and** episodes
 learned through sync (`PodcastEpisodeRef::identity_hints`). Feed GUID-less
 episodes into it so a device that sees an episode first through sync keeps
 the id used by the other devices.
 
-Limitation: for GUID-less episodes the id can depend on what a device saw
-first. If a publisher changes several identifying fields of a GUID-less
-episode at once, a device that never saw the old version can derive a
-different id.
+Limitations, GUID-less episodes only:
+
+* The id can depend on what a device saw first. If the publisher changes the
+  field the id was derived from (the `<link>`, or the title or date for a
+  date + title id), a device that saw the old version keeps the old id
+  through the enclosure match, while a device that never saw it derives a
+  new id. One changed field is enough.
+* Feeds with relative enclosure URLs fetched through different aliases give
+  different enclosure URLs, so the enclosure match and enclosure-derived ids
+  can differ between such devices.
 
 ## Metadata and bounds
 
@@ -182,13 +210,21 @@ Episodes without a season are shown in their own group. Unknown
 All merge functions are commutative, associative and idempotent per entity;
 ties are broken by a total order over all fields. The same set of operations
 therefore yields the same state in any delivery order, with duplicates.
-`hlc_ms` is the sync operation timestamp; it is not a true hybrid logical
-clock, so ordering of user intent on progress uses a Lamport generation.
+`hlc_ms` is the sync operation timestamp; clients advance it only past their
+own operations, so it is not a hybrid logical clock and a device with a fast
+clock stamps every write "later". Every register therefore orders by a
+Lamport `generation` first and uses `hlc_ms` only between writes that did not
+observe each other.
 
 ### Subscription
 
 * Register: `subscribed` + `podcast` metadata, last-writer-wins by
-  `(hlc_ms, op_id)`.
+  `(generation, hlc_ms, op_id)`.
+* `generation` is a per-podcast Lamport counter shared with the share
+  register: every subscribe, unsubscribe and share write uses
+  `next_podcast_generation(subscription, share)` = one more than the greatest
+  generation of either register (1 when there is none). An action taken after
+  observing another device's write orders after it whatever the clocks say.
 * Unsubscribing writes `subscribed = false`. It is state, not a tombstone,
   and is never compacted, so it beats a stale subscription from a device that
   returns after being offline.
@@ -197,20 +233,33 @@ clock, so ordering of user intent on progress uses a Lamport generation.
   separate explicit action (not part of this version).
 * Only explicit subscribe and unsubscribe actions write the register. RSS
   refreshes keep their metadata locally; a background refresh that wrote the
-  register could resurrect an unsubscribed podcast.
+  register could resurrect an unsubscribed podcast. Aliases learned by a
+  refresh use `podcast_feed_aliases_added`.
 * Subscribing to a podcast already subscribed locally must not emit a new
   operation.
 
+| Events | Result |
+| --- | --- |
+| A (clock 10 min ahead) subscribes at g1; B sees it and unsubscribes at g2 | unsubscribed on every device |
+| A and B, both offline after g1, unsubscribe and subscribe at g2 | the later `hlc_ms` (then `op_id`) wins |
+
 ### Share
 
-* `ShareRecord`, last-writer-wins by `(hlc_ms, op_id)`. `shared = false` is a
-  tombstone that revokes the publication.
+* `ShareRecord`, last-writer-wins by `(generation, hlc_ms, op_id)`, with the
+  generation from `next_podcast_generation`.
+* `shared = false` revokes the publication. Like an unsubscribe it is
+  privacy-protecting state, **not** a tombstone: it is never compacted and
+  its row is never deleted. Otherwise a stale `shared = true` still in some
+  device's log, or delivered again to a new device, would republish the
+  podcast. The register is one record per podcast, so keeping it is cheap.
 * Unsubscribing also writes `shared = false`.
 * `effective_share(subscription, share)` decides whether to publish: the user
-  is subscribed, chose to share, **and** the share decision is newer than the
-  latest subscription write. Every new subscription, including subscribing
-  again or subscribing from someone else's public card, is private until the
-  user shares it again, and a stale share decision cannot republish.
+  is subscribed, chose to share, **and** the share decision orders after the
+  latest subscription write by `(generation, hlc_ms, op_id)`. Every new
+  subscription, including subscribing again or subscribing from someone
+  else's public card, is private until the user shares it again; a stale
+  share decision cannot republish; a share decision taken after observing the
+  subscription always applies.
 
 ### Progress
 
@@ -222,20 +271,38 @@ position: seeking back and "start over" are real changes.
 
 * Explicit actions use `generation = max_seen + 1`
   (`ProgressRecord::explicit_generation`): starting a listening session,
-  seeking, "start over", "mark played", "mark unplayed", handing playback to
-  another device. `max_seen` is the generation of the current register,
-  including received records.
+  seeking, "start over", "mark played", "mark unplayed", taking over playback
+  through a handoff. `max_seen` is the generation of the current register,
+  including received records. An explicit action during a session becomes
+  the generation of that session: its later checkpoints use it.
 * Periodic checkpoints and pause/stop saves within a session keep the
   generation of that session's latest explicit action.
+* Handoff: queue items carry `PodcastEpisodeRef.progress_generation`, the
+  greatest generation the sender has seen for the episode, because the
+  playback state can arrive before the sender's progress operations. The
+  sender writes a final checkpoint at its session generation and does not
+  bump. Only the receiver writes the explicit action, with
+  `explicit_generation(max(local, progress_generation))`, so its writes order
+  after the sender's whatever the clocks say.
+* A device that observes a greater generation for the episode it is playing
+  stops writing at its old generation: either playback moved away (the
+  coordination claim says so), or the user keeps listening locally and the
+  device writes its next record as an explicit action
+  (`explicit_generation(max_seen)`).
 * Write progress periodically (every 15–30 s) and on pause, seek, stop,
-  episode change and handoff, in the background. Coalesce pending checkpoints
-  so the outgoing log keeps only the latest per episode.
+  episode change and handoff, in the background. The outgoing log may drop a
+  pending progress operation only when another pending operation of the same
+  episode `supersedes` it (greater `(generation, hlc_ms, device_id, op_id)`).
+  Never coalesce by sequence order: a checkpoint of an older session queued
+  after "mark played" must not replace it.
 
 | Events | Result |
 | --- | --- |
 | A checkpoints session s1 at g3; B seeks back at g4 with a slower clock; A's late g3 checkpoint arrives | B's seek (g4) wins |
 | A restarts (g3, position 0); a queued g2 checkpoint of the old session arrives later | restart wins |
 | A and B both saw g5 and listen offline; both start sessions at g6 | the later `hlc_ms` (then `device_id`, `op_id`) wins on every device; both sessions are kept |
+| A plays at g5 with a fast clock and hands off to B, which has only seen g2 | B starts at g6 (`max(2, 5) + 1`) and its checkpoints win |
+| A marks played (g5), then a queued g3 checkpoint of its session is written | the outgoing log keeps g5; g3 is dominated |
 
 Ordinary Play resumes from `resume_position_ms()` (the position when in
 progress, otherwise 0). "Start over" is a separate explicit action. Publisher
@@ -267,28 +334,65 @@ versions merge to the greatest `(completed, listened_ms, ended_at_ms, ...)`.
 ## Trusted-device sync (protocol v4)
 
 The ALPN remains `furumi/sync/2`; device profiles advertise
-`protocol_version = 4`. New operation kinds:
+`protocol_version = 4`. New operation kinds (none of them is a tombstone):
 
-| Kind | Payload | Materialization | Tombstone |
-| --- | --- | --- | --- |
-| `podcast_subscription_set` | `podcast_id`, `subscribed`, `podcast`, `feed_aliases` | `SyncOpWire::podcast_subscription` | no |
-| `podcast_share_set` | `podcast_id`, `shared` | `SyncOpWire::podcast_share` | `shared = false` |
-| `podcast_progress_set` | `episode_id`, `podcast_id`, `position_ms`, `status`, `generation`, `session_id`, optional `episode` ref | `SyncOpWire::podcast_progress` | no |
-| `podcast_listen_recorded` | `session`, optional `episode` ref | `SyncOpWire::podcast_listen_session` | no |
+| Kind | Payload | Materialization |
+| --- | --- | --- |
+| `podcast_subscription_set` | `podcast_id`, `subscribed`, `podcast`, `feed_aliases`, `generation` | `SyncOpWire::podcast_subscription` |
+| `podcast_share_set` | `podcast_id`, `shared`, `generation` | `SyncOpWire::podcast_share` |
+| `podcast_feed_aliases_added` | `podcast_id`, `feed_aliases` (1..9 URLs) | `SyncOpWire::podcast_feed_aliases` |
+| `podcast_progress_set` | `episode_id`, `podcast_id`, `position_ms`, `status`, `generation`, `session_id`, optional `episode` ref | `SyncOpWire::podcast_progress` |
+| `podcast_listen_recorded` | `session`, optional `episode` ref | `SyncOpWire::podcast_listen_session` |
 
 Register stamps come from the operation: `hlc_ms`, `op_id`, and for progress
 `device_id = origin_device_id`. A session's `device_id` must equal the
 operation origin. `SyncOpWire::validate_podcast` checks this and the bounds;
-receivers skip invalid podcast operations but still acknowledge them, so the
+receivers skip operations that fail it but still acknowledge them, so the
 log keeps moving.
 
-`DeviceProfileSet` gains an optional `protocol_version`. Each device reports
-its own version. Receivers store
-`profile_protocol_version(reported, previously_known)` and relays forward the
-stored version of other devices in `DeviceProfileWire.protocol_version`. They
-must never substitute their own constant: version gating would then send
-podcast state to an old client. A device that never reported a version is
-treated as version 1.
+Ids (`PodcastId`, `EpisodeId`) and feed URLs (`FeedUrl`) are validated while
+the message is deserialized: a malformed id or a non-canonical feed URL is a
+schema violation, like a wrong JSON type, and the **whole message** fails to
+parse. Conforming clients cannot produce one, because these types serialize
+only canonical values, and their rules are frozen with the `v1` derivation
+domains (changing them needs a new protocol version, see Versioning).
+
+### Peer versions
+
+Each device reports its own version: in the `profile` of its `Hello`,
+`PairRequest` and `PairResponse`, in its own entry of the `devices` list (a
+`SyncResponse` has no `profile`, so an initiator learns the responder's
+version from the entry whose `device_id` is the responder), and in
+`DeviceProfileSet.protocol_version` of operations it originates. A client
+emits a `DeviceProfileSet` with `protocol_version` on the first start of a
+new protocol version.
+
+* A self-report replaces the stored version:
+  `profile_protocol_version(reported, stored)` (`None` keeps the stored
+  value).
+* Profiles of other devices relayed in `devices` only raise it:
+  `relayed_protocol_version(relayed, stored)` = `max(stored, relayed)`, or
+  `relayed` when nothing is stored. Deployed v1–v3 clients relay every
+  device with their own constant, so a relayed 3 must not downgrade a v4
+  peer.
+* Relays forward the stored version of other devices in
+  `DeviceProfileWire.protocol_version` and must never substitute their own
+  constant: version gating would then send podcast state to an old client.
+* A device that never reported a version is treated as version 1.
+  Downgrading a device below v4 is not supported while relays still hold
+  v4 for it.
+
+### Pairing
+
+The invite consumer sends its `PairRequest` (operations, snapshot, playback)
+before it hears from the inviter. Invites created by v4 clients carry the
+inviter's version in `InviteWire.protocol_version` (JSON key `p`, omitted by
+older clients). The consumer gates the whole request by
+`InviteWire::inviter_protocol_version()`, which is version 1 for invites
+without it: no podcast operations, `snapshot.for_peer(version)`, and no
+playback snapshot with podcast items. Podcast state then catches up through
+the snapshot of the next regular sync. The inviter gates its `PairResponse`
+by the version in the request's `profile`.
 
 ### Snapshot recovery
 
@@ -296,20 +400,33 @@ Sync vectors only grow, so operations hidden from a peer while it ran an
 older version are never re-requested after it upgrades. Podcast state is
 therefore part of `SyncSnapshot`:
 
-| Section | Content | Limit |
-| --- | --- | --- |
-| `podcast_subscriptions` | all subscription registers, including unsubscribed | 1000 |
-| `podcast_shares` | all share registers, including `shared = false` | 1000 |
-| `podcast_progress` | progress registers | 5000 |
-| `podcast_listen_sessions` | most recent sessions | 2000 |
+| Section | Content | Limit | Budget share |
+| --- | --- | --- | --- |
+| `podcast_subscriptions` | subscription registers, including unsubscribed, with feed aliases; `podcast.description` is omitted | 1000 | 25 % |
+| `podcast_shares` | share registers, including `shared = false` | 1000 | 5 % |
+| `podcast_progress` | progress registers | 5000 | 45 % |
+| `podcast_listen_sessions` | most recent sessions | 2000 | 25 % |
 
-`SyncSnapshot::bound_podcast_state` orders each section newest first, caps it
-and fits all sections into a 4 MiB JSON budget in the priority order above,
-leaving room for music state inside the 8 MiB line limit. Records that do not
-fit still propagate through operations. Receivers ignore podcast sections
-that exceed the counts (`podcast_state_within_limits`), validate each record
-and merge it with the same functions as operations. A new or long-absent
-device thus converges from one snapshot.
+`SyncSnapshot::bound_podcast_state_to(budget)` orders each section newest
+first (registers by `(generation, hlc_ms)`, sessions by `ended_at_ms`), caps
+it by count and by its share of the JSON byte budget; unused budget passes on
+to the following sections in table order, so large subscription records
+cannot crowd out progress. `bound_podcast_state()` uses the default 4 MiB
+budget. Senders whose other message parts are large pass
+`podcast_snapshot_budget(other_bytes)`, which keeps the whole line under the
+8 MiB limit. Channel descriptions are not snapshotted: every device refreshes
+channel metadata from the feed.
+
+Receivers ignore podcast sections that exceed the counts
+(`podcast_state_within_limits`), validate each record and merge it with the
+same functions as operations.
+
+Limitations: records cut by the bounds reach a peer only through operations
+it has not acknowledged yet. A peer that upgrades from v3, or that received
+operations through a v3 relay, already skipped the podcast operations: it
+recovers only the newest records that fit, so older progress registers and
+listening sessions are missing on that device and its play counts
+(`completed_listen_count`) can differ from other devices.
 
 Empty sections are not serialized, so snapshots without podcast state are
 byte-identical to v3.
@@ -341,10 +458,14 @@ as 1.0. When implemented, position extrapolation and handoff must use it.
 
 ## Version gating for peers below v4
 
-`SyncOpPayload` and `PlaybackSource` are closed serde enums. A v3 client that
-receives an unknown `kind` fails to parse the **whole** message, not one
-operation, which would stall synchronization. Additive `serde(default)`
-fields alone do not make this compatible. Therefore:
+`SyncOpPayload` is a closed serde enum. A v3 client that receives an unknown
+operation `kind` fails to parse the **whole** message, not one operation,
+which would stall synchronization. A v3 client does not know
+`PlaybackTrack.source` and ignores it: it would treat an episode as a broken
+music item (id 0, no content id) and forward the queue that way, losing the
+episode for every device. Additive `serde(default)` fields alone therefore do
+not make podcasts compatible. The peer version comes from "Peer versions"
+above, and from the invite while pairing. Therefore:
 
 1. Never send podcast operations to a peer below v4
    (`op_allowed_for_peer`).
@@ -358,6 +479,9 @@ fields alone do not make this compatible. Therefore:
    queue contains podcast items (`playback_command_allowed_from_peer`): its
    state would silently drop them.
 5. Music operations and music-only playback keep working with v1–v3 peers.
+
+`PlaybackSource` is closed for v4 clients as well: a v4 client fails to parse
+a message with an unknown source `kind`.
 
 ## Jam privacy
 
@@ -383,7 +507,9 @@ limits, lenient dates and durations, relative media URLs resolved against
 the fetch URL. Items without an absolute `http(s)` audio URL are dropped. It
 extracts `itunes:season`, `itunes:episode`, `itunes:episodeType`,
 `guid isPermaLink` and `itunes:new-feed-url`, and produces identity hints for
-`resolve_episode_ids`. It performs no I/O.
+`resolve_episode_ids`; those hints are normative (see the no-GUID rule).
+Links are kept verbatim (trimmed only) because they are identity material.
+Text cleanup is linear in the input size. It performs no I/O.
 
 ## Versioning
 
@@ -396,5 +522,8 @@ extracts `itunes:season`, `itunes:episode`, `itunes:episodeType`,
   domains, new prefixes, a migration and a new protocol version.
 * Adding an operation kind or a `PlaybackSource` variant requires a new
   protocol version and gating as above.
+* Feed URL canonicalization, the identity bounds (`MAX_URL_BYTES`,
+  `MAX_GUID_BYTES`) and the no-GUID rule are frozen with the `v1` domains:
+  receivers reject non-canonical ids and URLs while parsing.
 * Public podcast cards will use a separate signed overlay with its own ALPN
   and version; the music DHT schema and `federation-net` do not change.

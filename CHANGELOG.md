@@ -9,11 +9,13 @@
   for subscriptions, shares, progress registers and listening sessions.
 - `music-dht 0.6.0`: optional `podcast-feed` feature with the shared tolerant
   RSS/Atom parser (`quick-xml`, `encoding_rs`, `url`).
-- `music-dht 0.6.0`: device-sync protocol version 4 (ALPN unchanged): four
-  `podcast_*` operation kinds, bounded podcast snapshot sections,
+- `music-dht 0.6.0`: device-sync protocol version 4 (ALPN unchanged): five
+  `podcast_*` operation kinds (subscription, share, feed aliases, progress,
+  listening sessions), bounded podcast snapshot sections,
   `PlaybackTrack.source`, reserved `PlaybackStateWire.playback_rate`,
-  `DeviceProfileSet.protocol_version`, version-gating helpers and Jam
-  redaction. New struct fields and enum variants break exhaustive
+  `DeviceProfileSet.protocol_version`, optional `InviteWire` protocol version
+  (`p`), self-reported vs relayed version helpers, version-gating helpers and
+  Jam redaction. New struct fields and enum variants break exhaustive
   construction and matching in clients.
 - `furumi-library 0.3.0`: follows `music-dht 0.6.0`, whose types it re-exposes.
 - See `PODCASTS.md` for the normative contract.

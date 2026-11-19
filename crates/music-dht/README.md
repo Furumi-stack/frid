@@ -226,8 +226,8 @@ let generation = ProgressRecord::explicit_generation(Some(4)); // 5
   self-contained queue item.
 * `SubscriptionRecord`, `ShareRecord`, `ProgressRecord`, `ListenSession` with
   `merge_subscription`, `merge_share`, `merge_progress`,
-  `merge_listen_session`, `effective_share`, `reaches_completion` and
-  `completed_listen_count`.
+  `merge_listen_session`, `next_podcast_generation`, `effective_share`,
+  `reaches_completion` and `completed_listen_count`.
 
 Enable the `podcast-feed` feature for `music_dht::podcast::feed`, the shared
 tolerant RSS 2.0 / RSS 1.0 / Atom parser:
@@ -237,12 +237,16 @@ music-dht = { version = "0.6", features = ["podcast-feed"] }
 ```
 
 Device-sync protocol v4 adds `podcast_subscription_set`, `podcast_share_set`,
-`podcast_progress_set` and `podcast_listen_recorded`, podcast snapshot
-sections, `PlaybackTrack.source` and a reserved `playback_rate`. Old clients
-cannot parse these, so always filter with `op_allowed_for_peer`,
+`podcast_feed_aliases_added`, `podcast_progress_set` and
+`podcast_listen_recorded`, podcast snapshot sections, `PlaybackTrack.source`
+and a reserved `playback_rate`. Old clients cannot parse the new operation
+kinds and ignore `source`, so always filter with `op_allowed_for_peer`,
 `playback_allowed_for_peer`, `SyncSnapshot::for_peer` and
 `playback_command_allowed_from_peer`, using the protocol version each device
-reported itself (`profile_protocol_version`). Jam hosts use
+reported itself (`profile_protocol_version`; relayed profiles go through
+`relayed_protocol_version`, pairing requests use
+`InviteWire::inviter_protocol_version`). Bound snapshots with
+`SyncSnapshot::bound_podcast_state_to(podcast_snapshot_budget(..))`. Jam hosts use
 `jam::redact_jam_snapshot`, `jam_command_allowed` and
 `restore_jam_private_items`.
 

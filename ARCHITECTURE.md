@@ -199,15 +199,18 @@ the publisher: it is never imported, content-addressed or offered for P2P
 transfer.
 
 Device-sync protocol v4 carries podcast state between trusted devices only:
-four `podcast_*` operations, bounded snapshot sections (the recovery path,
-because sync vectors never re-request operations hidden from an older peer),
-and an explicit `PlaybackTrack.source`. Operation and source enums are closed,
-so senders gate on the version each peer reported itself; podcast state is
-never sent to peers below v4, handoff to them is refused, and their playback
-commands are ignored while the queue contains episodes. Jam snapshots replace
-episodes with opaque placeholders. Progress ordering uses a Lamport
-generation rather than wall-clock `hlc_ms`, so a device with a fast clock
-cannot undo an observed seek or restart. Public podcast discovery is a future
+five `podcast_*` operations, bounded snapshot sections (the recovery path,
+because sync vectors never re-request operations hidden from an older peer;
+past the bounds an upgraded peer recovers only the newest records), and an
+explicit `PlaybackTrack.source`. The operation enum is closed and v3 clients
+ignore `source`, so senders gate on the version each peer reported itself
+(relayed profiles only raise it; pairing requests use the version in the
+invite); podcast state is never sent to peers below v4, handoff to them is
+refused, and their playback commands are ignored while the queue contains
+episodes. Jam snapshots replace episodes with opaque placeholders. Progress,
+subscription and share registers order by a Lamport generation before
+wall-clock `hlc_ms`, so a device with a fast clock cannot undo an observed
+seek, restart, unsubscribe or share decision. Public podcast discovery is a future
 separate overlay; the music DHT schema and `federation-net` are unchanged.
 
 Music discovery identifies an owner and content; it does not force all domain
