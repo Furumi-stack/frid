@@ -23,6 +23,11 @@
 - `sync_shares` is fail-safe for revocation (per-podcast `failed`) and holds
   back cards with privacy warnings until confirmed (`held_back`,
   `PodcastShareState::privacy_confirmed`).
+- Own cards persisted by an earlier run are neither republished (by
+  `maintenance` or `republish`) nor served to lookups until the first
+  `sync_shares` of the process, so a share revoked on another trusted device
+  while this one was offline is not re-sent on startup. That first call also
+  re-sends unchanged cards; tombstones are always re-sent.
 - `music-dht 0.6.0`: capability manifests can advertise `podcast_dht = 1`
   (`capabilities::PODCAST_DHT_ID`, `CapabilityManifest::with_podcast_dht`,
   `CapabilityManifest::protocol_version`,

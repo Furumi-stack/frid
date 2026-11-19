@@ -747,8 +747,22 @@ Fields are in postcard order. `PodcastDhtKey` is 32 raw bytes.
   confirmation. See [SQLite reference store](#sqlite-reference-store).
 * `PodcastDht::unpublish(podcast_id)` writes the tombstone. Nothing is ever
   sent for a podcast this device never published: no tombstone, no id.
-* `PodcastDht::republish` (run by `maintenance`) re-signs active cards and
-  re-sends unexpired tombstones every 10 minutes.
+* `PodcastDht::republish` (run by `maintenance` every 10 minutes and after
+  a bootstrap that found new peers) re-signs active cards and re-sends
+  unexpired tombstones.
+* Own cards persisted by an earlier run are not sent again until the client
+  calls `sync_shares` in this process: before that, `republish` sends only
+  tombstones and cards published with `publish` in this process, and
+  `FindValue` answers leave those cards out (they stay in the cache). A share
+  revoked on another trusted device while this one was offline is therefore
+  never re-sent on startup from the stale cache. Clients call `sync_shares`
+  on start, with the registers they hold, and again after device sync
+  applies newer operations; the first call also re-sends the unchanged cards
+  as they are (`PodcastDhtSyncStats::unchanged`, counted in `push`).
+  `sync_shares` itself still trusts the registers it is given: an unchanged
+  card is only re-signed when it used half its lifetime, so clients that may
+  hold stale registers on start lose nothing by reconciling again after
+  device sync.
 * The privacy heuristics (`feed_url_privacy_warning`) are advisory: query
   parameter names containing words such as `token`, `key`, `auth`, `secret`,
   `sig`/`signature`, `uid`, `user`, `pass`, `session`, `access`, `private`;
@@ -823,6 +837,8 @@ is not needed afterwards, and the episode catalog comes from RSS.
 
 * Only podcasts with `effective_share` are published; never-shared podcasts
   produce no network traffic at all.
+* After a restart nothing is re-sent from the persisted cards until the
+  client reconciled its registers with `sync_shares` (see Publication).
 * Cards carry the public projection only (see Card); tombstones carry key
   hashes only.
 * Records are signed by the publisher device and verified on every receive

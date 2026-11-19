@@ -22,6 +22,11 @@
 //! * Every record is verified (bounds, network, key placement, lifetime and
 //!   signature) when it is received and again whenever it is read from the
 //!   cache.
+//! * Own cards persisted by an earlier run are not sent again, neither
+//!   republished nor served to lookups, until the client reconciles with
+//!   [`PodcastDht::sync_shares`] in this process: a share revoked on another
+//!   trusted device while this one was offline is never re-sent from the
+//!   stale cache.
 //!
 //! Applications own the serving and maintenance tasks, exactly as for
 //! [`crate::similarity_dht::SimilarityDht`]: declare [`PODCAST_DHT_ALPN`] with
@@ -46,6 +51,7 @@ mod tests;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -264,7 +270,10 @@ pub struct PodcastDhtSyncStats {
     /// Cards published with a new revision, or refreshed because they used
     /// half their lifetime.
     pub published: usize,
-    /// Shared podcasts whose current card was already published.
+    /// Shared podcasts whose current card was already published. The first
+    /// call in a process re-sends these cards as they are (counted in
+    /// [`Self::push`]), since [`PodcastDht::republish`] withholds them until
+    /// then.
     pub unchanged: usize,
     /// Podcasts unpublished with a tombstone.
     pub unpublished: usize,
@@ -364,6 +373,13 @@ pub struct PodcastDht {
     failed: Mutex<HashMap<EndpointId, u64>>,
     failures: Mutex<HashMap<EndpointId, u32>>,
     publish_gate: Semaphore,
+    /// Set by the first [`PodcastDht::sync_shares`] of this process. Until
+    /// then own cards from the persisted cache are neither republished nor
+    /// served: the registers they were derived from may be stale.
+    synced: AtomicBool,
+    /// Podcasts published with [`PodcastDht::publish`] in this process; their
+    /// cards are sent even before the first `sync_shares`.
+    published_here: Mutex<HashSet<PodcastId>>,
     serve_limit: Arc<Semaphore>,
     inflight: Arc<Mutex<HashMap<EndpointId, usize>>>,
 }
@@ -412,6 +428,8 @@ impl PodcastDht {
             failed: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             publish_gate: Semaphore::new(1),
+            synced: AtomicBool::new(false),
+            published_here: Mutex::new(HashSet::new()),
             serve_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_PODCAST_DHT_REQUESTS)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }))
@@ -449,7 +467,9 @@ impl PodcastDht {
 
     /// Periodically discovers overlay peers, republishes own cards and
     /// tombstones every [`PODCAST_REPUBLISH_INTERVAL`] and removes expired
-    /// replicas. The first bootstrap runs immediately.
+    /// replicas. The first bootstrap runs immediately. Own cards are only
+    /// republished once the client called [`Self::sync_shares`] in this
+    /// process (see [`Self::republish`]).
     pub async fn maintenance(self: Arc<Self>) {
         let mut bootstrap = tokio::time::interval(PODCAST_BOOTSTRAP_INTERVAL);
         let mut republish = tokio::time::interval(PODCAST_REPUBLISH_INTERVAL);
@@ -621,7 +641,9 @@ impl PodcastDht {
         let card = card.bounded();
         card.validate()?;
         let _permit = self.publish_permit().await?;
+        let podcast_id = card.podcast_id.clone();
         let record = self.sign_card_locked(card, true).await?;
+        lock(&self.published_here).insert(podcast_id);
         self.push(record.into_iter().collect()).await
     }
 
@@ -647,6 +669,11 @@ impl PodcastDht {
     /// including podcasts absent from `states`, is unpublished. The call is
     /// idempotent: repeating it publishes nothing new.
     ///
+    /// The first successful call in a process arms [`Self::republish`] and
+    /// serving of own cards: clients call it on start, after loading their
+    /// merged registers, and again whenever they change. That call also
+    /// re-sends the unchanged cards to the overlay as they are.
+    ///
     /// Each podcast is handled on its own, so revocation is fail-safe: a
     /// shared podcast whose card cannot be built is reported in
     /// [`PodcastDhtSyncStats::failed`] and unpublished, and never prevents
@@ -657,6 +684,7 @@ impl PodcastDht {
     /// publishes the same feed URLs.
     pub async fn sync_shares(&self, states: Vec<PodcastShareState>) -> Result<PodcastDhtSyncStats> {
         let _permit = self.publish_permit().await?;
+        let first_sync = !self.synced.load(Ordering::SeqCst);
         let local = self.database.local_publications().await?;
         let active: HashMap<&PodcastId, &PodcastCardSpec> = local
             .iter()
@@ -727,32 +755,60 @@ impl PodcastDht {
                     records.push(record);
                     stats.published += 1;
                 }
-                Ok(None) => stats.unchanged += 1,
+                Ok(None) => {
+                    stats.unchanged += 1;
+                    // Withheld by `republish` until now: send it as it is.
+                    if first_sync
+                        && let Some(publication) = local
+                            .iter()
+                            .find(|publication| publication.podcast_id == podcast_id)
+                    {
+                        records.push(publication.record.clone());
+                    }
+                }
                 Err(error) => stats.failed.push(PodcastSyncFailure {
                     podcast_id,
                     error: error.to_string(),
                 }),
             }
         }
+        // Own publications now reflect the client's registers.
+        self.synced.store(true, Ordering::SeqCst);
         stats.push = self.push(records).await?;
         Ok(stats)
     }
 
     /// Re-signs every published card with a fresh lifetime (same revision)
     /// and re-sends every unexpired tombstone. Called by
-    /// [`Self::maintenance`] every [`PODCAST_REPUBLISH_INTERVAL`].
+    /// [`Self::maintenance`] every [`PODCAST_REPUBLISH_INTERVAL`] and after a
+    /// bootstrap that found new peers.
+    ///
+    /// Until [`Self::sync_shares`] has run in this process, only tombstones
+    /// and cards published with [`Self::publish`] in this process are sent:
+    /// the persisted cards were derived from registers that may have been
+    /// revoked on another trusted device meanwhile.
     pub async fn republish(&self) -> Result<PodcastDhtPublishStats> {
         let _permit = self.publish_permit().await?;
         let now = now_ms();
         let mut records = Vec::new();
+        let mut withheld = 0usize;
         for publication in self.database.local_publications().await? {
             match publication.spec {
-                Some(spec) => records.extend(self.sign_card_locked(spec, true).await?),
+                Some(spec) if self.may_send_card(&publication.podcast_id) => {
+                    records.extend(self.sign_card_locked(spec, true).await?);
+                }
+                Some(_) => withheld += 1,
                 None if publication.record.expires_at_ms() > now => {
                     records.push(publication.record);
                 }
                 None => {}
             }
+        }
+        if withheld > 0 {
+            debug!(
+                withheld,
+                "own podcast cards wait for the first share reconciliation"
+            );
         }
         if records.is_empty() {
             return Ok(PodcastDhtPublishStats::default());
@@ -835,6 +891,13 @@ impl PodcastDht {
         Ok(aggregate_hits(records)
             .into_iter()
             .find(|hit| hit.podcast_id == *podcast_id))
+    }
+
+    /// Whether an own card of `podcast_id` may leave this device: after the
+    /// first [`Self::sync_shares`] of this process, or when it was published
+    /// with [`Self::publish`] in this process.
+    fn may_send_card(&self, podcast_id: &PodcastId) -> bool {
+        self.synced.load(Ordering::SeqCst) || lock(&self.published_here).contains(podcast_id)
     }
 
     async fn publish_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
@@ -1174,10 +1237,18 @@ impl PodcastDht {
             )),
             PodcastDhtOperation::FindValue { key, filter_tokens } => {
                 validate_filter_tokens(&filter_tokens)?;
-                let records = self
+                let mut records = self
                     .database
                     .records_by_key(key, filter_tokens, now_ms(), MAX_PODCAST_DHT_RECORDS)
                     .await?;
+                // Own cards persisted by an earlier run wait for the first
+                // share reconciliation, like republishing.
+                let own = self.own_contact.peer_id;
+                records.retain(|record| {
+                    record.publisher() != own
+                        || record.is_tombstone()
+                        || self.may_send_card(record.podcast_id())
+                });
                 Ok(PodcastDhtResponse::success(
                     self.closest_contacts(key.as_bytes(), K),
                     records,

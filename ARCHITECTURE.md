@@ -241,7 +241,10 @@ capability `podcast_dht`), built like the similarity-routing overlay. A
 device publishes a card only for podcasts whose merged registers satisfy
 `effective_share` (SQLite clients read the merged registers from
 `PodcastStore`); `sync_shares` reconciles publications declaratively and
-nothing is sent for a podcast the device never published. A card is the
+nothing is sent for a podcast the device never published. Own cards persisted
+by an earlier run are neither republished nor served until the first
+`sync_shares` of the process, so a stale cache cannot revive a share revoked
+elsewhere while the device was offline. A card is the
 public projection of a podcast (feed URL and channel metadata, no personal
 state), signed by the device's iroh identity over a domain-separated
 canonical encoding. Only the origin URL the id hashes from is bound to the

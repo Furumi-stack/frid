@@ -264,10 +264,12 @@ explicitly shared. Wiring, as for `SimilarityDht`:
    simply does not add it);
 3. pass every peer manifest received to `note_peer_capabilities`, so peers
    without the overlay are not dialed;
-4. call `sync_shares` with the merged subscription and share registers after
-   applying sync operations: it publishes cards only where `effective_share`
-   holds, tombstones every other own publication, and reports cards it could
-   not build (`failed`) or held back for privacy (`held_back`);
+4. call `sync_shares` with the merged subscription and share registers on
+   start and after applying sync operations (until the first call, own cards
+   persisted by an earlier run are neither republished nor served): it
+   publishes cards only where `effective_share` holds, tombstones every other
+   own publication, and reports cards it could not build (`failed`) or held
+   back for privacy (`held_back`);
 5. ask the user before publishing when `PodcastCardSpec::privacy_warnings`
    (or `feed_url_privacy_warning`) reports a URL that looks private, then
    call `publish` or set `PodcastShareState::privacy_confirmed`.

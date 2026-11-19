@@ -20,6 +20,9 @@
 //!   look private (single node).
 //! * Contacts a peer returns are never trusted: fabricated, unreachable
 //!   contacts do not enter the routing table (two nodes).
+//! * After a restart, own cards persisted by the previous run are neither
+//!   republished nor served until the first `sync_shares`, so a share
+//!   revoked on another device meanwhile is never re-sent (two nodes).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -655,4 +658,106 @@ async fn fabricated_contacts_scenario() {
     a.stop().await;
     m_events.abort();
     m.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_device_waits_for_sync_shares_before_resending_cards() {
+    tokio::time::timeout(TEST_TIMEOUT, restart_scenario())
+        .await
+        .unwrap();
+}
+
+async fn restart_scenario() {
+    let temp = tempfile::tempdir().unwrap();
+    let network = NetworkId::from_name("podcast-dht-restart");
+    let state =
+        |subscription: &SubscriptionRecord, shared: bool, generation: u64| PodcastShareState {
+            subscription: subscription.clone(),
+            share: Some(share(subscription, shared, generation)),
+            card: None,
+            privacy_confirmed: false,
+        };
+    let kept = subscription("kept.xml", "Kept Show");
+    let revoked = subscription("revoked.xml", "Revoked Show");
+
+    // A publishes both podcasts while alone, then goes offline.
+    let a = Node::start(&temp.path().join("a"), network).await;
+    let stats = a
+        .dht
+        .sync_shares(vec![state(&kept, true, 2), state(&revoked, true, 2)])
+        .await
+        .unwrap();
+    assert_eq!((stats.published, stats.push.remote_nodes), (2, 0));
+    a.stop().await;
+
+    // Meanwhile another trusted device revokes "Revoked Show". A comes back
+    // with its persisted cards and runs maintenance before its client
+    // reconciled: the first bootstrap finds B.
+    let b = Node::start(&temp.path().join("b"), network).await;
+    let mut a = Node::start(&temp.path().join("a"), network).await;
+    b.service
+        .connect(a.service.ticket().await.unwrap())
+        .await
+        .unwrap();
+    wait_for("music DHT contacts", async || {
+        (!a.service.known_peers().is_empty()).then_some(())
+    })
+    .await;
+    a.tasks.push(tokio::spawn(Arc::clone(&a.dht).maintenance()));
+    wait_for("overlay contacts", async || {
+        (a.dht.known_peers() >= 1 && b.dht.known_peers() >= 1).then_some(())
+    })
+    .await;
+    // Neither maintenance nor an explicit republish sends a stale card, and
+    // A does not serve them to lookups either.
+    let stats = a.dht.republish().await.unwrap();
+    assert_eq!(stats.records, 0, "stale cards are withheld");
+    for podcast in [&kept, &revoked] {
+        assert!(
+            b.dht
+                .lookup_podcast(&podcast.podcast_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(search(&b, "show").await.is_empty());
+
+    // The client's first reconciliation revokes the stale share and
+    // re-sends the unchanged card.
+    let stats = a
+        .dht
+        .sync_shares(vec![state(&kept, true, 2), state(&revoked, false, 3)])
+        .await
+        .unwrap();
+    assert_eq!(
+        (stats.published, stats.unchanged, stats.unpublished),
+        (0, 1, 1)
+    );
+    assert_eq!(stats.push.records, 2, "the kept card and the tombstone");
+    assert!(stats.push.remote_nodes >= 1);
+    let a_only = vec![a.service.endpoint_id()];
+    let hit = b
+        .dht
+        .lookup_podcast(&kept.podcast_id)
+        .await
+        .unwrap()
+        .expect("the kept card is found");
+    assert_eq!(hit.publishers, a_only);
+    assert!(
+        b.dht
+            .lookup_podcast(&revoked.podcast_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // From now on republishing covers the kept card and the tombstone.
+    let stats = a.dht.republish().await.unwrap();
+    assert_eq!(stats.records, 2);
+    let hits = search(&b, "show").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].podcast_id, kept.podcast_id);
+
+    a.stop().await;
+    b.stop().await;
 }
