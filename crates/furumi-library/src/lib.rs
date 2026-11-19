@@ -3283,6 +3283,7 @@ fn query_tracks(
                 artists: Vec::new(),
                 featured_artists: Vec::new(),
                 fed: None,
+                podcast: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3348,6 +3349,7 @@ fn pending_track(fed: &FederatedTrack) -> TrackItem {
         file_size_bytes: None,
         play_count: 0,
         fed: Some(fed.clone()),
+        podcast: None,
     }
 }
 
