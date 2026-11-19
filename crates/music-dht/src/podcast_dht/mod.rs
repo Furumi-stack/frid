@@ -124,6 +124,11 @@ pub const MAX_PODCAST_DHT_REQUESTS_PER_PEER: usize = 8;
 /// Maximum distinct `(podcast_id, publisher)` records one lookup keeps;
 /// records of further owners are ignored.
 pub const MAX_PODCAST_LOOKUP_RECORDS: usize = 512;
+/// Most new `(podcast_id, publisher)` owners one response (or the local
+/// cache) may add to a lookup: a `1 / K` share of
+/// [`MAX_PODCAST_LOOKUP_RECORDS`], so the first responders cannot fill the
+/// lookup and crowd out later ones.
+pub const MAX_PODCAST_LOOKUP_OWNERS_PER_RESPONSE: usize = MAX_PODCAST_LOOKUP_RECORDS / K;
 /// A node stores a placement only when fewer than this many of its known
 /// overlay contacts are closer to the key than itself (`2 * K`: the `K`
 /// closest with slack for differing routing views).
@@ -141,6 +146,9 @@ const SERVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A peer that failed to answer (network error or timeout) is skipped by
 /// lookups, publication and bootstrap for this long.
 const FAILED_PEER_BACKOFF: Duration = Duration::from_secs(30);
+/// A contact that failed this many times in a row (each after its backoff)
+/// is removed from the routing table and the persisted peers.
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const MAX_TICKET_BYTES: usize = 16 * 1024;
 const MAX_ERROR_BYTES: usize = 1024;
 
@@ -354,6 +362,7 @@ pub struct PodcastDht {
     routing: Mutex<RoutingTable>,
     unsupported: Mutex<HashMap<EndpointId, u64>>,
     failed: Mutex<HashMap<EndpointId, u64>>,
+    failures: Mutex<HashMap<EndpointId, u32>>,
     publish_gate: Semaphore,
     serve_limit: Arc<Semaphore>,
     inflight: Arc<Mutex<HashMap<EndpointId, usize>>>,
@@ -401,6 +410,7 @@ impl PodcastDht {
             routing: Mutex::new(routing),
             unsupported: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
             publish_gate: Semaphore::new(1),
             serve_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_PODCAST_DHT_REQUESTS)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -481,9 +491,12 @@ impl PodcastDht {
     /// A peer whose manifest lacks [`PODCAST_DHT_ID`] at
     /// [`PODCAST_DHT_PROTOCOL_VERSION`] is removed from the overlay routing
     /// table and not contacted for [`UNSUPPORTED_PEER_BACKOFF`]. Peers only
-    /// enter the routing table after answering on [`PODCAST_DHT_ALPN`] or
-    /// being returned by an overlay peer, so a peer without the overlay is
-    /// never queried for records or asked to store them.
+    /// enter the routing table after answering a request on
+    /// [`PODCAST_DHT_ALPN`] or sending one as an authenticated requester, so
+    /// a peer without the overlay is never asked to store records and never
+    /// counts for replica responsibility. A contact another peer returns is
+    /// only a lookup candidate until it answers itself; a candidate that does
+    /// not answer is backed off like any failed peer.
     pub async fn note_peer_capabilities(
         &self,
         peer: EndpointId,
@@ -500,10 +513,11 @@ impl PodcastDht {
     }
 
     /// Discovers overlay peers among the routing table and the music DHT
-    /// contacts with one `FindNode` each. Music-DHT contacts whose capability
-    /// manifest lacks the overlay ([`Self::note_peer_capabilities`]) are
-    /// skipped; others are dialed on [`PODCAST_DHT_ALPN`] and only become
-    /// overlay contacts when they answer.
+    /// contacts with one `FindNode` each, then asks the not yet known contacts
+    /// they return once more. Music-DHT contacts whose capability manifest
+    /// lacks the overlay ([`Self::note_peer_capabilities`]) are skipped;
+    /// others are dialed on [`PODCAST_DHT_ALPN`]. A peer only becomes an
+    /// overlay contact when it answers.
     pub async fn bootstrap(&self) -> Result<()> {
         let known_feature: HashSet<EndpointId> = lock(&self.routing)
             .contacts()
@@ -517,25 +531,19 @@ impl PodcastDht {
                 .into_iter()
                 .filter(|contact| !known_feature.contains(&contact.peer_id)),
         );
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<EndpointId> = known_feature;
+        seen.insert(self.own_contact.peer_id);
+        let mut queried = HashSet::new();
         candidates.retain(|contact| {
             contact.peer_id != self.own_contact.peer_id
                 && !self.is_unsupported(&contact.peer_id)
                 && !self.is_backed_off(&contact.peer_id)
-                && seen.insert(contact.peer_id)
+                && queried.insert(contact.peer_id)
         });
+        seen.extend(queried);
         candidates.truncate(MAX_BOOTSTRAP_PEERS);
-        let target = *self.own_contact.node_id.as_bytes();
-        let responses = stream::iter(candidates.into_iter().map(|contact| async move {
-            let response = self
-                .exchange(&contact, PodcastDhtOperation::FindNode { target })
-                .await;
-            (contact, response)
-        }))
-        .buffer_unordered(BOOTSTRAP_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-        for (contact, response) in responses {
+        let mut discovered = Vec::new();
+        for (contact, response) in self.find_own_node(candidates).await {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
@@ -544,9 +552,44 @@ impl PodcastDht {
                 }
             };
             self.learn_contact(contact).await?;
-            self.learn_response_nodes(response.nodes).await;
+            for node in response.nodes {
+                if validate_contact(&node, &self.network_id, Some(self.own_contact.peer_id)).is_ok()
+                    && !self.is_unsupported(&node.peer_id)
+                    && !self.is_backed_off(&node.peer_id)
+                    && seen.insert(node.peer_id)
+                {
+                    discovered.push(node);
+                }
+            }
+        }
+        // Returned contacts are unverified: they join only by answering.
+        discovered.truncate(MAX_BOOTSTRAP_PEERS);
+        for (contact, response) in self.find_own_node(discovered).await {
+            match response {
+                Ok(_) => self.learn_contact(contact).await?,
+                Err(error) => {
+                    debug!(peer = %contact.peer_id, %error, "podcast DHT contact did not answer");
+                }
+            }
         }
         Ok(())
+    }
+
+    /// One `FindNode` for this node's id to each contact.
+    async fn find_own_node(
+        &self,
+        contacts: Vec<NodeContact>,
+    ) -> Vec<(NodeContact, Result<PodcastDhtResponse>)> {
+        let target = *self.own_contact.node_id.as_bytes();
+        stream::iter(contacts.into_iter().map(|contact| async move {
+            let response = self
+                .exchange(&contact, PodcastDhtOperation::FindNode { target })
+                .await;
+            (contact, response)
+        }))
+        .buffer_unordered(BOOTSTRAP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
     }
 
     /// Publishes (or refreshes) this device's card of a podcast.
@@ -892,7 +935,10 @@ impl PodcastDht {
     }
 
     /// Stores records on the `K` closest overlay nodes of each of their keys
-    /// (including this node when it is among them).
+    /// (including this node when it is among them). When a remote node
+    /// refuses a batch (`stored = 0`, for example because it does not count
+    /// itself responsible for the keys) or fails, its records are offered
+    /// once to the next closest nodes of the same keys, one per refusal.
     async fn push(&self, records: Vec<SignedPodcastRecord>) -> Result<PodcastDhtPublishStats> {
         let mut stats = PodcastDhtPublishStats {
             records: records.len(),
@@ -902,69 +948,105 @@ impl PodcastDht {
             return Ok(stats);
         }
         let mut local = Vec::new();
-        let mut remote: HashMap<EndpointId, (NodeContact, Vec<PodcastStoreEntry>)> = HashMap::new();
-        for record in records {
+        let mut plan = StorePlan::new();
+        let mut fallbacks: HashMap<(usize, PodcastDhtKey), Vec<NodeContact>> = HashMap::new();
+        for (index, record) in records.iter().enumerate() {
             let mut local_keys = Vec::new();
-            let mut remote_keys: HashMap<EndpointId, (NodeContact, Vec<PodcastDhtKey>)> =
-                HashMap::new();
             for key in record.dht_keys() {
                 stats.keys += 1;
-                let (store_local, contacts) = self.replica_targets(&key);
-                if store_local {
+                let targets = self.replica_targets(&key);
+                if targets.local {
                     local_keys.push(key);
                 }
-                for contact in contacts {
-                    remote_keys
-                        .entry(contact.peer_id)
-                        .or_insert_with(|| (contact, Vec::new()))
-                        .1
-                        .push(key);
+                for contact in targets.primary {
+                    plan.add(contact, index, key);
                 }
+                fallbacks.insert((index, key), targets.fallback);
             }
             if !local_keys.is_empty() {
                 local.push((local_keys, record.clone()));
-            }
-            for (peer, (contact, keys)) in remote_keys {
-                remote
-                    .entry(peer)
-                    .or_insert_with(|| (contact, Vec::new()))
-                    .1
-                    .push(PodcastStoreEntry {
-                        keys,
-                        record: record.clone(),
-                    });
             }
         }
         if !local.is_empty() {
             self.database.store(local, now_ms()).await?;
             stats.local_replica = true;
         }
-        let sends = stream::iter(remote.into_values().map(|(contact, entries)| async move {
-            let mut accepted = false;
-            for batch in entries.chunks(MAX_PODCAST_STORE_RECORDS) {
-                let response = self
-                    .exchange(
-                        &contact,
-                        PodcastDhtOperation::StoreBatch {
-                            records: batch.to_vec(),
+        let (mut accepted, refused) = self.send_store_plan(&records, plan).await;
+        let retry = retry_plan(refused, &mut fallbacks);
+        if !retry.is_empty() {
+            accepted.extend(self.send_store_plan(&records, retry).await.0);
+        }
+        stats.remote_nodes = accepted.len();
+        Ok(stats)
+    }
+
+    /// Sends a store plan. Returns the nodes that stored at least one
+    /// placement and the `(record index, key)` placements offered in batches
+    /// that were refused or failed.
+    async fn send_store_plan(
+        &self,
+        records: &[SignedPodcastRecord],
+        plan: StorePlan,
+    ) -> (HashSet<EndpointId>, Vec<(usize, PodcastDhtKey)>) {
+        let sends = stream::iter(plan.targets.into_values().map(|(contact, entries)| async move {
+            let entries: Vec<(usize, PodcastStoreEntry)> = entries
+                .into_iter()
+                .map(|(index, keys)| {
+                    (
+                        index,
+                        PodcastStoreEntry {
+                            keys,
+                            record: records[index].clone(),
                         },
                     )
-                    .await;
-                match response {
-                    Ok(response) => accepted |= response.stored > 0,
-                    Err(error) => {
-                        debug!(peer = %contact.peer_id, %error, "podcast DHT store failed");
-                        break;
+                })
+                .collect();
+            let mut accepted = false;
+            let mut refused = Vec::new();
+            let mut failed = false;
+            for batch in entries.chunks(MAX_PODCAST_STORE_RECORDS) {
+                let stored = if failed {
+                    false
+                } else {
+                    let response = self
+                        .exchange(
+                            &contact,
+                            PodcastDhtOperation::StoreBatch {
+                                records: batch.iter().map(|(_, entry)| entry.clone()).collect(),
+                            },
+                        )
+                        .await;
+                    match response {
+                        Ok(response) => response.stored > 0,
+                        Err(error) => {
+                            debug!(peer = %contact.peer_id, %error, "podcast DHT store failed");
+                            failed = true;
+                            false
+                        }
+                    }
+                };
+                if stored {
+                    accepted = true;
+                } else {
+                    for (index, entry) in batch {
+                        refused.extend(entry.keys.iter().map(|key| (*index, *key)));
                     }
                 }
             }
-            accepted
+            (contact.peer_id, accepted, refused)
         }))
         .buffer_unordered(PUBLISH_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
-        stats.remote_nodes = sends.into_iter().filter(|accepted| *accepted).count();
-        Ok(stats)
+        let mut accepted = HashSet::new();
+        let mut refused = Vec::new();
+        for (peer, stored, keys) in sends {
+            if stored {
+                accepted.insert(peer);
+            }
+            refused.extend(keys);
+        }
+        (accepted, refused)
     }
 
     /// Iterative lookup of `key`: queries the `K` closest known overlay
@@ -1013,16 +1095,23 @@ impl PodcastDht {
                 filter_tokens: filter_tokens.clone(),
             };
             let mut futures: FuturesUnordered<_> = batch
-                .iter()
+                .into_iter()
                 .map(|contact| {
                     let operation = operation.clone();
-                    async move { self.exchange(contact, operation).await }
+                    async move {
+                        let response = self.exchange(&contact, operation).await;
+                        (contact, response)
+                    }
                 })
                 .collect();
-            while let Ok(Some(response)) = tokio::time::timeout_at(deadline, futures.next()).await {
+            while let Ok(Some((contact, response))) =
+                tokio::time::timeout_at(deadline, futures.next()).await
+            {
                 let Ok(response) = response else {
                     continue;
                 };
+                // It answered on the overlay: now it is a verified contact.
+                self.learn_contact(contact).await?;
                 merge_records(
                     &mut winners,
                     response.records,
@@ -1031,12 +1120,12 @@ impl PodcastDht {
                     &filter_tokens,
                 );
                 for node in response.nodes {
+                    // Returned contacts are only candidates until they answer.
                     if validate_contact(&node, &self.network_id, Some(self.own_contact.peer_id))
                         .is_ok()
                         && !self.is_unsupported(&node.peer_id)
                         && known.insert(node.peer_id)
                     {
-                        self.learn_contact(node.clone()).await?;
                         candidates.push(node);
                     }
                 }
@@ -1098,9 +1187,11 @@ impl PodcastDht {
             PodcastDhtOperation::StoreBatch { records } => {
                 let entries =
                     validate_store_batch(records, &self.network_id, authenticated_peer, now_ms())?;
+                // Only verified contacts that are not backed off count.
                 let nodes: Vec<NodeId> = lock(&self.routing)
                     .contacts()
                     .into_iter()
+                    .filter(|contact| !self.is_backed_off(&contact.peer_id))
                     .map(|contact| contact.node_id)
                     .collect();
                 let entries: Vec<_> = entries
@@ -1137,10 +1228,21 @@ impl PodcastDht {
         match &result {
             Ok(_) => {
                 lock(&self.failed).remove(&contact.peer_id);
+                lock(&self.failures).remove(&contact.peer_id);
             }
             Err(MusicDhtError::Network(_) | MusicDhtError::Timeout) => {
                 let until = now_ms().saturating_add(FAILED_PEER_BACKOFF.as_millis() as u64);
                 lock(&self.failed).insert(contact.peer_id, until);
+                let failures = {
+                    let mut failures = lock(&self.failures);
+                    let count = failures.entry(contact.peer_id).or_default();
+                    *count += 1;
+                    *count
+                };
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    lock(&self.failures).remove(&contact.peer_id);
+                    self.forget_contact(contact.peer_id).await;
+                }
             }
             Err(_) => {}
         }
@@ -1180,6 +1282,16 @@ impl PodcastDht {
         Ok(response)
     }
 
+    /// Removes a contact that keeps failing from routing and the cache.
+    async fn forget_contact(&self, peer: EndpointId) {
+        if lock(&self.routing).remove(&peer) {
+            debug!(%peer, "podcast DHT contact dropped after repeated failures");
+        }
+        if let Err(error) = self.database.remove_peer(peer).await {
+            debug!(%peer, %error, "podcast DHT contact removal failed");
+        }
+    }
+
     fn is_unsupported(&self, peer: &EndpointId) -> bool {
         still_listed(&self.unsupported, peer)
     }
@@ -1188,21 +1300,15 @@ impl PodcastDht {
         still_listed(&self.failed, peer)
     }
 
-    fn replica_targets(&self, key: &PodcastDhtKey) -> (bool, Vec<NodeContact>) {
-        let mut contacts: Vec<_> = lock(&self.routing)
+    /// Replica targets of `key` among the contacts that are not backed off
+    /// ([`replica_targets`]).
+    fn replica_targets(&self, key: &PodcastDhtKey) -> ReplicaTargets {
+        let contacts: Vec<_> = lock(&self.routing)
             .contacts()
             .into_iter()
             .filter(|contact| !self.is_backed_off(&contact.peer_id))
             .collect();
-        contacts.push(self.fresh_own_contact());
-        contacts.sort_by_key(|contact| distance(contact.node_id.as_bytes(), key.as_bytes()));
-        contacts.dedup_by_key(|contact| contact.peer_id);
-        contacts.truncate(K);
-        let local = contacts
-            .iter()
-            .any(|contact| contact.peer_id == self.own_contact.peer_id);
-        contacts.retain(|contact| contact.peer_id != self.own_contact.peer_id);
-        (local, contacts)
+        replica_targets(self.fresh_own_contact(), contacts, key)
     }
 
     fn closest_contacts(&self, target: &[u8; 32], count: usize) -> Vec<NodeContact> {
@@ -1218,17 +1324,6 @@ impl PodcastDht {
         let mut contact = self.own_contact.clone();
         contact.last_seen_ms = now_ms();
         contact
-    }
-
-    async fn learn_response_nodes(&self, nodes: Vec<NodeContact>) {
-        for contact in nodes {
-            if self.is_unsupported(&contact.peer_id) {
-                continue;
-            }
-            if let Err(error) = self.learn_contact(contact).await {
-                debug!(%error, "invalid podcast DHT contact ignored");
-            }
-        }
     }
 
     async fn learn_contact(&self, mut contact: NodeContact) -> Result<()> {
@@ -1309,8 +1404,12 @@ fn validate_filter_tokens(tokens: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Adds verified records found under `key` to the per-owner winners, keeping
-/// at most [`MAX_PODCAST_LOOKUP_RECORDS`] owners.
+/// Adds verified records of one response (or the local cache) found under
+/// `key` to the per-owner winners. A newer record of a known owner always
+/// replaces its winner; the response may add at most
+/// [`MAX_PODCAST_LOOKUP_OWNERS_PER_RESPONSE`] new owners, and the lookup
+/// keeps at most [`MAX_PODCAST_LOOKUP_RECORDS`]. So the order in which
+/// responders answer does not let the first ones take every slot.
 fn merge_records(
     winners: &mut HashMap<(PodcastId, EndpointId), SignedPodcastRecord>,
     records: Vec<SignedPodcastRecord>,
@@ -1319,6 +1418,7 @@ fn merge_records(
     filter_tokens: &[String],
 ) {
     let now = now_ms();
+    let mut added = 0usize;
     for record in records {
         if record.verify_at(network_id, now).is_err() || !record.belongs_under(key) {
             continue;
@@ -1332,11 +1432,96 @@ fn merge_records(
         let owner = (record.podcast_id().clone(), record.publisher());
         match winners.get(&owner) {
             Some(current) if compare_records(current, &record).is_ge() => {}
-            None if winners.len() >= MAX_PODCAST_LOOKUP_RECORDS => {}
-            _ => {
+            Some(_) => {
                 winners.insert(owner, record);
             }
+            None if winners.len() >= MAX_PODCAST_LOOKUP_RECORDS
+                || added >= MAX_PODCAST_LOOKUP_OWNERS_PER_RESPONSE => {}
+            None => {
+                winners.insert(owner, record);
+                added += 1;
+            }
         }
+    }
+}
+
+/// Replica nodes of one key, from [`replica_targets`].
+#[derive(Debug)]
+struct ReplicaTargets {
+    /// Whether this node is among the `K` closest.
+    local: bool,
+    /// The other nodes among the `K` closest.
+    primary: Vec<NodeContact>,
+    /// The next up to `K` nodes, farthest first (popped closest first).
+    fallback: Vec<NodeContact>,
+}
+
+/// The `K` closest nodes of `key` among `contacts` and `own` (this node), and
+/// the next `K` as fallbacks.
+fn replica_targets(
+    own: NodeContact,
+    mut contacts: Vec<NodeContact>,
+    key: &PodcastDhtKey,
+) -> ReplicaTargets {
+    let own_peer = own.peer_id;
+    contacts.push(own);
+    contacts.sort_by_key(|contact| distance(contact.node_id.as_bytes(), key.as_bytes()));
+    contacts.dedup_by_key(|contact| contact.peer_id);
+    let mut fallback = contacts.split_off(K.min(contacts.len()));
+    fallback.retain(|contact| contact.peer_id != own_peer);
+    fallback.truncate(K);
+    fallback.reverse();
+    let local = contacts.iter().any(|contact| contact.peer_id == own_peer);
+    contacts.retain(|contact| contact.peer_id != own_peer);
+    ReplicaTargets {
+        local,
+        primary: contacts,
+        fallback,
+    }
+}
+
+/// One fallback node per refused `(record index, key)` placement: the
+/// closest one not yet offered that placement.
+fn retry_plan(
+    refused: Vec<(usize, PodcastDhtKey)>,
+    fallbacks: &mut HashMap<(usize, PodcastDhtKey), Vec<NodeContact>>,
+) -> StorePlan {
+    let mut retry = StorePlan::new();
+    for (index, key) in refused {
+        if let Some(contact) = fallbacks
+            .get_mut(&(index, key))
+            .and_then(|fallback| fallback.pop())
+        {
+            retry.add(contact, index, key);
+        }
+    }
+    retry
+}
+
+/// Placements to offer per remote node: record index and keys.
+struct StorePlan {
+    targets: HashMap<EndpointId, (NodeContact, BTreeMap<usize, Vec<PodcastDhtKey>>)>,
+}
+
+impl StorePlan {
+    fn new() -> Self {
+        Self {
+            targets: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, contact: NodeContact, index: usize, key: PodcastDhtKey) {
+        self.targets
+            .entry(contact.peer_id)
+            .or_insert_with(|| (contact, BTreeMap::new()))
+            .1
+            .entry(index)
+            .or_default()
+            .push(key);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.targets.is_empty()
     }
 }
 

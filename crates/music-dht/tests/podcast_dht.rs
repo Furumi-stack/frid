@@ -18,6 +18,8 @@
 //!   and is never asked for records or to store them.
 //! * `sync_shares` stays fail-safe for revocation and holds back URLs that
 //!   look private (single node).
+//! * Contacts a peer returns are never trusted: fabricated, unreachable
+//!   contacts do not enter the routing table (two nodes).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -565,4 +567,92 @@ async fn single_node_scenario() {
     assert_eq!((stats.unchanged, stats.held_back.len()), (1, 0));
 
     a.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fabricated_contacts_never_join_the_overlay() {
+    tokio::time::timeout(TEST_TIMEOUT, fabricated_contacts_scenario())
+        .await
+        .unwrap();
+}
+
+/// K contacts whose node ids are genuine hashes of their endpoint ids but
+/// whose tickets carry no address, as a malicious peer could return them.
+fn fabricated_contacts(network: NetworkId) -> Vec<NodeContact> {
+    (0..music_dht::K)
+        .map(|index| {
+            let peer = federation_net::SecretKey::from_bytes(&[index as u8 + 101; 32]).public();
+            let ticket = federation_net::PeerTicket {
+                ticket_version: federation_net::TICKET_VERSION,
+                protocol_version: 1,
+                network_id: network,
+                schema_id: federation_net::SchemaId::from_bytes([0; 32]),
+                endpoint_addr: federation_net::EndpointAddr::new(peer),
+            };
+            NodeContact {
+                node_id: NodeId::from_endpoint(&peer),
+                peer_id: peer,
+                ticket: ticket.to_string(),
+                last_seen_ms: u64::MAX,
+            }
+        })
+        .collect()
+}
+
+async fn fabricated_contacts_scenario() {
+    let temp = tempfile::tempdir().unwrap();
+    let network = NetworkId::from_name("podcast-dht-fabricated-contacts");
+    let a = Node::start(&temp.path().join("a"), network).await;
+    // M speaks the overlay ALPN but answers every request with fabricated
+    // contacts.
+    let (m, m_events) = start_service(&temp.path().join("m"), network, true).await;
+    let mut acceptor = m.stream_acceptor(PODCAST_DHT_ALPN).unwrap();
+    let fabricated = fabricated_contacts(network);
+    let response = PodcastDhtResponse {
+        version: PODCAST_DHT_PROTOCOL_VERSION,
+        ok: true,
+        error: None,
+        nodes: fabricated.clone(),
+        records: Vec::new(),
+        stored: 0,
+    };
+    let payload = postcard::to_stdvec(&response).unwrap();
+    let server = tokio::spawn(async move {
+        while let Some(mut stream) = acceptor.accept().await {
+            let mut request = Vec::new();
+            let _ = AsyncReadExt::read_to_end(
+                &mut (&mut stream.recv).take(MAX_PODCAST_DHT_REQUEST_BYTES as u64),
+                &mut request,
+            )
+            .await;
+            let _ = stream.send.write_all(&payload).await;
+            let _ = stream.send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.send.stopped()).await;
+        }
+    });
+    m.connect(a.service.ticket().await.unwrap()).await.unwrap();
+    wait_for("music DHT contact", async || {
+        (!a.service.known_peers().is_empty()).then_some(())
+    })
+    .await;
+
+    // Bootstrap learns M, which answered, and none of the contacts it made
+    // up: they are tried once and never answer.
+    a.dht.bootstrap().await.unwrap();
+    assert_eq!(a.dht.known_peers(), 1);
+    // A lookup treats them as candidates only.
+    let podcast_id = PodcastId::from_feed_url(&feed("nothing.xml"));
+    assert!(a.dht.lookup_podcast(&podcast_id).await.unwrap().is_none());
+    assert_eq!(a.dht.known_peers(), 1);
+    a.dht.bootstrap().await.unwrap();
+    assert_eq!(
+        a.dht.known_peers(),
+        1,
+        "fabricated contacts never count for replica responsibility"
+    );
+
+    server.abort();
+    a.stop().await;
+    m_events.abort();
+    m.shutdown().await.unwrap();
 }

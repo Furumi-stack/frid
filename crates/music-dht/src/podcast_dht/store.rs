@@ -17,33 +17,53 @@ use crate::error::{MusicDhtError, Result};
 use crate::podcast::PodcastId;
 use crate::routing::{NodeContact, NodeId};
 
+use super::MAX_PODCAST_DHT_RECORDS;
 use super::card::{PodcastCardSpec, PodcastDhtKey, SignedPodcastRecord, compare_records};
 
 /// `PRAGMA user_version` of the podcast-discovery cache schema. Version 1
 /// (pre-release) stored one payload per key; its replica table is dropped on
 /// open because the cache is replaceable. Own publications are kept.
 pub const PODCAST_DHT_CACHE_SCHEMA_VERSION: i32 = 2;
-/// Maximum records (cards and tombstones) indexed under one key. A full key
-/// admits no new `(podcast_id, publisher)` until a record expires: existing
-/// records are never evicted for newcomers, and their owners keep refreshing
-/// them in place.
-pub const MAX_PODCAST_RECORDS_PER_KEY: usize = 256;
-/// Maximum tombstones newly indexed under one key. A tombstone is admitted
-/// under a text key only in place of a record of the same
-/// `(podcast_id, publisher)` already indexed there, so this budget applies to
-/// the podcast-id key, where tombstones of unknown cards land.
-pub const MAX_PODCAST_TOMBSTONES_PER_KEY: usize = 32;
+/// Maximum records (cards and tombstones) indexed under one key. It equals
+/// [`MAX_PODCAST_DHT_RECORDS`], so one `FindValue` response carries every
+/// record of a key: nothing admitted is unreachable.
+///
+/// A full key admits a newcomer by evicting a random placement from its
+/// younger half (by first indexing time). The older half is never evicted
+/// for newcomers, so cards that were there before a flood stay, and the
+/// younger half stays contestable, so nobody who stored first holds the key
+/// for good.
+pub const MAX_PODCAST_RECORDS_PER_KEY: usize = MAX_PODCAST_DHT_RECORDS;
+/// Maximum tombstones indexed under one key, including tombstones that
+/// replaced their owner's card in place. Over budget, a random tombstone of
+/// another owner from the younger half of the key's tombstones is evicted.
+/// It equals [`MAX_PODCAST_RESPONSE_TOMBSTONES`], so every tombstone of a key
+/// is served.
+pub const MAX_PODCAST_TOMBSTONES_PER_KEY: usize = MAX_PODCAST_RESPONSE_TOMBSTONES;
 /// Maximum tombstones in one `FindValue` response; cards fill the rest.
 pub const MAX_PODCAST_RESPONSE_TOMBSTONES: usize = 32;
 /// Maximum `(podcast_id, publisher)` records one publisher device keeps in a
-/// replica.
+/// replica. A publisher over it is refused (nothing is evicted for it).
 pub const MAX_PODCAST_RECORDS_PER_PUBLISHER: usize = 256;
-/// Maximum `(podcast_id, publisher)` records in a replica cache.
+/// Maximum `(podcast_id, publisher)` records in a replica cache. A full cache
+/// admits a new record by evicting random records from the younger half of
+/// the cache (by first indexing time), like a full key.
 pub const MAX_PODCAST_CACHE_RECORDS: usize = 4_096;
-/// Maximum total encoded size of the records in a replica cache.
+/// Maximum total encoded size of the records in a replica cache, enforced
+/// like [`MAX_PODCAST_CACHE_RECORDS`].
 pub const MAX_PODCAST_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum persisted overlay contacts; the least recently seen are dropped.
 pub const MAX_PERSISTED_PODCAST_DHT_PEERS: usize = 1_024;
+/// Maximum records evicted from the cache to admit one record; when that is
+/// not enough room, the record is refused and nothing is evicted.
+const MAX_EVICTIONS_PER_RECORD: usize = 16;
+
+const _: () = assert!(
+    MAX_PODCAST_RECORDS_PER_KEY <= MAX_PODCAST_DHT_RECORDS
+        && MAX_PODCAST_TOMBSTONES_PER_KEY <= MAX_PODCAST_RESPONSE_TOMBSTONES
+        && MAX_PODCAST_RESPONSE_TOMBSTONES <= MAX_PODCAST_DHT_RECORDS,
+    "every record admitted under a key must fit one FindValue response"
+);
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS podcast_dht_records (
@@ -227,7 +247,8 @@ impl PodcastDhtDatabase {
     /// [`MAX_PODCAST_RESPONSE_TOMBSTONES`] tombstones (always returned so stale
     /// replicas elsewhere can be overruled) and cards containing every token
     /// in `filter_tokens` up to `limit` records in all. Records indexed longest
-    /// come first. Cards precede tombstones.
+    /// come first. Cards precede tombstones. With the default limits and
+    /// `limit` = [`MAX_PODCAST_DHT_RECORDS`], every record of the key fits.
     pub async fn records_by_key(
         &self,
         key: PodcastDhtKey,
@@ -475,10 +496,10 @@ fn store_one(
     };
     let payload = postcard::to_stdvec(record).map_err(to_sql_error)?;
     if replace
-        && !admits_record(
+        && !make_room_for_record(
             conn,
             limits,
-            &publisher,
+            (&podcast_id, &publisher),
             existing.is_none(),
             existing_bytes,
             payload.len(),
@@ -536,6 +557,14 @@ fn store_one(
                 clamp_i64(record.expires_at_ms()),
             ],
         )?;
+        // A card converted to a tombstone in place counts against the
+        // tombstone budget of each key it stays under, like a new one.
+        if record.is_tombstone() {
+            for key in &indexed {
+                let key = PodcastDhtKey::from_bytes(*key);
+                make_room_under_key(conn, limits, &key, true, (&podcast_id, &publisher), now, 0)?;
+            }
+        }
     }
 
     // New placements. A tombstone only takes a new place under the podcast-id
@@ -549,7 +578,15 @@ fn store_one(
         if record.is_tombstone() && *key != id_key {
             continue;
         }
-        if !admits_placement(conn, limits, key, record.is_tombstone(), now)? {
+        if !make_room_under_key(
+            conn,
+            limits,
+            key,
+            record.is_tombstone(),
+            (&podcast_id, &publisher),
+            now,
+            1,
+        )? {
             continue;
         }
         conn.execute(
@@ -596,58 +633,197 @@ fn store_one(
     Ok(written)
 }
 
-/// Whether the cache may hold the new version of a record: per-publisher and
-/// global record counts for a new owner, and the global byte budget.
-fn admits_record(
+/// Makes room in the cache for the new version of a record of `owner`.
+///
+/// * A publisher at [`StoreLimits::per_publisher`] gets no new record.
+/// * When the record count (for a new owner) or the byte budget would be
+///   exceeded, random records of other owners from the younger half of the
+///   cache (by first indexing time) are evicted, at most
+///   [`MAX_EVICTIONS_PER_RECORD`]. If that is not enough, nothing is evicted
+///   and the record is refused.
+fn make_room_for_record(
     conn: &Connection,
     limits: &StoreLimits,
-    publisher: &str,
+    owner: (&str, &str),
     new_owner: bool,
     previous_bytes: usize,
     new_bytes: usize,
     now: i64,
 ) -> rusqlite::Result<bool> {
+    if new_bytes > limits.bytes {
+        return Ok(false);
+    }
+    if new_owner {
+        let own: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM podcast_dht_records WHERE publisher = ?1 AND expires_at_ms > ?2",
+            params![owner.1, now],
+            |row| row.get(0),
+        )?;
+        if own.max(0) as usize >= limits.per_publisher {
+            return Ok(false);
+        }
+    }
     let (records, bytes): (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM podcast_dht_records
          WHERE expires_at_ms > ?1",
         [now],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let bytes = (bytes.max(0) as usize).saturating_sub(previous_bytes);
-    if bytes.saturating_add(new_bytes) > limits.bytes {
-        return Ok(false);
-    }
-    if !new_owner {
+    let mut records = records.max(0) as usize;
+    let mut bytes = (bytes.max(0) as usize).saturating_sub(previous_bytes);
+    let fits = |records: usize, bytes: usize| {
+        bytes.saturating_add(new_bytes) <= limits.bytes && (!new_owner || records < limits.records)
+    };
+    if fits(records, bytes) {
         return Ok(true);
     }
-    if records.max(0) as usize >= limits.records {
+
+    // Candidates: the younger half of the other owners' records, shuffled.
+    let others = records.saturating_sub(usize::from(!new_owner));
+    let mut statement = conn.prepare(
+        "SELECT podcast_id, publisher, payload_bytes FROM (
+             SELECT r.podcast_id, r.publisher, r.payload_bytes,
+                    (SELECT MIN(k.first_stored_at_ms) FROM podcast_dht_keys k
+                      WHERE k.podcast_id = r.podcast_id AND k.publisher = r.publisher) AS since
+               FROM podcast_dht_records r
+              WHERE r.expires_at_ms > ?1 AND NOT (r.podcast_id = ?2 AND r.publisher = ?3)
+              ORDER BY since DESC, random()
+              LIMIT ?4)
+         ORDER BY random() LIMIT ?5",
+    )?;
+    let candidates = statement
+        .query_map(
+            params![
+                now,
+                owner.0,
+                owner.1,
+                others.div_ceil(2) as i64,
+                MAX_EVICTIONS_PER_RECORD as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut evict = Vec::new();
+    for (podcast_id, publisher, payload_bytes) in candidates {
+        if fits(records, bytes) {
+            break;
+        }
+        records = records.saturating_sub(1);
+        bytes = bytes.saturating_sub(payload_bytes.max(0) as usize);
+        evict.push((podcast_id, publisher));
+    }
+    if !fits(records, bytes) {
         return Ok(false);
     }
-    let own: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM podcast_dht_records WHERE publisher = ?1 AND expires_at_ms > ?2",
-        params![publisher, now],
-        |row| row.get(0),
-    )?;
-    Ok((own.max(0) as usize) < limits.per_publisher)
+    for (podcast_id, publisher) in evict {
+        delete_owner(conn, &podcast_id, &publisher)?;
+    }
+    Ok(true)
 }
 
-/// Whether `key` has room for one more placement. Existing placements are
-/// never evicted.
-fn admits_placement(
+/// Makes room under `key` for `incoming` more placements (0 when an existing
+/// placement of `owner` was converted to a tombstone in place) and returns
+/// whether the key has room.
+///
+/// Over [`StoreLimits::per_key`], or over [`StoreLimits::tombstones_per_key`]
+/// for a tombstone, a random placement of another owner from the younger
+/// half of the key (by first indexing time; only tombstones for the
+/// tombstone budget) is evicted. The older half is never evicted for a
+/// newcomer.
+fn make_room_under_key(
     conn: &Connection,
     limits: &StoreLimits,
     key: &PodcastDhtKey,
     tombstone: bool,
+    owner: (&str, &str),
     now: i64,
+    incoming: usize,
 ) -> rusqlite::Result<bool> {
-    let (total, tombstones): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(tombstone), 0) FROM podcast_dht_keys
-         WHERE dht_key = ?1 AND expires_at_ms > ?2",
-        params![key.as_bytes().as_slice(), now],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+    for _ in 0..=MAX_EVICTIONS_PER_RECORD {
+        let (total, tombstones): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tombstone), 0) FROM podcast_dht_keys
+             WHERE dht_key = ?1 AND expires_at_ms > ?2",
+            params![key.as_bytes().as_slice(), now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let over_tombstones =
+            tombstone && tombstones.max(0) as usize + incoming > limits.tombstones_per_key;
+        let over_total = total.max(0) as usize + incoming > limits.per_key;
+        if !over_tombstones && !over_total {
+            return Ok(true);
+        }
+        let Some((podcast_id, publisher)) =
+            young_placement(conn, key, over_tombstones, owner, now)?
+        else {
+            return Ok(false);
+        };
+        conn.execute(
+            "DELETE FROM podcast_dht_keys
+             WHERE dht_key = ?1 AND podcast_id = ?2 AND publisher = ?3",
+            params![key.as_bytes().as_slice(), podcast_id, publisher],
+        )?;
+        let placed: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM podcast_dht_keys
+                             WHERE podcast_id = ?1 AND publisher = ?2)",
+            params![podcast_id, publisher],
+            |row| row.get(0),
+        )?;
+        if !placed {
+            delete_owner(conn, &podcast_id, &publisher)?;
+        }
+    }
+    Ok(false)
+}
+
+/// A random unexpired placement of another owner than `owner` from the
+/// younger half of `key` (only tombstones with `tombstones_only`).
+fn young_placement(
+    conn: &Connection,
+    key: &PodcastDhtKey,
+    tombstones_only: bool,
+    owner: (&str, &str),
+    now: i64,
+) -> rusqlite::Result<Option<(String, String)>> {
+    let filter = "dht_key = ?1 AND expires_at_ms > ?2 AND (?3 = 0 OR tombstone = 1)
+                  AND NOT (podcast_id = ?4 AND publisher = ?5)";
+    let count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM podcast_dht_keys WHERE {filter}"),
+        params![
+            key.as_bytes().as_slice(),
+            now,
+            tombstones_only,
+            owner.0,
+            owner.1
+        ],
+        |row| row.get(0),
     )?;
-    Ok((total.max(0) as usize) < limits.per_key
-        && (!tombstone || (tombstones.max(0) as usize) < limits.tombstones_per_key))
+    if count <= 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        &format!(
+            "SELECT podcast_id, publisher FROM (
+                 SELECT podcast_id, publisher FROM podcast_dht_keys WHERE {filter}
+                  ORDER BY first_stored_at_ms DESC, random() LIMIT ?6)
+             ORDER BY random() LIMIT 1"
+        ),
+        params![
+            key.as_bytes().as_slice(),
+            now,
+            tombstones_only,
+            owner.0,
+            owner.1,
+            (count as usize).div_ceil(2) as i64
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
 }
 
 fn delete_owner(conn: &Connection, podcast_id: &str, publisher: &str) -> rusqlite::Result<()> {

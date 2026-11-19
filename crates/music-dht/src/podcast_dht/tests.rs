@@ -1,6 +1,8 @@
 //! Unit tests of the podcast-discovery overlay: records, ordering, cache and
 //! search aggregation. Multi-node behavior is in `tests/podcast_dht.rs`.
 
+use std::collections::HashSet;
+
 use federation_net::{NetworkId, SecretKey};
 
 use crate::routing::NodeId;
@@ -584,50 +586,239 @@ async fn open_db_with(
     .unwrap()
 }
 
+fn rust_card(index: usize, issued: u64) -> SignedPodcastRecord {
+    card_with(
+        spec(&format!("show-{index}.xml"), "Rust Radio"),
+        &numbered_secret(index),
+        1,
+        issued,
+    )
+}
+
+async fn store_all(
+    db: &store::PodcastDhtDatabase,
+    entries: Vec<(Vec<PodcastDhtKey>, SignedPodcastRecord)>,
+    now: u64,
+) -> usize {
+    let mut written = 0;
+    for chunk in entries.chunks(MAX_PODCAST_STORE_RECORDS) {
+        written += db.store(chunk.to_vec(), now).await.unwrap();
+    }
+    written
+}
+
+async fn count_records(temp: &tempfile::TempDir) -> i64 {
+    rusqlite::Connection::open(temp.path().join("podcast-dht.sqlite3"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM podcast_dht_records", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
 #[tokio::test]
-async fn cache_full_key_keeps_its_records_and_refuses_newcomers() {
+async fn cache_full_key_admits_newcomers_from_its_younger_half() {
     let temp = tempfile::tempdir().unwrap();
     let db = open_db(&temp).await;
-    let token_key = PodcastDhtKey::token(&network(), "rust");
-    let mut entries = Vec::new();
-    for index in 0..=MAX_PODCAST_RECORDS_PER_KEY {
-        // Later publishers expire later; that buys them nothing.
-        let record = card_with(
-            spec("show.xml", "Rust Radio"),
-            &numbered_secret(index),
+    let rust = PodcastDhtKey::token(&network(), "rust");
+    let half = MAX_PODCAST_RECORDS_PER_KEY / 2;
+    let older: Vec<_> = (0..half).map(|index| rust_card(index, NOW)).collect();
+    let younger: Vec<_> = (half..MAX_PODCAST_RECORDS_PER_KEY)
+        .map(|index| rust_card(index, NOW))
+        .collect();
+    let keyed = |records: &[SignedPodcastRecord]| -> Vec<_> {
+        records
+            .iter()
+            .map(|record| (vec![rust], record.clone()))
+            .collect()
+    };
+    assert_eq!(store_all(&db, keyed(&older), NOW).await, half);
+    assert_eq!(store_all(&db, keyed(&younger), NOW + 1).await, half);
+
+    // Newcomers keep getting in; each takes a random place of the younger
+    // half, the older half stays.
+    let mut newcomers = Vec::new();
+    for index in 0..half {
+        let newcomer = rust_card(1_000 + index, NOW);
+        assert_eq!(
+            db.store(vec![(vec![rust], newcomer.clone())], NOW + 2 + index as u64)
+                .await
+                .unwrap(),
             1,
-            NOW + index as u64,
+            "a full key admits a newcomer"
         );
-        entries.push((vec![token_key], record));
+        newcomers.push(newcomer);
+        let cached = db
+            .records_by_key(rust, Vec::new(), NOW + 2, MAX_PODCAST_DHT_RECORDS)
+            .await
+            .unwrap();
+        assert_eq!(cached.len(), MAX_PODCAST_RECORDS_PER_KEY);
+        assert!(older.iter().all(|record| cached.contains(record)));
+        assert!(cached.contains(newcomers.last().unwrap()));
     }
-    let first = entries[0].1.clone();
-    let last = entries[MAX_PODCAST_RECORDS_PER_KEY].1.clone();
-    // The first publisher arrived first; the rest a moment later.
-    db.store(entries[..1].to_vec(), NOW).await.unwrap();
-    for chunk in entries[1..].chunks(64) {
-        db.store(chunk.to_vec(), NOW + 1).await.unwrap();
-    }
-    let cached = db
-        .records_by_key(token_key, Vec::new(), NOW, usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(cached.len(), MAX_PODCAST_RECORDS_PER_KEY);
-    assert!(cached.contains(&first));
-    assert!(!cached.contains(&last));
-    assert_eq!(cached[0], first, "records indexed longest come first");
-    // The first publisher keeps refreshing its place.
+    // Owners refresh in place without evicting anybody.
     let refresh = card_with(
-        spec("show.xml", "Rust Radio"),
+        spec("show-0.xml", "Rust Radio"),
         &numbered_secret(0),
         1,
         NOW + 1_000,
     );
     assert_eq!(
-        db.store(vec![(vec![token_key], refresh)], NOW)
+        db.store(vec![(vec![rust], refresh.clone())], NOW + 1_000)
             .await
             .unwrap(),
         1
     );
+    let cached = db
+        .records_by_key(rust, Vec::new(), NOW + 1_000, MAX_PODCAST_DHT_RECORDS)
+        .await
+        .unwrap();
+    assert_eq!(cached.len(), MAX_PODCAST_RECORDS_PER_KEY);
+    assert!(cached.contains(&refresh));
+}
+
+#[tokio::test]
+async fn sybils_planted_first_cannot_lock_a_late_card_out_of_a_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db(&temp).await;
+    let rust = PodcastDhtKey::token(&network(), "rust");
+    // 128 throwaway identities, each with its own podcast titled like the
+    // victim's, fill the key first.
+    let sybils: Vec<_> = (0..MAX_PODCAST_DHT_RECORDS)
+        .map(|index| (vec![rust], rust_card(index, NOW)))
+        .collect();
+    store_all(&db, sybils, NOW).await;
+    let victim = card(&secret(1), 1);
+    assert_eq!(
+        db.store(vec![entry(&victim)], NOW + 1).await.unwrap(),
+        victim.dht_keys().len()
+    );
+    let tokens = vec!["rust".to_string(), "radio".to_string()];
+    let served = db
+        .records_by_key(rust, tokens.clone(), NOW + 1, MAX_PODCAST_DHT_RECORDS)
+        .await
+        .unwrap();
+    assert!(served.len() <= MAX_PODCAST_DHT_RECORDS);
+    assert!(served.contains(&victim), "everything admitted is served");
+    let hits = rank_hits(aggregate_hits(served), "Rust Radio", &tokens);
+    assert!(
+        hits.iter()
+            .any(|hit| hit.podcast_id == *victim.podcast_id())
+    );
+}
+
+#[tokio::test]
+async fn a_card_back_after_expiring_gets_into_a_cache_full_of_sybils() {
+    let limits = store::StoreLimits {
+        records: 16,
+        ..store::StoreLimits::default()
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db_with(&temp, limits).await;
+    let victim = card(&secret(1), 1);
+    let id_key = PodcastDhtKey::podcast(&network(), victim.podcast_id());
+    db.store(vec![entry(&victim)], NOW).await.unwrap();
+    let sybils = |issued: u64| -> Vec<_> {
+        (0..16)
+            .map(|index| {
+                let record = rust_card(index, issued);
+                (record.dht_keys(), record)
+            })
+            .collect()
+    };
+    store_all(&db, sybils(NOW), NOW + 1).await;
+    assert_eq!(count_records(&temp).await, 16);
+
+    // The victim's device is offline longer than a card lives; the sybils
+    // keep refreshing theirs in place.
+    let later = NOW + PODCAST_CARD_TTL.as_millis() as u64 + 3_600_000;
+    store_all(&db, sybils(later), later).await;
+    assert!(
+        db.records_by_key(id_key, Vec::new(), later, MAX_PODCAST_DHT_RECORDS)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let back = card_with(spec("show.xml", "Rust Radio"), &secret(1), 1, later + 1);
+    assert!(db.store(vec![entry(&back)], later + 1).await.unwrap() > 0);
+    assert_eq!(
+        db.records_by_key(id_key, Vec::new(), later + 1, MAX_PODCAST_DHT_RECORDS)
+            .await
+            .unwrap(),
+        vec![back]
+    );
+    assert_eq!(count_records(&temp).await, 16);
+}
+
+#[tokio::test]
+async fn sybil_tombstones_planted_first_cannot_hide_a_revocation() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db(&temp).await;
+    let victim_card = card(&secret(1), 1);
+    let id_key = PodcastDhtKey::podcast(&network(), victim_card.podcast_id());
+    let rust = PodcastDhtKey::token(&network(), "rust");
+    // 64 sybils publish a card of the victim's podcast, then convert it to
+    // a tombstone in place, under the id key and the text keys.
+    for index in 0..64 {
+        let key = numbered_secret(index);
+        let sybil_card = card_with(spec("show.xml", "Rust Radio"), &key, 1, NOW);
+        db.store(vec![entry(&sybil_card)], NOW).await.unwrap();
+        let tombstone = PodcastTombstone::new(
+            network(),
+            key.public(),
+            sybil_card.podcast_id().clone(),
+            2,
+            NOW,
+            sybil_card.dht_keys(),
+        );
+        let tombstone =
+            SignedPodcastRecord::sign_tombstone(tombstone, |bytes| key.sign(bytes)).unwrap();
+        assert!(db.store(vec![entry(&tombstone)], NOW).await.unwrap() > 0);
+    }
+    let conn = rusqlite::Connection::open(temp.path().join("podcast-dht.sqlite3")).unwrap();
+    let tombstones = |key: &PodcastDhtKey| -> usize {
+        conn.query_row(
+            "SELECT COUNT(*) FROM podcast_dht_keys WHERE dht_key = ?1 AND tombstone = 1",
+            [key.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+    };
+    for key in [id_key, rust] {
+        assert_eq!(
+            tombstones(&key),
+            MAX_PODCAST_TOMBSTONES_PER_KEY,
+            "in-place conversions count against the tombstone budget"
+        );
+    }
+
+    // The honest publisher publishes later, then unpublishes.
+    assert!(db.store(vec![entry(&victim_card)], NOW + 1).await.unwrap() > 0);
+    let victim_tombstone = tombstone(&secret(1), 2, NOW + 2);
+    assert!(
+        db.store(vec![entry(&victim_tombstone)], NOW + 2)
+            .await
+            .unwrap()
+            > 0
+    );
+    for key in [id_key, rust] {
+        assert!(tombstones(&key) <= MAX_PODCAST_TOMBSTONES_PER_KEY);
+        let served = db
+            .records_by_key(key, vec![], NOW + 2, MAX_PODCAST_DHT_RECORDS)
+            .await
+            .unwrap();
+        assert!(
+            served.contains(&victim_tombstone),
+            "the revocation is served"
+        );
+        // It overrules a stale replica still holding the card.
+        let mut all = served;
+        all.push(victim_card.clone());
+        assert!(aggregate_hits(all).iter().all(|hit| {
+            hit.podcast_id != *victim_card.podcast_id()
+                || !hit.publishers.contains(&secret(1).public())
+        }));
+    }
 }
 
 #[tokio::test]
@@ -663,8 +854,8 @@ async fn sybil_tombstones_cannot_suppress_a_card() {
         written += db.store(chunk.to_vec(), NOW).await.unwrap();
     }
     assert_eq!(
-        written, MAX_PODCAST_TOMBSTONES_PER_KEY,
-        "only the id key's tombstone budget is used"
+        written, 256,
+        "each sybil tombstone takes a young sybil tombstone's place under the id key"
     );
 
     let by_id = db
@@ -726,36 +917,67 @@ async fn cache_enforces_publisher_record_and_byte_quotas() {
     let temp = tempfile::tempdir().unwrap();
     let db = open_db_with(&temp, limits).await;
     let show = |index: usize, key: &SecretKey| {
-        entry(&card_with(
+        card_with(
             spec(&format!("show-{index}.xml"), "Rust Radio"),
             key,
             1,
             NOW,
-        ))
+        )
     };
     let heavy = secret(1);
-    let stored: Vec<usize> = {
-        let mut out = Vec::new();
-        for index in 0..4 {
-            out.push(db.store(vec![show(index, &heavy)], NOW).await.unwrap());
-        }
-        out
-    };
-    assert!(stored[..3].iter().all(|written| *written > 0));
+    for index in 0..3 {
+        let record = show(index, &heavy);
+        assert!(
+            db.store(vec![entry(&record)], NOW + index as u64)
+                .await
+                .unwrap()
+                > 0
+        );
+    }
     assert_eq!(
-        stored[3], 0,
+        db.store(vec![entry(&show(3, &heavy))], NOW + 3)
+            .await
+            .unwrap(),
+        0,
         "the fourth podcast of one publisher is refused"
     );
     // A refresh of an admitted record is always accepted.
     let refresh = card_with(spec("show-0.xml", "Rust Radio"), &heavy, 1, NOW + 1);
-    assert!(db.store(vec![entry(&refresh)], NOW).await.unwrap() > 0);
-    assert!(db.store(vec![show(10, &secret(2))], NOW).await.unwrap() > 0);
-    assert!(db.store(vec![show(11, &secret(3))], NOW).await.unwrap() > 0);
-    assert_eq!(
-        db.store(vec![show(12, &secret(4))], NOW).await.unwrap(),
-        0,
-        "the cache holds at most five records"
+    assert!(db.store(vec![entry(&refresh)], NOW + 4).await.unwrap() > 0);
+    assert!(
+        db.store(vec![entry(&show(10, &secret(2)))], NOW + 10)
+            .await
+            .unwrap()
+            > 0
     );
+    assert!(
+        db.store(vec![entry(&show(11, &secret(3)))], NOW + 11)
+            .await
+            .unwrap()
+            > 0
+    );
+    assert_eq!(count_records(&temp).await, 5);
+
+    // The cache is full: every newcomer still gets in by evicting a random
+    // record of the younger half; the two oldest records always stay.
+    let rust = PodcastDhtKey::token(&network(), "rust");
+    for index in 0..6 {
+        let newcomer = show(20 + index, &secret(10 + index as u8));
+        assert!(
+            db.store(vec![entry(&newcomer)], NOW + 20 + index as u64)
+                .await
+                .unwrap()
+                > 0
+        );
+        assert_eq!(count_records(&temp).await, 5);
+        let cached = db
+            .records_by_key(rust, Vec::new(), NOW + 30, MAX_PODCAST_DHT_RECORDS)
+            .await
+            .unwrap();
+        assert!(cached.contains(&refresh));
+        assert!(cached.contains(&show(1, &heavy)));
+        assert!(cached.contains(&newcomer));
+    }
 
     let one = card(&secret(1), 1);
     let limits = store::StoreLimits {
@@ -764,25 +986,34 @@ async fn cache_enforces_publisher_record_and_byte_quotas() {
     };
     let temp = tempfile::tempdir().unwrap();
     let db = open_db_with(&temp, limits).await;
-    assert!(
-        db.store(vec![entry(&card(&secret(1), 1))], NOW)
-            .await
-            .unwrap()
-            > 0
-    );
-    assert!(
-        db.store(vec![entry(&card(&secret(2), 1))], NOW)
-            .await
-            .unwrap()
-            > 0
-    );
+    let id_key = PodcastDhtKey::podcast(&network(), one.podcast_id());
+    for (index, now) in [(1, NOW), (2, NOW + 1), (3, NOW + 2)] {
+        assert!(
+            db.store(vec![entry(&card(&secret(index), 1))], now)
+                .await
+                .unwrap()
+                > 0
+        );
+    }
+    // The byte budget holds two cards: the younger half of the two others
+    // (the second card) made room for the third.
     assert_eq!(
-        db.store(vec![entry(&card(&secret(3), 1))], NOW)
+        db.records_by_key(id_key, Vec::new(), NOW + 2, MAX_PODCAST_DHT_RECORDS)
             .await
-            .unwrap(),
-        0,
-        "the byte budget is full"
+            .unwrap()
+            .into_iter()
+            .map(|record| record.publisher())
+            .collect::<HashSet<_>>(),
+        HashSet::from([secret(1).public(), secret(3).public()])
     );
+    // A record larger than the whole budget evicts nothing.
+    let limits = store::StoreLimits {
+        bytes: one.encoded_len() - 1,
+        ..store::StoreLimits::default()
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db_with(&temp, limits).await;
+    assert_eq!(db.store(vec![entry(&one)], NOW).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -931,6 +1162,71 @@ fn replicas_only_accept_keys_they_are_close_to() {
     assert!(is_responsible(&own, &near[1..], &key));
 }
 
+fn contact_of(key: &SecretKey) -> NodeContact {
+    let peer = key.public();
+    NodeContact {
+        node_id: NodeId::from_endpoint(&peer),
+        peer_id: peer,
+        ticket: String::new(),
+        last_seen_ms: NOW,
+    }
+}
+
+#[test]
+fn refused_placements_fall_back_to_the_next_closest_nodes() {
+    let key = PodcastDhtKey::token(&network(), "rust");
+    let contacts: Vec<NodeContact> = (0..3 * K)
+        .map(|index| contact_of(&numbered_secret(index)))
+        .collect();
+    let mut by_distance = contacts.clone();
+    by_distance.sort_by_key(|contact| distance(contact.node_id.as_bytes(), key.as_bytes()));
+    // This node is the farthest one: it is no replica and no fallback.
+    let own = by_distance.pop().unwrap();
+    let others: Vec<NodeContact> = by_distance.clone();
+    let targets = replica_targets(own.clone(), others.clone(), &key);
+    assert!(!targets.local);
+    let ids = |contacts: &[NodeContact]| -> Vec<EndpointId> {
+        contacts.iter().map(|contact| contact.peer_id).collect()
+    };
+    assert_eq!(ids(&targets.primary), ids(&by_distance[..K]));
+    let mut fallback = targets.fallback.clone();
+    fallback.reverse();
+    assert_eq!(ids(&fallback), ids(&by_distance[K..2 * K]));
+
+    // Two refusals of one placement go to the two next closest nodes;
+    // another record's refusal has its own fallbacks.
+    let mut fallbacks = HashMap::from([
+        ((0, key), targets.fallback.clone()),
+        ((1, key), targets.fallback),
+    ]);
+    let retry = retry_plan(vec![(0, key), (0, key), (1, key)], &mut fallbacks);
+    let first = by_distance[K].peer_id;
+    let second = by_distance[K + 1].peer_id;
+    assert_eq!(retry.targets.len(), 2);
+    assert_eq!(
+        retry.targets[&first].1.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        retry.targets[&second].1.keys().copied().collect::<Vec<_>>(),
+        vec![0]
+    );
+    assert_eq!(fallbacks[&(0, key)].len(), K - 2);
+
+    // With this node among the closest it keeps a local replica and is never
+    // its own fallback.
+    let targets = replica_targets(by_distance[0].clone(), others, &key);
+    assert!(targets.local);
+    assert_eq!(targets.primary.len(), K - 1);
+    assert!(
+        targets
+            .fallback
+            .iter()
+            .chain(&targets.primary)
+            .all(|contact| contact.peer_id != by_distance[0].peer_id)
+    );
+}
+
 #[test]
 fn inbound_requests_are_limited_per_peer() {
     let inflight = Arc::new(Mutex::new(HashMap::new()));
@@ -946,21 +1242,50 @@ fn inbound_requests_are_limited_per_peer() {
 }
 
 #[test]
-fn lookups_keep_a_bounded_number_of_owners() {
+fn lookups_give_each_response_a_bounded_share_of_owners() {
     let mut winners = HashMap::new();
     let id_key = PodcastDhtKey::podcast(&network(), card(&secret(1), 1).podcast_id());
-    let records: Vec<_> = (0..=MAX_PODCAST_LOOKUP_RECORDS)
-        .map(|index| {
-            card_with(
-                spec("show.xml", "Rust Radio"),
-                &numbered_secret(index),
-                1,
-                now_ms(),
-            )
-        })
-        .collect();
-    let first = records[0].clone();
-    merge_records(&mut winners, records, &network(), &id_key, &[]);
+    let response = |first: usize| -> Vec<SignedPodcastRecord> {
+        (first..first + MAX_PODCAST_DHT_RECORDS)
+            .map(|index| {
+                card_with(
+                    spec("show.xml", "Rust Radio"),
+                    &numbered_secret(index),
+                    1,
+                    now_ms(),
+                )
+            })
+            .collect()
+    };
+    // Four attacker responders answer first, each with 128 sybil owners.
+    for responder in 0..4 {
+        merge_records(
+            &mut winners,
+            response(10_000 + responder * MAX_PODCAST_DHT_RECORDS),
+            &network(),
+            &id_key,
+            &[],
+        );
+    }
+    assert_eq!(winners.len(), 4 * MAX_PODCAST_LOOKUP_OWNERS_PER_RESPONSE);
+    // An honest replica answering later still contributes its owners.
+    let honest = response(0);
+    let victim = honest[0].clone();
+    merge_records(&mut winners, honest, &network(), &id_key, &[]);
+    let owner = (victim.podcast_id().clone(), victim.publisher());
+    assert_eq!(winners[&owner], victim);
+    assert_eq!(winners.len(), 5 * MAX_PODCAST_LOOKUP_OWNERS_PER_RESPONSE);
+
+    // The lookup as a whole stays bounded.
+    for responder in 0..8 {
+        merge_records(
+            &mut winners,
+            response(20_000 + responder * MAX_PODCAST_DHT_RECORDS),
+            &network(),
+            &id_key,
+            &[],
+        );
+    }
     assert_eq!(winners.len(), MAX_PODCAST_LOOKUP_RECORDS);
     // A newer record of a known owner still replaces its winner.
     let newer = card_with(
@@ -970,7 +1295,6 @@ fn lookups_keep_a_bounded_number_of_owners() {
         now_ms(),
     );
     merge_records(&mut winners, vec![newer.clone()], &network(), &id_key, &[]);
-    let owner = (first.podcast_id().clone(), first.publisher());
     assert_eq!(winners[&owner], newer);
 }
 
