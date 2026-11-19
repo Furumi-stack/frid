@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — podcast discovery (`podcast_dht`)
+
+- `music-dht 0.6.0`: new `music_dht::podcast_dht` overlay for public podcast
+  discovery on its own ALPN `furumi-fd/podcast-dht/1` (version 1) and its own
+  SQLite cache: signed `PodcastCard`s and `PodcastTombstone`s
+  (`furumi-podcast-card:v1` / `furumi-podcast-card-tombstone:v1` canonical
+  signing input), monotonic revisions with a total tie-break, text and id
+  keys, `PodcastDht::{publish, unpublish, sync_shares, republish, search,
+  lookup_podcast}` gated by `effective_share`, typed search hits
+  (`PodcastSearchHit`, `FederatedSearchHit`, `SearchHitKind`,
+  `merge_search_results`) and the advisory `feed_url_privacy_warning`.
+- `music-dht 0.6.0`: capability manifests advertise `podcast_dht = 1`
+  (`capabilities::PODCAST_DHT_ID`, `CapabilityManifest::protocol_version`,
+  `CapabilityManifest::supports_podcast_dht`); applications that do not run
+  the overlay must remove it with `without_protocol`.
+- `music-dht 0.6.0`: new `MusicDhtError::PodcastPublication` variant (the enum
+  is `#[non_exhaustive]`).
+- The music DHT (`music-dht-v5`), `federation-net` and device-sync protocol v4
+  are unchanged. See "Public discovery (podcast_dht)" in `PODCASTS.md`.
+
 ## Unreleased — podcast contract
 
 - `music-dht 0.6.0` (breaking): new `music_dht::podcast` module with the shared

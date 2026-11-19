@@ -232,8 +232,28 @@ refused, and their playback commands are ignored while the queue contains
 episodes. Jam snapshots replace episodes with opaque placeholders. Progress,
 subscription and share registers order by a Lamport generation before
 wall-clock `hlc_ms`, so a device with a fast clock cannot undo an observed
-seek, restart, unsubscribe or share decision. Public podcast discovery is a future
-separate overlay; the music DHT schema and `federation-net` are unchanged.
+seek, restart, unsubscribe or share decision. The music DHT schema and
+`federation-net` are unchanged.
+
+Public podcast discovery is a third schema-independent Kademlia overlay,
+`music_dht::podcast_dht` (ALPN `furumi-fd/podcast-dht/1`, version 1,
+capability `podcast_dht`), built like the similarity-routing overlay. A
+device publishes a card only for podcasts whose merged registers satisfy
+`effective_share`; `sync_shares` reconciles publications declaratively and
+nothing is sent for a podcast the device never published. A card is the
+public projection of a podcast (feed URL and channel metadata, no personal
+state), signed by the device's iroh identity over a domain-separated
+canonical encoding and bound to its id by the URL the id hashes from. Cards
+live under the podcast-id key and one key per normalized title/author token;
+unpublishing writes a signed tombstone of the next revision that supersedes
+lower and equal revisions under every key and outlives every older card.
+Records use the music DHT's active/tombstone TTLs and republish cadence, are
+verified on every receive and cache read, and are kept in a separate,
+replaceable SQLite cache. Search filters on every replica by all query tokens,
+merges cards of one podcast across publisher devices, and returns typed
+`podcast` hits that clients merge with music results. Capability data only
+helps skip peers; it never authorizes. See the "Public discovery" section of
+[PODCASTS.md](PODCASTS.md).
 
 Music discovery identifies an owner and content; it does not force all domain
 traffic through DHT messages. `music-dht` exposes the underlying authenticated

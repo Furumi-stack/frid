@@ -10,8 +10,9 @@ live in `music_dht::podcast` (pure types and functions) and
 `music_dht::device_sync` (wire DTOs and gating helpers). Clients must use
 them instead of local copies.
 
-Public discovery (signed podcast cards in a separate DHT overlay) is not part
-of this version of the contract; it will be specified with the overlay.
+Public discovery of podcasts a user explicitly shared uses signed podcast
+cards in a separate DHT overlay, `music_dht::podcast_dht`; see
+[Public discovery (podcast_dht)](#public-discovery-podcast_dht).
 
 ## Responsibilities
 
@@ -19,6 +20,7 @@ of this version of the contract; it will be specified with the overlay.
 | --- | --- |
 | `music_dht::podcast` | ids, URL canonicalization, no-GUID rule, metadata DTOs and bounds, merge functions, RSS/Atom parser (feature `podcast-feed`) |
 | `music_dht::device_sync` | sync operation kinds, snapshot sections, `PlaybackSource`, version gating, Jam redaction |
+| `music_dht::podcast_dht` | public podcast cards and tombstones, their signatures, replication, cache and search, privacy warnings for feed URLs |
 | Client storage (`furumi_library::podcasts::PodcastStore`, web PostgreSQL) | persistence and migrations implementing the rules below (SQLite reference: see "SQLite reference store") |
 | Client runtime | HTTP fetching, conditional requests, scheduling, audio buffering and decoding, UI |
 
@@ -32,7 +34,7 @@ offered for P2P transfer. RSS refreshes fetch metadata only.
 | --- | --- | --- | --- |
 | Subscription state, channel metadata | `podcast_subscription_set` + snapshot | never | |
 | Feed aliases | `podcast_feed_aliases_added`, `podcast_subscription_set` + snapshot | never | |
-| Share decision | `podcast_share_set` + snapshot | only the published card (future overlay) | |
+| Share decision | `podcast_share_set` + snapshot | only the signed card while `effective_share` holds (`podcast_dht`) | |
 | Episode progress | `podcast_progress_set` + snapshot | never | |
 | Listening sessions, play counts | `podcast_listen_recorded` + snapshot | never | |
 | Episode catalog | each device parses RSS itself; `PodcastEpisodeRef` travels with progress and queue items | never | |
@@ -498,6 +500,213 @@ Jam participants are outside the trusted-device group.
   private item. States that drop, duplicate or inject private items are
   rejected. Participants may still pause, seek and reorder music.
 
+## Public discovery (podcast_dht)
+
+`music_dht::podcast_dht` publishes podcasts the user explicitly shared so
+that peers outside the user's trusted-device group can find and subscribe to
+them. It is a separate, schema-independent Kademlia overlay built like
+`similarity_dht`: its own ALPN, version, routing contacts and SQLite cache.
+The music DHT (`music-dht-v5`) and `federation-net` are unchanged. Every
+device of a user publishes under its own identity; search merges the cards
+of one podcast by `podcast_id`.
+
+| Item | Value |
+| --- | --- |
+| ALPN | `furumi-fd/podcast-dht/1` (schema-independent stream protocol) |
+| Wire and record version | `PODCAST_DHT_PROTOCOL_VERSION = 1` |
+| Capability manifest | `podcast_dht = 1` (`CapabilityManifest::supports_podcast_dht`) |
+| Cache | separate SQLite file, `PRAGMA user_version = 1`; a newer schema is refused |
+| Card TTL | `ACTIVE_RECORD_TTL` of the music DHT (12 h) |
+| Tombstone TTL | `TOMBSTONE_TTL` of the music DHT (24 h) |
+| Republish | `DEFAULT_REPUBLISH_INTERVAL` (10 min), expiry sweep `DEFAULT_EXPIRE_INTERVAL` (1 min) |
+| Clock skew | `issued_at_ms` at most 5 min in the future |
+
+### Card
+
+A card is the public projection of one podcast by one publisher device. It
+is built from the subscription with `PodcastCardSpec::from_subscription`,
+which reads only the podcast id, the feed URLs and the channel metadata. It
+never contains progress, listening history, play counts, subscription or
+share registers (`generation`, `hlc_ms`, `op_id`), device names, local paths,
+HTTP validators or episodes.
+
+| Field | Bound |
+| --- | --- |
+| `version`, `network_id`, `publisher` | 1, the federation network, the device's iroh endpoint key |
+| `podcast_id` | must equal `PodcastId::from_feed_url(id_feed_url or feed_url)` |
+| `feed_url` | canonical `FeedUrl` the feed is fetched from |
+| `id_feed_url` | the URL the id was derived from, present only when it differs from `feed_url` (feed moved) |
+| `title` | 1..300 characters, no control characters |
+| `author` | optional, ≤ 300 characters, no control characters |
+| `description` | optional, ≤ 1 000 characters, only `\n`/`\t` controls |
+| `image_url`, `link` | optional absolute `http(s)` URLs ≤ 2 048 bytes |
+| `language` | optional, ≤ 35 bytes of ASCII letters, digits and `-` |
+| `categories` | ≤ 8, each 1..64 characters, no control characters |
+| `episode_count`, `latest_episode_at_ms` | optional; the time is ≥ 0 |
+| `revision` | ≥ 1, monotonic per `(podcast_id, publisher)` |
+| `issued_at_ms`, `expires_at_ms` | `0 < issued < expires ≤ issued + 12 h` |
+
+`PodcastCardSpec::bounded` truncates publisher data to these bounds. The
+whole signed record is at most 24 KiB postcard-encoded; the field bounds keep
+every valid card below it.
+
+Binding the id to a URL in the card prevents claiming an existing podcast id
+for an arbitrary feed. When a feed moved, `feed_url` is the publisher's
+claim; clients should prefer their own subscription's URLs for a podcast
+they already know.
+
+### Tombstone
+
+`(version, network_id, publisher, podcast_id, revision, issued_at_ms,
+expires_at_ms, index_keys)` with `expires_at_ms ≤ issued_at_ms + 24 h` and
+`index_keys` the sorted, distinct text keys of the retracted card (at most
+32, without the podcast-id key). It carries key hashes, not the title. A
+tombstone supersedes every card of the same `(podcast_id, publisher)` with a
+lower or equal revision and is itself retained and served until it expires.
+Because the tombstone TTL exceeds the card TTL, every card issued before a
+tombstone expires before it.
+
+### Signing input
+
+Both records are signed with the publisher's Ed25519 iroh identity over a
+canonical, language-independent encoding: the domain string, a `0x00` byte,
+then the fields in the order listed. Integers are little-endian (`u16`,
+`u32`, `u64`, `i64`); strings are a `u32` byte length followed by UTF-8;
+`Option` is `0x00`, or `0x01` followed by the value; lists are a `u32` count
+followed by the items; `network_id`, `publisher` and keys are their raw 32
+bytes.
+
+* Card, domain `furumi-podcast-card:v1`: `version u16, network_id, publisher,
+  podcast_id str, feed_url str, id_feed_url opt str, title str, author opt
+  str, description opt str, image_url opt str, link opt str, language opt
+  str, categories list of str, episode_count opt u32, latest_episode_at_ms
+  opt i64, revision u64, issued_at_ms u64, expires_at_ms u64`.
+* Tombstone, domain `furumi-podcast-card-tombstone:v1`: `version u16,
+  network_id, publisher, podcast_id str, revision u64, issued_at_ms u64,
+  expires_at_ms u64, index_keys list of 32-byte keys`.
+
+Unit tests pin BLAKE3 vectors of both encodings. On the wire, records are
+postcard `SignedPodcastRecord { body: Card | Tombstone, signature }`.
+
+### Keys and placement
+
+`key = BLAKE3("furumi-podcast-dht:key:v1" || 0x00 || network_id || kind ||
+material)` with kind `0x01` and the podcast id string for the id key, or
+kind `0x02` and a token for a text key. Tokens are the distinct
+`normalize_name` tokens of the title, then of the author, skipping tokens
+longer than 64 bytes, at most 32. A card is stored under the id key and its
+text keys (at most 33); a tombstone under the id key and its `index_keys`.
+Replicas accept a record only under a key derived from it.
+
+### Ordering
+
+For one `(podcast_id, publisher)` the greater record wins: higher
+`revision`; at an equal revision a tombstone beats a card; then later
+`issued_at_ms` (a republish); then later `expires_at_ms`; then the
+lexicographically greater signing input. This is a total order, so every
+replica converges whatever the delivery order. A replica that holds a
+tombstone, or a card of a higher revision, under any key drops older cards of
+that publisher under every key and refuses them later; a replayed old
+revision is therefore ignored.
+
+Revisions: a changed card gets `max(previous + 1, now_ms)` (time-seeded, so
+revisions stay monotonic even if the local cache is lost); an unchanged card
+is re-signed with the same revision and a fresh lifetime on every republish;
+unpublishing writes a tombstone with `previous + 1`; publishing again later
+gets `max(tombstone + 1, now_ms)`.
+
+### Publication
+
+* `PodcastDht::publish(subscription, share, card)` refuses
+  (`MusicDhtError::PodcastPublication`) unless `effective_share` holds, so a
+  new or resumed subscription is never published without a fresh share
+  decision.
+* `PodcastDht::sync_shares(states)` is declarative and idempotent: podcasts
+  for which `effective_share` holds are published (when changed, new or past
+  half their lifetime), every other podcast this device published is
+  unpublished. Clients call it after applying share or subscription
+  operations, so unsharing or unsubscribing on any trusted device revokes
+  every device's own card once the registers converge, and a stale device
+  cannot republish (its registers lose to the newer share decision).
+* `PodcastDht::unpublish(podcast_id)` writes the tombstone. Nothing is ever
+  sent for a podcast this device never published: no tombstone, no id.
+* `PodcastDht::republish` (run by `maintenance`) re-signs active cards and
+  re-sends unexpired tombstones every 10 minutes.
+* Before publishing, the UI must call `feed_url_privacy_warning` (or
+  `PodcastCardSpec::privacy_warnings`, which also checks `id_feed_url`) and
+  ask the user when it returns a warning. The heuristics are advisory: query
+  parameter names containing words such as `token`, `key`, `auth`, `secret`,
+  `sig`/`signature`, `uid`, `user`, `pass`, `session`, `access`, `private`;
+  known member-feed hosts; and long high-entropy query values (≥ 16
+  characters) or path segments (≥ 32 characters). False positives and misses
+  are possible.
+
+### Search
+
+* `PodcastDht::search(query, limit)` normalizes the query
+  (`podcast_query_tokens`: distinct tokens, at most 8), looks up the text
+  keys of the three longest tokens and asks every replica to return only
+  cards indexed under **all** query tokens (tombstones are always returned).
+  Results are verified again, the winning record per publisher is kept,
+  tombstoned publishers are dropped and cards are merged by `podcast_id`
+  into `PodcastSearchHit { podcast_id, card, publishers }`. Ranking: exact
+  normalized title first, then more publishers.
+* `PodcastDht::lookup_podcast(podcast_id)` reads the id key.
+* `publishers` lists distinct publisher **devices**; it is not a subscriber
+  count (one user may publish from several devices, and subscribers who did
+  not share are invisible), so no subscriber count is offered.
+* The representative card is the one whose `feed_url` most publishers agree
+  on, then the most recently issued, then the greatest publisher key.
+* `FederatedSearchHit` (`{"type": "music" | "podcast", "hit": ...}`),
+  `SearchHitKind` (`artist`, `release`, `track`, `podcast`) and
+  `merge_search_results` merge podcast hits with `SearchOutcome` music
+  results; `SearchOutcome` itself is unchanged.
+* Lookups query the 8 closest overlay nodes (α = 3, at most 32 requests,
+  15 s deadline) and return partial results when peers fail. A peer that
+  fails a request is skipped for 30 s.
+
+Subscribing from a hit creates the user's own private subscription: resolve
+the id with `resolve_podcast_id` on the card's `id_feed_url` (or `feed_url`),
+which yields the card's `podcast_id` unless the user already knows that URL,
+fetch the feed from `feed_url` and record it as an alias when it differs. The
+new subscription is private (see `effective_share`), the publisher's
+availability is not needed afterwards, and the episode catalog comes from RSS.
+
+### Limits
+
+| Limit | Value |
+| --- | --- |
+| Request / response | 512 KiB / 4 MiB postcard |
+| Store batch | 1..16 entries, each 1..33 distinct keys |
+| Records per `FindValue` response | 128 |
+| Filter tokens | ≤ 8, each 1..64 bytes |
+| Records cached per key | 256; the record expiring first is evicted for a longer-lived one |
+| Concurrent inbound requests | 64 (more are dropped); 10 s per request |
+| Error message | ≤ 1 KiB |
+| Contact ticket | ≤ 16 KiB |
+
+### Privacy guarantees
+
+* Only podcasts with `effective_share` are published; never-shared podcasts
+  produce no network traffic at all.
+* Cards carry the public projection only (see Card); tombstones carry key
+  hashes only.
+* Records are signed by the publisher device and verified on every receive
+  and on every cache read; a forwarder cannot alter or impersonate them, and
+  records from another network are rejected.
+* Cards do not carry a connection ticket: discovering a card does not reveal
+  how to reach the publisher, and subscribing never contacts it.
+* The publisher's device key is public in the card. Devices of one user are
+  not linked by the overlay, but publishing the same podcasts from several
+  devices makes them correlatable.
+* Unpublishing is eventually consistent: replicas that missed the tombstone
+  keep serving the old card until it expires (at most 12 h). A replica that
+  only held text keys of an older revision (after a title change) may serve
+  that revision until it expires.
+* Capability manifests are informational. A peer without `podcast_dht` never
+  enters the overlay routing table (it cannot answer on the ALPN), and
+  `PodcastDht::note_peer_capabilities` evicts a peer whose manifest lacks it.
+
 ## Feed parser
 
 With the `podcast-feed` feature, `music_dht::podcast::feed` parses RSS 2.0,
@@ -667,5 +876,8 @@ must keep the same invariants.
 * Feed URL canonicalization, the identity bounds (`MAX_URL_BYTES`,
   `MAX_GUID_BYTES`) and the no-GUID rule are frozen with the `v1` domains:
   receivers reject non-canonical ids and URLs while parsing.
-* Public podcast cards will use a separate signed overlay with its own ALPN
-  and version; the music DHT schema and `federation-net` do not change.
+* Public podcast cards use the separate signed overlay `podcast_dht` with
+  its own ALPN (`furumi-fd/podcast-dht/1`), wire/record version 1, signing
+  domains `furumi-podcast-card:v1` / `furumi-podcast-card-tombstone:v1`, key
+  domain `furumi-podcast-dht:key:v1` and cache schema 1, all frozen; the music
+  DHT schema and `federation-net` do not change.

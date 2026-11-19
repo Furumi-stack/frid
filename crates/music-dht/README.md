@@ -250,6 +250,21 @@ reported itself (`profile_protocol_version`; relayed profiles go through
 `jam::redact_jam_snapshot`, `jam_command_allowed` and
 `restore_jam_private_items`.
 
+### Public podcast discovery
+
+`music_dht::podcast_dht::PodcastDht` is a separate signed overlay (ALPN
+`furumi-fd/podcast-dht/1`, capability `podcast_dht`) for podcasts the user
+explicitly shared. Declare the ALPN with
+`schema_independent_stream_protocol`, open the overlay with its own cache file,
+and spawn `serve` and `maintenance`, as for `SimilarityDht`. Call
+`sync_shares` with the merged subscription and share registers after applying
+sync operations: it publishes cards only where `effective_share` holds and
+tombstones every other own publication. Ask the user before publishing when
+`PodcastCardSpec::privacy_warnings` (or `feed_url_privacy_warning`) reports a
+URL that looks private. `search` and `lookup_podcast` return
+`PodcastSearchHit`s; `merge_search_results` combines them with
+`SearchOutcome::network_results` as typed `FederatedSearchHit`s.
+
 ## Verification
 
 ```bash
