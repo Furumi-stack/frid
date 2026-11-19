@@ -251,9 +251,12 @@ per normalized title/author token; unpublishing writes a signed tombstone of
 the next revision that supersedes lower and equal revisions on replicas that
 hold it, for the keys it lists, and outlives every older card. Only a record's
 publisher may store it; replicas keep one payload per publisher and podcast,
-admit placements only for keys they are close to, within per-key,
-per-publisher and total budgets, and never evict existing records for
-newcomers (tombstones cannot displace cards). Records use the music DHT's
+admit placements only for keys they are close to (counting only contacts that
+answered or authenticated, never ones another peer suggested), within per-key,
+per-publisher and total budgets. A key holds no more records than one response
+carries; a full key or cache admits a newcomer by evicting a random record from
+its younger half, so the older half survives floods and capacity is never
+first-come-forever (over their budget, tombstones only displace other tombstones). Records use the music DHT's
 active/tombstone TTLs and republish cadence, are verified on every receive and
 cache read, and are kept in a separate, replaceable SQLite cache. Search
 filters on every replica by all query tokens, merges cards of one podcast

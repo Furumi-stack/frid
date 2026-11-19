@@ -14,9 +14,12 @@
   `feed_url_privacy_warning`.
 - Replicas accept records only from their publisher, store one payload per
   `(podcast_id, publisher)`, admit placements only for keys they are close to
-  and within per-key, per-publisher and total budgets, and never evict
-  existing records for newcomers. Search offers only the URL the podcast id
-  hashes from; moved-feed URLs are reported as unverified claims.
+  (counting verified contacts only) and within per-key, per-publisher and
+  total budgets. A key never holds more than one response carries; full keys
+  and caches admit newcomers by evicting random records from their younger
+  half. Lookups give each response a bounded share of owners. Search offers
+  only the URL the podcast id hashes from; moved-feed URLs are reported as
+  unverified claims.
 - `sync_shares` is fail-safe for revocation (per-podcast `failed`) and holds
   back cards with privacy warnings until confirmed (`held_back`,
   `PodcastShareState::privacy_confirmed`).

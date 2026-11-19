@@ -650,7 +650,10 @@ Fields are in postcard order. `PodcastDhtKey` is 32 raw bytes.
   authenticated transport peer, `node_id` must be `NodeId::from_endpoint`
   of it and its ticket must name the same endpoint and network; otherwise the
   request is refused. The responder learns the requester as an overlay
-  contact.
+  contact (it is authenticated).
+* `nodes` in a response are unverified suggestions. A requester treats them
+  as lookup or bootstrap candidates only and adds one to its routing table
+  (and persisted contacts) only after it answered a request itself.
 * `FindNode` returns the `K` closest overlay contacts (the responder
   included).
 * `FindValue` returns the records under `key` (see Replica storage) and the
@@ -663,7 +666,9 @@ Fields are in postcard order. `PodcastDhtKey` is 32 raw bytes.
   records), pass `verify_at` (bounds, network, lifetime, clock skew,
   signature, size) and belong under each listed key; otherwise the whole
   batch is refused. Keys the responder is not responsible for are skipped.
-  `stored` counts the `(key, record)` placements written.
+  `stored` counts the `(key, record)` placements written. A publisher
+  offers the placements of a batch answered with `stored = 0` (or that
+  failed) once to the next closest node of each key.
 * A refused request gets `ok = false` with an `error` of at most 1 KiB and
   empty `nodes`, `records` and `stored = 0`; an accepted one has `ok = true`
   and no `error`. Requesters reject responses that violate this or exceed
@@ -676,17 +681,34 @@ Fields are in postcard order. `PodcastDhtKey` is 32 raw bytes.
   it in place; placements the new version no longer belongs under (an old
   title's tokens, keys a tombstone does not list) are dropped, so on one
   replica a tombstone supersedes the card under every key it held.
-* A node accepts a placement only when fewer than `2 * K` of its known
-  overlay contacts are closer to the key than itself.
-* Admission, never eviction: a key holds at most 256 records. A full key
-  admits no new `(podcast_id, publisher)` until one expires; existing records
-  keep their place and their publishers refresh them in place. A tombstone
-  is indexed under a text key only in place of its owner's record there; new
-  tombstones under a key (in practice the id key, for cards this replica
-  never saw) are limited to 32.
-* A replica holds at most 256 records per publisher, 4 096 records and
-  32 MiB of payload; records beyond that are refused, not evicted. At most
-  1 024 overlay contacts are persisted.
+* A node accepts a placement only when fewer than `2 * K` of its verified
+  overlay contacts that are not backed off are closer to the key than
+  itself. Contacts only enter the routing table by answering a request or
+  by sending one, so a peer cannot make a replica refuse keys by returning
+  made-up contacts. A contact that fails three times in a row (each after
+  its 30 s backoff) is removed.
+* A key holds at most 128 records, at most 32 of them tombstones: exactly
+  what one `FindValue` response carries, so every admitted record is served.
+  A tombstone is indexed under a text key only in place of its owner's
+  record there, and such an in-place conversion counts against the
+  tombstone budget like a new tombstone.
+* Full key: a new placement evicts a random placement of another owner from
+  the younger half of the key (by first indexing time; only tombstones when
+  the tombstone budget is full). The older half is never evicted for a
+  newcomer, so records placed before a flood keep their place and their
+  publishers refresh them in place. Capacity is never first-come-forever:
+  a newcomer always gets a place, though placements in the younger half can
+  be evicted again by later newcomers.
+* A replica holds at most 256 records per publisher (a publisher over it is
+  refused), 4 096 records and 32 MiB of payload. A full cache admits a new
+  record by evicting random records of other owners from its younger half,
+  at most 16; when that is not enough room, nothing is evicted and the record
+  is refused. At most 1 024 overlay contacts are persisted.
+* Device identities cost nothing, so these rules bound flooding but cannot
+  prevent it: an attacker with many identities can keep part of the younger
+  half of a key or cache busy, and a newcomer's place there can be evicted
+  again until its publisher's next republish (every 10 min) puts it back.
+  Protocol 1 has no proof of work or other identity cost.
 * `FindValue` answers with at most 128 records: at most 32 tombstones and
   the cards indexed longest first. Every record is verified again on every
   read.
@@ -764,9 +786,12 @@ Fields are in postcard order. `PodcastDhtKey` is 32 raw bytes.
   `merge_search_results` merge podcast hits with `SearchOutcome` music
   results; `SearchOutcome` itself is unchanged.
 * Lookups query the 8 closest overlay nodes (α = 3, at most 32 requests,
-  15 s deadline), keep at most 512 `(podcast_id, publisher)` records each and
-  return partial results when peers fail. A peer that fails a request is
-  skipped for 30 s.
+  15 s deadline) and return partial results when peers fail. They keep at
+  most 512 `(podcast_id, publisher)` owners; each response (and the local
+  cache) may add at most 64 new owners (`512 / K`), so the responders that
+  answer first cannot fill a lookup and crowd out the rest. A newer record
+  of a known owner always replaces its winner. A peer that fails a request
+  is skipped for 30 s.
 
 Subscribing from a hit creates the user's own private subscription with the
 hit's `feed_url` (the origin URL): resolve the id with `resolve_podcast_id`,
@@ -785,10 +810,10 @@ is not needed afterwards, and the episode catalog comes from RSS.
 | Store batch | 1..16 entries, each 1..33 distinct keys, records of the requester only |
 | Records per `FindValue` response | 128, at most 32 of them tombstones |
 | Filter tokens | ≤ 8, each 1..64 bytes |
-| Records per key | 256 (new tombstones 32); admission only, no eviction |
-| Records per replica | 256 per publisher, 4 096 in all, 32 MiB of payload |
-| Store responsibility | fewer than `2 * K` = 16 known contacts closer to the key |
-| Records kept per lookup | 512 `(podcast_id, publisher)` |
+| Records per key | 128, at most 32 of them tombstones; random eviction from the younger half |
+| Records per replica | 256 per publisher (refused beyond), 4 096 in all, 32 MiB of payload (random eviction from the younger half, at most 16 per record) |
+| Store responsibility | fewer than `2 * K` = 16 verified, not backed-off contacts closer to the key |
+| Records kept per lookup | 512 `(podcast_id, publisher)`, at most 64 new ones per response |
 | Persisted overlay contacts | 1 024 |
 | Inbound requests | 64 concurrent, 8 per peer (more are dropped); 10 s each |
 | Error message | ≤ 1 KiB |
