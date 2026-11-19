@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use music_dht::device_sync::SyncOpPayload;
 use music_dht::podcast::feed::ParsedFeed;
-use music_dht::podcast::{EpisodeId, EpisodeMeta, FeedUrl, PodcastId, merge_feed_aliases};
+use music_dht::podcast::{
+    EpisodeId, EpisodeIdentityHints, EpisodeMeta, FeedUrl, KnownEpisode, PodcastId,
+    merge_feed_aliases, resolve_episode_ids,
+};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
 use super::apply::{self, EpisodeSource};
@@ -79,6 +82,32 @@ fn podcast_fetch_url(conn: &Connection, podcast_id: &PodcastId) -> Result<Option
         .optional()?)
 }
 
+fn fetch_state_in(conn: &Connection, podcast_id: &PodcastId) -> Result<FetchState> {
+    Ok(conn
+        .query_row(
+            "SELECT etag, last_modified, checked_at_ms, last_success_at_ms,
+                    next_check_at_ms, last_error, consecutive_failures, cover_url,
+                    cover_path
+               FROM podcast_fetch_state WHERE podcast_id = ?1",
+            [podcast_id.as_str()],
+            |row| {
+                Ok(FetchState {
+                    etag: row.get(0)?,
+                    last_modified: row.get(1)?,
+                    checked_at_ms: row.get(2)?,
+                    last_success_at_ms: row.get(3)?,
+                    next_check_at_ms: row.get(4)?,
+                    last_error: row.get(5)?,
+                    consecutive_failures: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
+                    cover_url: row.get(7)?,
+                    cover_path: row.get(8)?,
+                })
+            },
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
 fn has_personal_state(conn: &Connection, episode_id: &EpisodeId) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM episode_progress WHERE episode_id = ?1)
@@ -134,6 +163,119 @@ fn rekey_legacy_guids(conn: &Connection, podcast_id: &PodcastId, feed: &ParsedFe
         )?;
     }
     Ok(())
+}
+
+/// Episodes imported from the prototype without a GUID (`legacy_guid` set)
+/// that carry no progress and no session.
+///
+/// Their ids were resolved over every stored prototype row at once, stale
+/// rows included, so they may differ from what a fresh device derives from
+/// the current feed. They are provisional until a refresh confirms them.
+fn provisional_episode_ids(
+    conn: &Connection,
+    podcast_id: &PodcastId,
+) -> Result<BTreeSet<EpisodeId>> {
+    let mut statement = conn.prepare(
+        "SELECT e.episode_id FROM episodes e
+          WHERE e.podcast_id = ?1 AND e.legacy_guid IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM episode_progress p WHERE p.episode_id = e.episode_id)
+            AND NOT EXISTS (SELECT 1 FROM podcast_listen_sessions s
+                             WHERE s.episode_id = e.episode_id)",
+    )?;
+    let ids = statement
+        .query_map([podcast_id.as_str()], |row| {
+            super::episode_id_col(row.get(0)?)
+        })?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(ids)
+}
+
+/// Resolves the ids of the feed items as a device without prototype history
+/// would, and moves provisional imported episodes onto them.
+///
+/// * The ids come from the contract identity rule against every stored
+///   episode except the provisional ones (episodes from earlier refreshes,
+///   from sync, and imported ones that already carry personal state).
+/// * Each provisional episode is matched to the item it was imported from
+///   with the same rule (enclosure, then link, then date and title; GUIDs
+///   ignored, since the prototype may have stored the enclosure URL as GUID)
+///   and re-keyed to that item's id unless another stored episode already
+///   holds it. Unmatched provisional episodes stay as they are (not in the
+///   feed); the next refresh that lists them re-keys them.
+///
+/// Provisional episodes have no progress and no session, so no personal
+/// state moves. The refresh then clears `legacy_guid` on every episode it
+/// lists, which makes their ids final.
+fn resolve_and_rekey_provisional(
+    conn: &Connection,
+    podcast_id: &PodcastId,
+    feed: &ParsedFeed,
+) -> Result<Vec<Option<EpisodeId>>> {
+    let known = apply::known_episodes(conn, podcast_id)?;
+    let provisional = provisional_episode_ids(conn, podcast_id)?;
+    if provisional.is_empty() {
+        return Ok(feed.resolve_episode_ids(podcast_id, &known));
+    }
+    let (provisional_known, stable_known): (Vec<KnownEpisode>, Vec<KnownEpisode>) = known
+        .into_iter()
+        .partition(|episode| provisional.contains(&episode.episode_id));
+    let ids = feed.resolve_episode_ids(podcast_id, &stable_known);
+
+    let guidless: Vec<EpisodeIdentityHints> = feed
+        .identity_hints()
+        .into_iter()
+        .map(|hints| EpisodeIdentityHints {
+            guid: None,
+            ..hints
+        })
+        .collect();
+    let matches = resolve_episode_ids(
+        podcast_id,
+        feed.link.as_deref(),
+        &guidless,
+        &provisional_known,
+    );
+    let mut moves: Vec<(EpisodeId, EpisodeId)> = matches
+        .into_iter()
+        .zip(&ids)
+        .filter_map(|(matched, target)| {
+            let matched = matched.filter(|id| provisional.contains(id))?;
+            let target = target.clone()?;
+            (matched != target).then_some((matched, target))
+        })
+        .collect();
+    // A target held by an episode that does not move away blocks the move.
+    let occupied: BTreeSet<EpisodeId> = stable_known
+        .iter()
+        .chain(&provisional_known)
+        .map(|episode| episode.episode_id.clone())
+        .collect();
+    loop {
+        let leaving: BTreeSet<&EpisodeId> = moves.iter().map(|(from, _)| from).collect();
+        let blocked: BTreeSet<EpisodeId> = moves
+            .iter()
+            .filter(|(_, to)| occupied.contains(to) && !leaving.contains(to))
+            .map(|(from, _)| from.clone())
+            .collect();
+        if blocked.is_empty() {
+            break;
+        }
+        moves.retain(|(from, _)| !blocked.contains(from));
+    }
+    // Two phases, so a move may take an id another move vacates.
+    for (index, (from, _)) in moves.iter().enumerate() {
+        conn.execute(
+            "UPDATE episodes SET episode_id = ?2 WHERE episode_id = ?1",
+            params![from.as_str(), format!("rekey-pending:{index}")],
+        )?;
+    }
+    for (index, (_, to)) in moves.iter().enumerate() {
+        conn.execute(
+            "UPDATE episodes SET episode_id = ?2 WHERE episode_id = ?1",
+            params![format!("rekey-pending:{index}"), to.as_str()],
+        )?;
+    }
+    Ok(ids)
 }
 
 fn upsert_feed_episode(conn: &Connection, meta: &EpisodeMeta, now: i64) -> Result<Option<bool>> {
@@ -215,8 +357,7 @@ impl PodcastStore {
         };
 
         rekey_legacy_guids(&tx, podcast_id, feed)?;
-        let known = apply::known_episodes(&tx, podcast_id)?;
-        let ids = feed.resolve_episode_ids(podcast_id, &known);
+        let ids = resolve_and_rekey_provisional(&tx, podcast_id, feed)?;
         tx.execute(
             "UPDATE episodes SET in_feed = 0 WHERE podcast_id = ?1",
             [podcast_id.as_str()],
@@ -295,45 +436,26 @@ impl PodcastStore {
 
     /// Local fetch state of a podcast (defaults when never fetched).
     pub fn fetch_state(&self, podcast_id: &PodcastId) -> Result<FetchState> {
-        Ok(self
-            .lock()
-            .query_row(
-                "SELECT etag, last_modified, checked_at_ms, last_success_at_ms,
-                        next_check_at_ms, last_error, consecutive_failures, cover_url,
-                        cover_path
-                   FROM podcast_fetch_state WHERE podcast_id = ?1",
-                [podcast_id.as_str()],
-                |row| {
-                    Ok(FetchState {
-                        etag: row.get(0)?,
-                        last_modified: row.get(1)?,
-                        checked_at_ms: row.get(2)?,
-                        last_success_at_ms: row.get(3)?,
-                        next_check_at_ms: row.get(4)?,
-                        last_error: row.get(5)?,
-                        consecutive_failures: u32::try_from(row.get::<_, i64>(6)?)
-                            .unwrap_or(u32::MAX),
-                        cover_url: row.get(7)?,
-                        cover_path: row.get(8)?,
-                    })
-                },
-            )
-            .optional()?
-            .unwrap_or_default())
+        fetch_state_in(&self.lock(), podcast_id)
     }
 
+    /// Read-modify-write of the fetch state under one lock and one immediate
+    /// transaction, so concurrent `record_*` / `set_cover_cache` calls (from
+    /// this or another process) never lose each other's columns or failure
+    /// increments.
     fn update_fetch_state(
         &self,
         podcast_id: &PodcastId,
         update: impl FnOnce(&mut FetchState),
     ) -> Result<FetchState> {
-        let mut state = self.fetch_state(podcast_id)?;
-        update(&mut state);
-        let conn = self.lock();
-        if podcast_fetch_url(&conn, podcast_id)?.is_none() {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if podcast_fetch_url(&tx, podcast_id)?.is_none() {
             return Err(PodcastStoreError::UnknownPodcast(podcast_id.clone()).into());
         }
-        conn.execute(
+        let mut state = fetch_state_in(&tx, podcast_id)?;
+        update(&mut state);
+        tx.execute(
             "INSERT INTO podcast_fetch_state
                  (podcast_id, etag, last_modified, checked_at_ms, last_success_at_ms,
                   next_check_at_ms, last_error, consecutive_failures, cover_url, cover_path)
@@ -359,6 +481,7 @@ impl PodcastStore {
                 state.cover_path,
             ],
         )?;
+        tx.commit()?;
         Ok(state)
     }
 

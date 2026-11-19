@@ -549,9 +549,23 @@ must keep the same invariants.
   * Episode ids come from `resolve_episode_ids` over the stored items. The
     prototype stored the enclosure URL as `guid` when an item had none: such
     rows are imported as GUID-less items and keep the value in
-    `episodes.legacy_guid`. When a later refresh shows that value as a real
-    GUID, the episode is re-keyed to its GUID id if it has no progress and no
-    session (otherwise the GUID item becomes a new episode).
+    `episodes.legacy_guid`. The prototype kept one row per enclosure URL, so
+    rows with the same publication second, normalized title and `<link>`
+    (or none) are one item whose audio URL moved: the newest row
+    (`first_seen_at`, then `id`) is imported, the others are quarantined as
+    duplicates.
+  * Imported GUID-less episodes are **provisional**: stale rows can still
+    change which key is unique among the stored items, so their ids may
+    differ from what a device without the prototype derives. On a refresh,
+    item ids are resolved against the stored episodes except provisional
+    ones without progress or sessions; each such provisional episode is
+    matched to its item (enclosure, then link, then date and title, GUIDs
+    ignored) and re-keyed to that item's id unless another episode holds
+    it. The same applies when `legacy_guid` turns out to be the item's real
+    GUID. Listing an episode clears `legacy_guid`, which makes its id final.
+    Provisional episodes carry no personal state, so nothing personal moves;
+    an imported episode played before its first refresh keeps its id (the
+    feed item then becomes a separate episode if the ids differ).
   * ETag, Last-Modified, check time, last error and the cover cache move to the
     fetch state. The prototype stores no progress or history, so none is
     created.
@@ -605,6 +619,14 @@ must keep the same invariants.
   (descriptions, episodes) are never exported.
 * Feed URLs resolve through `resolve_podcast_id` over the alias set, the
   catalog fetch URL and the register's `podcast.feed_url`.
+* Fetch-state writes (`record_fetch_*`, `set_cover_cache`) read and write
+  the row in one immediate transaction, so concurrent writers on one or
+  several connections never lose a column or a failure increment.
+* `TrackItem::podcast_episode` builds queue items with a negative,
+  per-episode `id` (`TrackItem::podcast_track_id`, at most
+  `PODCAST_TRACK_ID_MAX`, below the ids of pending federated tracks) and
+  `release_id` / artist id -1, so code written for library tracks
+  (`id >= 0`) skips them even before it checks `is_podcast()`.
 
 ## Versioning
 

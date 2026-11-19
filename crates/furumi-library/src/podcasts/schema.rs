@@ -6,7 +6,8 @@ use anyhow::{Context as _, Result};
 use music_dht::podcast::{
     EpisodeId, EpisodeIdentityHints, EpisodeMeta, EpisodeType, FeedUrl, KnownEpisode,
     MAX_DESCRIPTION_CHARS, MAX_TITLE_CHARS, MAX_URL_BYTES, PodcastId, PodcastMeta,
-    SubscriptionRecord, bounded_text, is_http_url, resolve_episode_ids, resolve_podcast_id,
+    SubscriptionRecord, bounded_text, is_http_url, normalize_episode_title, resolve_episode_ids,
+    resolve_podcast_id,
 };
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 
@@ -442,11 +443,16 @@ fn secs_to_ms(secs: i64) -> i64 {
 ///   and stay in `legacy_podcasts` with their episodes. Rows with the same
 ///   canonical URL merge into one podcast (the first row's subscription and
 ///   fetch state win; the episodes of all of them are imported).
-/// * Episodes get ids from the contract identity rule over the whole stored
-///   document. The prototype stored the enclosure URL as `guid` when the
-///   item had none: such rows are imported as GUID-less items and keep the
-///   stored value in `legacy_guid`, which a later refresh uses to re-key the
-///   episode to its GUID id when the feed does have that GUID.
+/// * Episodes get ids from the contract identity rule over the stored rows.
+///   The prototype stored the enclosure URL as `guid` when the item had
+///   none: such rows are imported as GUID-less items and keep the stored
+///   value in `legacy_guid`. Rows of one GUID-less item seen under several
+///   enclosure URLs are collapsed into the newest (the others are
+///   quarantined as duplicates). Because stale rows can still change which
+///   key is unique, these ids are provisional: the first refresh that lists
+///   the item re-keys an episode without progress or sessions to the id the
+///   current feed gives (see `refresh.rs`), including its GUID id when the
+///   stored value turns out to be a real GUID.
 /// * ETag, Last-Modified, check time, last error and the cover cache move to
 ///   the local fetch state. The prototype has no progress or history, so no
 ///   progress register or session is created.
@@ -623,6 +629,7 @@ fn import_prototype_episodes(
         let guid = row.guid.trim();
         (!guid.is_empty() && guid != row.audio_url.trim()).then(|| guid.to_string())
     };
+    let usable = collapse_moved_guidless_rows(tx, usable, real_guid)?;
     let hints: Vec<EpisodeIdentityHints> = usable
         .iter()
         .map(|row| EpisodeIdentityHints {
@@ -717,6 +724,66 @@ fn import_prototype_episodes(
         )?;
     }
     Ok(())
+}
+
+/// Collapses prototype rows that are one GUID-less item seen under several
+/// enclosure URLs.
+///
+/// The prototype keyed GUID-less items by their enclosure URL, so an item
+/// whose audio URL changed (new CDN, tracking prefix) left one row per URL.
+/// Those stale rows are not part of the current feed; resolved together with
+/// it they would make the item's `<link>` and `(date, title)` look
+/// non-unique and give it an id a fresh device never derives. Rows with the
+/// same publication second, normalized title and `<link>` (or none) are the
+/// same item: the newest (`first_seen_at`, then `id`) is imported, the others
+/// are quarantined as duplicates. The link must match too, so distinct
+/// episodes that only share a title and second are never merged.
+fn collapse_moved_guidless_rows(
+    tx: &Transaction<'_>,
+    rows: Vec<LegacyEpisode>,
+    real_guid: impl Fn(&LegacyEpisode) -> Option<String>,
+) -> Result<Vec<LegacyEpisode>> {
+    type ItemKey = (i64, String, Option<String>);
+    let key = |row: &LegacyEpisode| -> Option<ItemKey> {
+        if real_guid(row).is_some() {
+            return None;
+        }
+        let title = normalize_episode_title(&row.title);
+        let link = row
+            .link
+            .as_deref()
+            .map(str::trim)
+            .filter(|link| !link.is_empty())
+            .map(str::to_string);
+        (!title.is_empty()).then_some((row.published_at?, title, link))
+    };
+    let mut newest: BTreeMap<ItemKey, (i64, i64)> = BTreeMap::new();
+    for row in &rows {
+        if let Some(key) = key(row) {
+            let candidate = (row.first_seen_at, row.id);
+            newest
+                .entry(key)
+                .and_modify(|best| *best = (*best).max(candidate))
+                .or_insert(candidate);
+        }
+    }
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let keeper = key(&row).and_then(|key| newest.get(&key).map(|(_, id)| *id));
+        match keeper {
+            Some(keeper) if keeper != row.id => quarantine(
+                tx,
+                "legacy_podcast_episodes",
+                row.id,
+                "duplicate episode",
+                &format!(
+                    "older enclosure URL of the GUID-less item imported from legacy episode {keeper}"
+                ),
+            )?,
+            _ => kept.push(row),
+        }
+    }
+    Ok(kept)
 }
 
 fn bounded_title(title: &str) -> String {

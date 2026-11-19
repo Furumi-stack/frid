@@ -1758,3 +1758,325 @@ fn concurrent_openers_migrate_once() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Review regressions
+
+/// A prototype `podcast_episodes` row: guid, title, published_at (seconds),
+/// audio URL, link.
+type PrototypeRow<'a> = (&'a str, &'a str, Option<i64>, &'a str, Option<&'a str>);
+
+/// A prototype database with one podcast at [`FEED`] and the given rows.
+fn prototype_with_rows(path: &Path, rows: &[PrototypeRow<'_>]) -> Vec<i64> {
+    let conn = fabricate_prototype(path);
+    conn.execute(
+        "INSERT INTO podcasts (feed_url, title, link, added_at) VALUES (?1, 'Show', ?2, 1700000000)",
+        params![FEED, "https://example.test/"],
+    )
+    .unwrap();
+    let show = conn.last_insert_rowid();
+    rows.iter()
+        .map(|(guid, title, published, audio, link)| {
+            prototype_episode(&conn, show, guid, title, *published, audio, *link)
+        })
+        .collect()
+}
+
+fn in_feed_ids(store: &PodcastStore, podcast_id: &PodcastId) -> Vec<(EpisodeId, bool)> {
+    store
+        .episodes(&EpisodeQuery::new(podcast_id.clone()))
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.episode.episode_id, item.in_feed))
+        .collect()
+}
+
+/// 2023-11-14T22:13:20Z.
+const PILOT_DATE: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
+const PILOT_SECS: i64 = 1_700_000_000;
+const OLD_AUDIO: &str = "https://cdn.example.test/old/ep1.mp3";
+const NEW_AUDIO: &str = "https://cdn.example.test/new/ep1.mp3";
+const PILOT_LINK: &str = "https://example.test/ep1";
+
+fn current_pilot_feed() -> ParsedFeed {
+    parse(
+        &rss(
+            "Show",
+            None,
+            &[Item {
+                link: Some(PILOT_LINK),
+                date: Some(PILOT_DATE),
+                ..Item::new(None, "Pilot", NEW_AUDIO)
+            }],
+        ),
+        &url(FEED),
+    )
+}
+
+#[test]
+fn prototype_rows_of_a_moved_guidless_item_import_as_the_fresh_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(PODCAST_DB_FILE);
+    // The prototype keyed GUID-less items by enclosure URL: after the CDN
+    // move the same item has two rows.
+    let rows = prototype_with_rows(
+        &path,
+        &[
+            (
+                OLD_AUDIO,
+                "Pilot",
+                Some(PILOT_SECS),
+                OLD_AUDIO,
+                Some(PILOT_LINK),
+            ),
+            (
+                NEW_AUDIO,
+                "Pilot",
+                Some(PILOT_SECS),
+                NEW_AUDIO,
+                Some(PILOT_LINK),
+            ),
+        ],
+    );
+    let store_a = PodcastStore::open(&path).unwrap();
+    let podcast_id = PodcastId::from_feed_url(&url(FEED));
+    let feed = current_pilot_feed();
+    let fresh = feed.resolve_episode_ids(&podcast_id, &[])[0]
+        .clone()
+        .unwrap();
+
+    // One episode, with the id a fresh device derives; the stale row is a
+    // quarantined duplicate that stays in the legacy table.
+    assert_eq!(
+        in_feed_ids(&store_a, &podcast_id),
+        vec![(fresh.clone(), true)]
+    );
+    let quarantine = store_a.legacy_quarantine().unwrap();
+    assert_eq!(quarantine.len(), 1);
+    assert_eq!(quarantine[0].legacy_id, rows[0]);
+    assert_eq!(quarantine[0].reason, "duplicate episode");
+    assert_eq!(
+        store_a.episode(&fresh).unwrap().unwrap().episode.audio_url,
+        NEW_AUDIO
+    );
+
+    // Device A refreshes and plays; fresh device B subscribed, refreshed
+    // and played too. A's operation lands on B's own episode.
+    let mut stamps_a = TestStamps::new("device-a", 1_800_000_000_000);
+    refresh(
+        &store_a,
+        &mut stamps_a,
+        &podcast_id,
+        &feed,
+        &url(FEED),
+        false,
+    );
+    assert_eq!(
+        in_feed_ids(&store_a, &podcast_id),
+        vec![(fresh.clone(), true)]
+    );
+    let store_b = PodcastStore::open_in_memory().unwrap();
+    let mut stamps_b = TestStamps::new("device-b", 1_900_000_000_000);
+    store_b
+        .subscribe(&mut stamps_b, &meta(FEED, "Show"))
+        .unwrap();
+    refresh(
+        &store_b,
+        &mut stamps_b,
+        &podcast_id,
+        &feed,
+        &url(FEED),
+        false,
+    );
+    let reference_b = store_b.episode_ref(&fresh).unwrap().unwrap();
+    store_b
+        .start_session(&mut stamps_b, &reference_b, "b-1", 600_000, None)
+        .unwrap();
+    let reference_a = store_a.episode_ref(&fresh).unwrap().unwrap();
+    let write = store_a
+        .start_session(&mut stamps_a, &reference_a, "a-1", 5_000, None)
+        .unwrap();
+    store_b.apply_remote_op(&write.op.into_wire(1)).unwrap();
+    refresh(
+        &store_b,
+        &mut stamps_b,
+        &podcast_id,
+        &feed,
+        &url(FEED),
+        false,
+    );
+    assert_eq!(
+        in_feed_ids(&store_b, &podcast_id),
+        vec![(fresh.clone(), true)]
+    );
+    assert!(store_b.progress(&fresh).unwrap().is_some());
+}
+
+#[test]
+fn first_refresh_rekeys_provisional_imported_guidless_episodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(PODCAST_DB_FILE);
+    // The stale row was also retitled, so the import cannot tell it is the
+    // same item: the shared link is not identifying among the stored rows
+    // and both rows get (date, title) ids.
+    prototype_with_rows(
+        &path,
+        &[
+            (
+                OLD_AUDIO,
+                "Pilot (draft)",
+                Some(PILOT_SECS),
+                OLD_AUDIO,
+                Some(PILOT_LINK),
+            ),
+            (
+                NEW_AUDIO,
+                "Pilot",
+                Some(PILOT_SECS),
+                NEW_AUDIO,
+                Some(PILOT_LINK),
+            ),
+        ],
+    );
+    let store = PodcastStore::open(&path).unwrap();
+    let podcast_id = PodcastId::from_feed_url(&url(FEED));
+    let feed = current_pilot_feed();
+    let fresh = feed.resolve_episode_ids(&podcast_id, &[])[0]
+        .clone()
+        .unwrap();
+    let imported = in_feed_ids(&store, &podcast_id);
+    assert_eq!(imported.len(), 2);
+    assert!(
+        imported.iter().all(|(id, _)| *id != fresh),
+        "the import alone cannot know the current feed"
+    );
+
+    let mut stamps = TestStamps::new("device-a", 1_800_000_000_000);
+    let outcome = refresh(&store, &mut stamps, &podcast_id, &feed, &url(FEED), false);
+    assert_eq!(
+        outcome.new_episodes, 0,
+        "the imported row moved, not duplicated"
+    );
+    assert_eq!(outcome.updated_episodes + outcome.unchanged_episodes, 1);
+    let after = in_feed_ids(&store, &podcast_id);
+    assert_eq!(after.len(), 2);
+    assert!(after.contains(&(fresh.clone(), true)));
+    assert_eq!(after.iter().filter(|(_, in_feed)| *in_feed).count(), 1);
+    assert_eq!(
+        store.episode(&fresh).unwrap().unwrap().episode.audio_url,
+        NEW_AUDIO
+    );
+    let legacy_guid: Option<String> = store
+        .lock()
+        .query_row(
+            "SELECT legacy_guid FROM episodes WHERE episode_id = ?1",
+            [fresh.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_guid, None, "the refresh confirmed the id");
+
+    // Ids are final now: later refreshes keep them.
+    refresh(&store, &mut stamps, &podcast_id, &feed, &url(FEED), false);
+    assert_eq!(in_feed_ids(&store, &podcast_id), after);
+}
+
+#[test]
+fn imported_episodes_with_personal_state_are_not_rekeyed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(PODCAST_DB_FILE);
+    prototype_with_rows(
+        &path,
+        &[
+            (
+                OLD_AUDIO,
+                "Pilot (draft)",
+                Some(PILOT_SECS),
+                OLD_AUDIO,
+                Some(PILOT_LINK),
+            ),
+            (
+                NEW_AUDIO,
+                "Pilot",
+                Some(PILOT_SECS),
+                NEW_AUDIO,
+                Some(PILOT_LINK),
+            ),
+        ],
+    );
+    let store = PodcastStore::open(&path).unwrap();
+    let podcast_id = PodcastId::from_feed_url(&url(FEED));
+    let played = store
+        .episodes(&EpisodeQuery::new(podcast_id.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|item| item.episode.audio_url == NEW_AUDIO)
+        .unwrap()
+        .episode
+        .episode_id;
+    let mut stamps = TestStamps::new("device-a", 1_800_000_000_000);
+    let reference = store.episode_ref(&played).unwrap().unwrap();
+    store
+        .start_session(&mut stamps, &reference, "s-1", 42_000, None)
+        .unwrap();
+    refresh(
+        &store,
+        &mut stamps,
+        &podcast_id,
+        &current_pilot_feed(),
+        &url(FEED),
+        false,
+    );
+    // The played episode keeps its id and its position and is the feed item.
+    assert!(in_feed_ids(&store, &podcast_id).contains(&(played.clone(), true)));
+    assert_eq!(store.resume_position_ms(&played).unwrap(), 42_000);
+}
+
+#[test]
+fn concurrent_fetch_state_writers_lose_no_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(PODCAST_DB_FILE);
+    let first = std::sync::Arc::new(PodcastStore::open(&path).unwrap());
+    let second = std::sync::Arc::new(PodcastStore::open(&path).unwrap());
+    let mut stamps = TestStamps::new("device-a", 1_000);
+    let podcast_id = first
+        .subscribe(&mut stamps, &meta(FEED, "Show"))
+        .unwrap()
+        .podcast_id;
+    const THREADS: usize = 4;
+    const FAILURES: usize = 25;
+    let workers: Vec<_> = (0..THREADS)
+        .map(|thread| {
+            // Two connections (as two processes would have) and two threads
+            // per connection.
+            let store = if thread % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let podcast_id = podcast_id.clone();
+            std::thread::spawn(move || {
+                for attempt in 0..FAILURES {
+                    store
+                        .record_fetch_failure(&podcast_id, attempt as i64, "timeout", None)
+                        .unwrap();
+                    if thread == 0 && attempt == FAILURES / 2 {
+                        store
+                            .set_cover_cache(
+                                &podcast_id,
+                                Some("https://example.test/c.jpg"),
+                                Some("/covers/c.jpg"),
+                            )
+                            .unwrap();
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let state = second.fetch_state(&podcast_id).unwrap();
+    assert_eq!(state.consecutive_failures as usize, THREADS * FAILURES);
+    assert_eq!(state.cover_path.as_deref(), Some("/covers/c.jpg"));
+}
