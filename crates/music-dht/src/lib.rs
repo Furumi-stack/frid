@@ -23,6 +23,10 @@
 //! * [`similarity_lsh`] turns those embeddings into deterministic compact
 //!   routing summaries, while [`similarity_dht`] stores and discovers signed
 //!   peer summaries without owning model inference or an embedding database.
+//! * [`podcast`] is the pure, shared podcast contract (canonical feed URLs,
+//!   podcast/episode ids, metadata DTOs and convergent merge rules), with an
+//!   optional RSS/Atom parser behind the `podcast-feed` feature;
+//!   [`device_sync`] protocol v4 carries it between trusted devices.
 //! * Records are replicated to the `K` nodes whose ids are XOR-closest to
 //!   each key. Publishers pick the targets from their routing table and send
 //!   batched store requests (one pipeline per peer), so even a large library

@@ -13,7 +13,7 @@ The workspace has three layers:
 - [`music-dht`](crates/music-dht) builds a Kademlia-style distributed music
   directory on top of that transport, including catalog discovery, content-id
   lookup, signed similarity-LSH routing, direct byte streams, and shared Furumi
-  wire types.
+  wire types, including the shared podcast contract ([PODCASTS.md](PODCASTS.md)).
 - [`furumi-library`](crates/furumi-library) owns the shared local `library.db`
   contract, migrations, catalog operations, metadata import, artwork,
   playlists, likes, history, and similarity persistence used by Furumi clients.

@@ -185,7 +185,9 @@ new clients should accept both ALPNs and only send `ListenRecorded` when
 `supports_listen_history(peer.protocol_version)` returns true. Likes,
 playlists and membership remain compatible with v1. Profile version 3 adds
 versioned personal playback coordination over the existing JSON sync stream;
-legacy unfenced playback messages are ignored by upgraded clients.
+legacy unfenced playback messages are ignored by upgraded clients. Profile
+version 4 adds podcasts (see below); `op_allowed_for_peer` applies all of
+these rules to one operation.
 
 `music_dht::playback` provides the shared pure ownership engine and generic
 snapshot/command envelopes. Configure startup and failover with `Config`, feed
@@ -193,12 +195,64 @@ actual output reports, and persist `Checkpoint` before applying decisions.
 `Config::passive()` is intended for always-running gateways. See the workspace
 `PLAYBACK_PROTOCOL.md` for invariants, configuration and migration details.
 
+## Podcasts
+
+`music_dht::podcast` is the shared, pure podcast contract (no SQLite, HTTP or
+clock). Clients use it for identity, merge rules and wire DTOs; see the
+workspace `PODCASTS.md` for the normative rules.
+
+```rust
+use music_dht::podcast::{
+    EpisodeIdentityHints, FeedUrl, PodcastId, ProgressRecord, resolve_episode_ids,
+};
+
+let url = FeedUrl::from_user_input("feed://example.com/rss?token=abc")?;
+let podcast = PodcastId::from_feed_url(&url); // "pod1:..."
+let hints = [EpisodeIdentityHints {
+    guid: Some("episode-1".into()),
+    ..Default::default()
+}];
+let ids = resolve_episode_ids(&podcast, None, &hints, &[]); // "ep1:..."
+
+// Explicit actions (seek, start over, new session) bump the generation.
+let generation = ProgressRecord::explicit_generation(Some(4)); // 5
+```
+
+* `FeedUrl` canonicalizes feed URLs and keeps every query parameter.
+* `PodcastId`, `EpisodeId`, `EpisodeKey`, `resolve_podcast_id`,
+  `merge_feed_aliases`, `resolve_episode_ids`: identity, aliases and the
+  no-GUID rule.
+* `PodcastMeta`, `EpisodeMeta`, `PodcastEpisodeRef`: bounded metadata and the
+  self-contained queue item.
+* `SubscriptionRecord`, `ShareRecord`, `ProgressRecord`, `ListenSession` with
+  `merge_subscription`, `merge_share`, `merge_progress`,
+  `merge_listen_session`, `effective_share`, `reaches_completion` and
+  `completed_listen_count`.
+
+Enable the `podcast-feed` feature for `music_dht::podcast::feed`, the shared
+tolerant RSS 2.0 / RSS 1.0 / Atom parser:
+
+```toml
+music-dht = { version = "0.6", features = ["podcast-feed"] }
+```
+
+Device-sync protocol v4 adds `podcast_subscription_set`, `podcast_share_set`,
+`podcast_progress_set` and `podcast_listen_recorded`, podcast snapshot
+sections, `PlaybackTrack.source` and a reserved `playback_rate`. Old clients
+cannot parse these, so always filter with `op_allowed_for_peer`,
+`playback_allowed_for_peer`, `SyncSnapshot::for_peer` and
+`playback_command_allowed_from_peer`, using the protocol version each device
+reported itself (`profile_protocol_version`). Jam hosts use
+`jam::redact_jam_snapshot`, `jam_command_allowed` and
+`restore_jam_private_items`.
+
 ## Verification
 
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test -p music-dht
+cargo test -p music-dht --features podcast-feed
 ```
 
 The integration test starts three real nodes in one process (they use Iroh's
