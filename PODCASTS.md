@@ -21,7 +21,7 @@ cards in a separate DHT overlay, `music_dht::podcast_dht`; see
 | `music_dht::podcast` | ids, URL canonicalization, no-GUID rule, metadata DTOs and bounds, merge functions, RSS/Atom parser (feature `podcast-feed`) |
 | `music_dht::device_sync` | sync operation kinds, snapshot sections, `PlaybackSource`, version gating, Jam redaction |
 | `music_dht::podcast_dht` | public podcast cards and tombstones, their signatures, replication, cache and search, privacy warnings for feed URLs |
-| Client storage (`furumi_library::podcasts::PodcastStore`, web PostgreSQL) | persistence and migrations implementing the rules below (SQLite reference: see "SQLite reference store") |
+| Client storage (`furumi_library::podcasts::PodcastStore`, web PostgreSQL) | persistence and migrations implementing the rules below (SQLite reference: [SQLite reference store](#sqlite-reference-store)) |
 | Client runtime | HTTP fetching, conditional requests, scheduling, audio buffering and decoding, UI |
 
 Audio is always fetched from the publisher. It is never imported into the
@@ -716,6 +716,13 @@ Fields are in postcard order. `PodcastDhtKey` is 32 raw bytes.
   publishes the same `feed_url` and `id_feed_url`. A feed move to a URL that
   looks private therefore asks again; an earlier publication of a held-back
   podcast stays as it was.
+* SQLite clients build each `PodcastShareState` from
+  `PodcastStore::subscription` (the merged register with its alias set, which
+  always contains the origin URL) and `PodcastStore::share`; its `is_shared`
+  equals `PodcastSummary::shared`. A card for the URL the device now fetches
+  sets `feed_url` from the catalog and `id_feed_url` to the origin URL. The
+  store does not persist `privacy_confirmed`; the client keeps that
+  confirmation. See [SQLite reference store](#sqlite-reference-store).
 * `PodcastDht::unpublish(podcast_id)` writes the tombstone. Nothing is ever
   sent for a podcast this device never published: no tombstone, no id.
 * `PodcastDht::republish` (run by `maintenance`) re-signs active cards and
@@ -928,7 +935,9 @@ must keep the same invariants.
   `set_shared`/`unsubscribe` the share register, with
   `next_podcast_generation`. No-op actions draw no stamp and emit nothing.
   `unsubscribe` emits `subscribed = false` and `shared = false` and keeps
-  progress, sessions and the catalog.
+  progress, sessions and the catalog. The store only records the decision;
+  publishing and revoking the public card is `PodcastDht::sync_shares` (see
+  [Public discovery](#public-discovery-podcast_dht)).
 * Explicit progress actions use `explicit_generation(max(local, carried))`;
   checkpoints keep the session generation and are refused (`Superseded`)
   once the register holds a greater one, or after the session completed.

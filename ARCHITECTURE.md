@@ -239,7 +239,8 @@ Public podcast discovery is a third schema-independent Kademlia overlay,
 `music_dht::podcast_dht` (ALPN `furumi-fd/podcast-dht/1`, version 1,
 capability `podcast_dht`), built like the similarity-routing overlay. A
 device publishes a card only for podcasts whose merged registers satisfy
-`effective_share`; `sync_shares` reconciles publications declaratively and
+`effective_share` (SQLite clients read the merged registers from
+`PodcastStore`); `sync_shares` reconciles publications declaratively and
 nothing is sent for a podcast the device never published. A card is the
 public projection of a podcast (feed URL and channel metadata, no personal
 state), signed by the device's iroh identity over a domain-separated
