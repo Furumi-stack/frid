@@ -5,7 +5,7 @@
 //! (like the similarity-routing cache). Every record read from it is decoded
 //! and verified again before it is used or served.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -17,32 +17,66 @@ use crate::error::{MusicDhtError, Result};
 use crate::podcast::PodcastId;
 use crate::routing::{NodeContact, NodeId};
 
-use super::card::{
-    PodcastCardSpec, PodcastDhtKey, SignedPodcastRecord, compare_records, supersedes_everywhere,
-};
+use super::card::{PodcastCardSpec, PodcastDhtKey, SignedPodcastRecord, compare_records};
 
-/// `PRAGMA user_version` of the podcast-discovery cache schema.
-pub const PODCAST_DHT_CACHE_SCHEMA_VERSION: i32 = 1;
-/// Maximum distinct `(podcast_id, publisher)` records cached under one key.
-/// When full, the record expiring first is evicted if the new one outlives it.
+/// `PRAGMA user_version` of the podcast-discovery cache schema. Version 1
+/// (pre-release) stored one payload per key; its replica table is dropped on
+/// open because the cache is replaceable. Own publications are kept.
+pub const PODCAST_DHT_CACHE_SCHEMA_VERSION: i32 = 2;
+/// Maximum records (cards and tombstones) indexed under one key. A full key
+/// admits no new `(podcast_id, publisher)` until a record expires: existing
+/// records are never evicted for newcomers, and their owners keep refreshing
+/// them in place.
 pub const MAX_PODCAST_RECORDS_PER_KEY: usize = 256;
+/// Maximum tombstones newly indexed under one key. A tombstone is admitted
+/// under a text key only in place of a record of the same
+/// `(podcast_id, publisher)` already indexed there, so this budget applies to
+/// the podcast-id key, where tombstones of unknown cards land.
+pub const MAX_PODCAST_TOMBSTONES_PER_KEY: usize = 32;
+/// Maximum tombstones in one `FindValue` response; cards fill the rest.
+pub const MAX_PODCAST_RESPONSE_TOMBSTONES: usize = 32;
+/// Maximum `(podcast_id, publisher)` records one publisher device keeps in a
+/// replica.
+pub const MAX_PODCAST_RECORDS_PER_PUBLISHER: usize = 256;
+/// Maximum `(podcast_id, publisher)` records in a replica cache.
+pub const MAX_PODCAST_CACHE_RECORDS: usize = 4_096;
+/// Maximum total encoded size of the records in a replica cache.
+pub const MAX_PODCAST_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum persisted overlay contacts; the least recently seen are dropped.
+pub const MAX_PERSISTED_PODCAST_DHT_PEERS: usize = 1_024;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS podcast_dht_records (
-    dht_key       BLOB NOT NULL,
-    podcast_id    TEXT NOT NULL,
-    publisher     TEXT NOT NULL,
-    tombstone     INTEGER NOT NULL,
-    expires_at_ms INTEGER NOT NULL,
-    payload       BLOB NOT NULL,
-    PRIMARY KEY (dht_key, podcast_id, publisher)
+    podcast_id         TEXT NOT NULL,
+    publisher          TEXT NOT NULL,
+    tombstone          INTEGER NOT NULL,
+    expires_at_ms      INTEGER NOT NULL,
+    payload_bytes      INTEGER NOT NULL,
+    payload            BLOB NOT NULL,
+    PRIMARY KEY (podcast_id, publisher)
 );
 
 CREATE INDEX IF NOT EXISTS idx_podcast_dht_records_expiry
     ON podcast_dht_records(expires_at_ms);
 
-CREATE INDEX IF NOT EXISTS idx_podcast_dht_records_owner
-    ON podcast_dht_records(podcast_id, publisher);
+CREATE INDEX IF NOT EXISTS idx_podcast_dht_records_publisher
+    ON podcast_dht_records(publisher);
+
+CREATE TABLE IF NOT EXISTS podcast_dht_keys (
+    dht_key            BLOB NOT NULL,
+    podcast_id         TEXT NOT NULL,
+    publisher          TEXT NOT NULL,
+    tombstone          INTEGER NOT NULL,
+    expires_at_ms      INTEGER NOT NULL,
+    first_stored_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (dht_key, podcast_id, publisher)
+);
+
+CREATE INDEX IF NOT EXISTS idx_podcast_dht_keys_owner
+    ON podcast_dht_keys(podcast_id, publisher);
+
+CREATE INDEX IF NOT EXISTS idx_podcast_dht_keys_expiry
+    ON podcast_dht_keys(expires_at_ms);
 
 CREATE TABLE IF NOT EXISTS podcast_dht_peers (
     peer_id      TEXT PRIMARY KEY,
@@ -60,6 +94,28 @@ CREATE TABLE IF NOT EXISTS podcast_dht_local (
 );
 ";
 
+/// Admission limits of a replica cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StoreLimits {
+    pub per_key: usize,
+    pub tombstones_per_key: usize,
+    pub per_publisher: usize,
+    pub records: usize,
+    pub bytes: usize,
+}
+
+impl Default for StoreLimits {
+    fn default() -> Self {
+        Self {
+            per_key: MAX_PODCAST_RECORDS_PER_KEY,
+            tombstones_per_key: MAX_PODCAST_TOMBSTONES_PER_KEY,
+            per_publisher: MAX_PODCAST_RECORDS_PER_PUBLISHER,
+            records: MAX_PODCAST_CACHE_RECORDS,
+            bytes: MAX_PODCAST_CACHE_BYTES,
+        }
+    }
+}
+
 /// This device's latest publication of one podcast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalPublication {
@@ -76,6 +132,7 @@ pub(crate) struct LocalPublication {
 pub(crate) struct PodcastDhtDatabase {
     conn: Arc<Mutex<Connection>>,
     network_id: NetworkId,
+    limits: StoreLimits,
 }
 
 impl std::fmt::Debug for PodcastDhtDatabase {
@@ -88,6 +145,14 @@ impl std::fmt::Debug for PodcastDhtDatabase {
 
 impl PodcastDhtDatabase {
     pub async fn open(path: &Path, network_id: NetworkId) -> Result<Self> {
+        Self::open_with_limits(path, network_id, StoreLimits::default()).await
+    }
+
+    pub async fn open_with_limits(
+        path: &Path,
+        network_id: NetworkId,
+        limits: StoreLimits,
+    ) -> Result<Self> {
         let path = path.to_path_buf();
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
             let conn = Connection::open(&path).map_err(|error| {
@@ -101,6 +166,11 @@ impl PodcastDhtDatabase {
                     "podcast DHT cache schema {version} is newer than supported {PODCAST_DHT_CACHE_SCHEMA_VERSION}"
                 )));
             }
+            if version == 1 {
+                // Replicas are replaceable; the old layout is dropped.
+                conn.execute_batch("DROP TABLE IF EXISTS podcast_dht_records;")
+                    .map_err(database_error)?;
+            }
             conn.execute_batch(SCHEMA).map_err(|error| {
                 MusicDhtError::Database(format!("failed to initialize podcast DHT cache: {error}"))
             })?;
@@ -113,37 +183,39 @@ impl PodcastDhtDatabase {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             network_id,
+            limits,
         })
     }
 
     async fn call<F, T>(&self, operation: F) -> Result<T>
     where
-        F: FnOnce(&Connection, &NetworkId) -> rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&Connection, &NetworkId, &StoreLimits) -> rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let conn = Arc::clone(&self.conn);
         let network_id = self.network_id;
+        let limits = self.limits;
         tokio::task::spawn_blocking(move || {
             let guard = lock(&conn);
-            operation(&guard, &network_id).map_err(database_error)
+            operation(&guard, &network_id, &limits).map_err(database_error)
         })
         .await
         .map_err(|error| MusicDhtError::Database(format!("database task panicked: {error}")))?
     }
 
     /// Stores records under the given keys. The caller has verified every
-    /// record and checked that each key belongs to it. Returns the number of
-    /// `(key, record)` rows written.
+    /// record, checked that each key belongs to it and that the sender is its
+    /// publisher. Returns the number of `(key, record)` placements written.
     pub async fn store(
         &self,
         entries: Vec<(Vec<PodcastDhtKey>, SignedPodcastRecord)>,
         now_ms: u64,
     ) -> Result<usize> {
-        self.call(move |conn, network_id| {
+        self.call(move |conn, network_id, limits| {
             let transaction = conn.unchecked_transaction()?;
             let mut written = 0;
             for (keys, record) in entries {
-                written += store_one(&transaction, network_id, &keys, &record, now_ms)?;
+                written += store_one(&transaction, network_id, limits, &keys, &record, now_ms)?;
             }
             transaction.commit()?;
             Ok(written)
@@ -151,9 +223,11 @@ impl PodcastDhtDatabase {
         .await
     }
 
-    /// Valid, unexpired records under `key`, newest expiry first. Cards must
-    /// contain every token in `filter_tokens`; tombstones are always
-    /// returned so stale replicas elsewhere can be overruled.
+    /// Valid, unexpired records under `key`: at most
+    /// [`MAX_PODCAST_RESPONSE_TOMBSTONES`] tombstones (always returned so stale
+    /// replicas elsewhere can be overruled) and cards containing every token
+    /// in `filter_tokens` up to `limit` records in all. Records indexed longest
+    /// come first. Cards precede tombstones.
     pub async fn records_by_key(
         &self,
         key: PodcastDhtKey,
@@ -161,52 +235,70 @@ impl PodcastDhtDatabase {
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<SignedPodcastRecord>> {
-        self.call(move |conn, network_id| {
+        self.call(move |conn, network_id, _| {
             let mut statement = conn.prepare(
-                "SELECT payload FROM podcast_dht_records
-                 WHERE dht_key = ?1 AND expires_at_ms > ?2
-                 ORDER BY expires_at_ms DESC, podcast_id, publisher",
+                "SELECT r.payload FROM podcast_dht_keys k
+                 JOIN podcast_dht_records r
+                   ON r.podcast_id = k.podcast_id AND r.publisher = k.publisher
+                 WHERE k.dht_key = ?1 AND k.tombstone = ?2 AND k.expires_at_ms > ?3
+                 ORDER BY k.first_stored_at_ms, k.podcast_id, k.publisher",
             )?;
-            let rows = statement.query_map(
-                params![key.as_bytes().as_slice(), clamp_i64(now_ms)],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            let mut records = Vec::new();
-            for row in rows {
-                let Some(record) = decode_valid(&row?, network_id, now_ms) else {
-                    continue;
-                };
-                if !record.belongs_under(&key) {
-                    continue;
+            let mut select = |tombstone: bool, limit: usize| -> rusqlite::Result<Vec<_>> {
+                let mut records = Vec::new();
+                if limit == 0 {
+                    return Ok(records);
                 }
-                let matches = record.card().is_none_or(|card| {
-                    let tokens = card.index_tokens();
-                    filter_tokens.iter().all(|token| tokens.contains(token))
-                });
-                if matches {
-                    records.push(record);
-                    if records.len() == limit {
-                        break;
+                let rows = statement.query_map(
+                    params![key.as_bytes().as_slice(), tombstone, clamp_i64(now_ms)],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?;
+                for row in rows {
+                    let Some(record) = decode_valid(&row?, network_id, now_ms) else {
+                        continue;
+                    };
+                    if record.is_tombstone() != tombstone || !record.belongs_under(&key) {
+                        continue;
+                    }
+                    let matches = record.card().is_none_or(|card| {
+                        let tokens = card.index_tokens();
+                        filter_tokens.iter().all(|token| tokens.contains(token))
+                    });
+                    if matches {
+                        records.push(record);
+                        if records.len() == limit {
+                            break;
+                        }
                     }
                 }
-            }
+                Ok(records)
+            };
+            let tombstones = select(true, MAX_PODCAST_RESPONSE_TOMBSTONES.min(limit))?;
+            let mut records = select(false, limit - tombstones.len())?;
+            records.extend(tombstones);
             Ok(records)
         })
         .await
     }
 
+    /// Removes expired records and their key placements. Returns the number
+    /// of records removed.
     pub async fn delete_expired(&self, now_ms: u64) -> Result<usize> {
-        self.call(move |conn, _| {
+        self.call(move |conn, _, _| {
+            let now = clamp_i64(now_ms);
+            conn.execute(
+                "DELETE FROM podcast_dht_keys WHERE expires_at_ms <= ?1",
+                [now],
+            )?;
             conn.execute(
                 "DELETE FROM podcast_dht_records WHERE expires_at_ms <= ?1",
-                [clamp_i64(now_ms)],
+                [now],
             )
         })
         .await
     }
 
     pub async fn upsert_peer(&self, contact: NodeContact) -> Result<()> {
-        self.call(move |conn, _| {
+        self.call(move |conn, _, _| {
             conn.execute(
                 "INSERT OR REPLACE INTO podcast_dht_peers
                  (peer_id, node_id, ticket, last_seen_ms)
@@ -218,13 +310,20 @@ impl PodcastDhtDatabase {
                     clamp_i64(contact.last_seen_ms),
                 ],
             )?;
+            conn.execute(
+                "DELETE FROM podcast_dht_peers WHERE peer_id IN (
+                     SELECT peer_id FROM podcast_dht_peers
+                     ORDER BY last_seen_ms DESC, peer_id
+                     LIMIT -1 OFFSET ?1)",
+                [MAX_PERSISTED_PODCAST_DHT_PEERS as i64],
+            )?;
             Ok(())
         })
         .await
     }
 
     pub async fn remove_peer(&self, peer: EndpointId) -> Result<()> {
-        self.call(move |conn, _| {
+        self.call(move |conn, _, _| {
             conn.execute(
                 "DELETE FROM podcast_dht_peers WHERE peer_id = ?1",
                 [peer.to_string()],
@@ -235,7 +334,7 @@ impl PodcastDhtDatabase {
     }
 
     pub async fn load_peers(&self) -> Result<Vec<NodeContact>> {
-        self.call(move |conn, _| {
+        self.call(move |conn, _, _| {
             let mut statement =
                 conn.prepare("SELECT peer_id, ticket, last_seen_ms FROM podcast_dht_peers")?;
             let rows = statement.query_map([], |row| {
@@ -267,7 +366,7 @@ impl PodcastDhtDatabase {
         &self,
         podcast_id: PodcastId,
     ) -> Result<Option<LocalPublication>> {
-        self.call(move |conn, _| {
+        self.call(move |conn, _, _| {
             conn.query_row(
                 "SELECT podcast_id, revision, spec, record FROM podcast_dht_local
                  WHERE podcast_id = ?1",
@@ -281,7 +380,7 @@ impl PodcastDhtDatabase {
     }
 
     pub async fn local_publications(&self) -> Result<Vec<LocalPublication>> {
-        self.call(move |conn, _| {
+        self.call(move |conn, _, _| {
             let mut statement = conn.prepare(
                 "SELECT podcast_id, revision, spec, record FROM podcast_dht_local
                  ORDER BY podcast_id",
@@ -303,7 +402,7 @@ impl PodcastDhtDatabase {
         publication: LocalPublication,
         now_ms: u64,
     ) -> Result<()> {
-        self.call(move |conn, _| {
+        self.call(move |conn, _, _| {
             let spec = publication
                 .spec
                 .as_ref()
@@ -332,141 +431,235 @@ impl PodcastDhtDatabase {
 fn store_one(
     conn: &Connection,
     network_id: &NetworkId,
+    limits: &StoreLimits,
     keys: &[PodcastDhtKey],
     record: &SignedPodcastRecord,
     now_ms: u64,
 ) -> rusqlite::Result<usize> {
     let podcast_id = record.podcast_id().as_str().to_string();
     let publisher = record.publisher().to_string();
+    let now = clamp_i64(now_ms);
 
-    // Every cached version of this (podcast, publisher), re-verified.
-    let mut existing: HashMap<[u8; 32], SignedPodcastRecord> = HashMap::new();
-    let mut invalid_keys = Vec::new();
-    {
-        let mut statement = conn.prepare(
-            "SELECT dht_key, payload FROM podcast_dht_records
+    // The cached record of this (podcast, publisher), re-verified.
+    let cached: Option<(Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT payload, payload_bytes FROM podcast_dht_records
              WHERE podcast_id = ?1 AND publisher = ?2",
-        )?;
-        let rows = statement.query_map(params![podcast_id, publisher], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        for row in rows {
-            let (key, payload) = row?;
-            let decoded = decode_valid(&payload, network_id, now_ms);
-            match (<[u8; 32]>::try_from(key.as_slice()), decoded) {
-                (Ok(key_bytes), Some(cached)) => {
-                    existing.insert(key_bytes, cached);
-                }
-                _ => invalid_keys.push(key),
+            params![podcast_id, publisher],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (existing, existing_bytes) = match cached {
+        Some((payload, bytes)) => match decode_valid(&payload, network_id, now_ms) {
+            Some(existing) => (Some(existing), bytes.max(0) as usize),
+            None => {
+                delete_owner(conn, &podcast_id, &publisher)?;
+                (None, 0)
             }
+        },
+        None => {
+            // Stray placements without a record.
+            delete_owner(conn, &podcast_id, &publisher)?;
+            (None, 0)
         }
-    }
-    for key in invalid_keys {
-        conn.execute(
-            "DELETE FROM podcast_dht_records
-             WHERE dht_key = ?1 AND podcast_id = ?2 AND publisher = ?3",
-            params![key, podcast_id, publisher],
-        )?;
-    }
+    };
 
-    // A tombstone or a newer revision cached under any key wins everywhere.
-    if existing
-        .values()
-        .any(|cached| supersedes_everywhere(cached, record))
+    // Higher revision, tombstone at an equal revision, later republish...
+    let replace = match &existing {
+        Some(existing) => match compare_records(existing, record) {
+            std::cmp::Ordering::Greater => return Ok(0),
+            std::cmp::Ordering::Equal => false,
+            std::cmp::Ordering::Less => true,
+        },
+        None => true,
+    };
+    let payload = postcard::to_stdvec(record).map_err(to_sql_error)?;
+    if replace
+        && !admits_record(
+            conn,
+            limits,
+            &publisher,
+            existing.is_none(),
+            existing_bytes,
+            payload.len(),
+            now,
+        )?
     {
         return Ok(0);
     }
 
-    let payload = postcard::to_stdvec(record).map_err(to_sql_error)?;
+    let mut indexed: HashSet<[u8; 32]> = HashSet::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT dht_key FROM podcast_dht_keys WHERE podcast_id = ?1 AND publisher = ?2",
+        )?;
+        let rows = statement.query_map(params![podcast_id, publisher], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        for row in rows {
+            if let Ok(key) = <[u8; 32]>::try_from(row?.as_slice()) {
+                indexed.insert(key);
+            }
+        }
+    }
+
     let mut written = 0;
+    if replace {
+        // Placements the new version no longer belongs under are dropped (a
+        // renamed card, or a tombstone that does not list the key); the others
+        // now serve the new version.
+        let belongs: HashSet<[u8; 32]> = record
+            .dht_keys()
+            .iter()
+            .map(|key| *key.as_bytes())
+            .collect();
+        let stale: Vec<[u8; 32]> = indexed
+            .iter()
+            .filter(|key| !belongs.contains(*key))
+            .copied()
+            .collect();
+        for key in stale {
+            conn.execute(
+                "DELETE FROM podcast_dht_keys
+                 WHERE dht_key = ?1 AND podcast_id = ?2 AND publisher = ?3",
+                params![key.as_slice(), podcast_id, publisher],
+            )?;
+            indexed.remove(&key);
+        }
+        written += conn.execute(
+            "UPDATE podcast_dht_keys SET tombstone = ?3, expires_at_ms = ?4
+             WHERE podcast_id = ?1 AND publisher = ?2",
+            params![
+                podcast_id,
+                publisher,
+                record.is_tombstone(),
+                clamp_i64(record.expires_at_ms()),
+            ],
+        )?;
+    }
+
+    // New placements. A tombstone only takes a new place under the podcast-id
+    // key: under a text key it may only replace a record of its owner, so
+    // nobody can index tombstones under someone else's search terms.
+    let id_key = PodcastDhtKey::podcast(network_id, record.podcast_id());
     for key in keys {
-        if let Some(cached) = existing.get(key.as_bytes())
-            && compare_records(cached, record).is_ge()
-        {
+        if indexed.contains(key.as_bytes()) {
             continue;
         }
-        if !existing.contains_key(key.as_bytes()) && !make_room(conn, key, record, now_ms)? {
+        if record.is_tombstone() && *key != id_key {
+            continue;
+        }
+        if !admits_placement(conn, limits, key, record.is_tombstone(), now)? {
             continue;
         }
         conn.execute(
-            "INSERT INTO podcast_dht_records
-                 (dht_key, podcast_id, publisher, tombstone, expires_at_ms, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(dht_key, podcast_id, publisher) DO UPDATE SET
-                 tombstone = excluded.tombstone,
-                 expires_at_ms = excluded.expires_at_ms,
-                 payload = excluded.payload",
+            "INSERT INTO podcast_dht_keys
+                 (dht_key, podcast_id, publisher, tombstone, expires_at_ms, first_stored_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 key.as_bytes().as_slice(),
                 podcast_id,
                 publisher,
                 record.is_tombstone(),
                 clamp_i64(record.expires_at_ms()),
-                payload,
+                now,
             ],
         )?;
+        indexed.insert(*key.as_bytes());
         written += 1;
     }
 
-    // Drop versions the new record makes obsolete under other keys too.
-    if written > 0 {
-        for (key, cached) in &existing {
-            if !keys.iter().any(|stored| stored.as_bytes() == key)
-                && supersedes_everywhere(record, cached)
-            {
-                conn.execute(
-                    "DELETE FROM podcast_dht_records
-                     WHERE dht_key = ?1 AND podcast_id = ?2 AND publisher = ?3",
-                    params![key.as_slice(), podcast_id, publisher],
-                )?;
-            }
-        }
+    if indexed.is_empty() {
+        delete_owner(conn, &podcast_id, &publisher)?;
+        return Ok(0);
+    }
+    if replace {
+        conn.execute(
+            "INSERT INTO podcast_dht_records
+                 (podcast_id, publisher, tombstone, expires_at_ms, payload_bytes, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(podcast_id, publisher) DO UPDATE SET
+                 tombstone = excluded.tombstone,
+                 expires_at_ms = excluded.expires_at_ms,
+                 payload_bytes = excluded.payload_bytes,
+                 payload = excluded.payload",
+            params![
+                podcast_id,
+                publisher,
+                record.is_tombstone(),
+                clamp_i64(record.expires_at_ms()),
+                payload.len() as i64,
+                payload,
+            ],
+        )?;
     }
     Ok(written)
 }
 
-/// Ensures there is room for one more record under `key`.
-fn make_room(
+/// Whether the cache may hold the new version of a record: per-publisher and
+/// global record counts for a new owner, and the global byte budget.
+fn admits_record(
     conn: &Connection,
-    key: &PodcastDhtKey,
-    record: &SignedPodcastRecord,
-    now_ms: u64,
+    limits: &StoreLimits,
+    publisher: &str,
+    new_owner: bool,
+    previous_bytes: usize,
+    new_bytes: usize,
+    now: i64,
 ) -> rusqlite::Result<bool> {
-    conn.execute(
-        "DELETE FROM podcast_dht_records WHERE dht_key = ?1 AND expires_at_ms <= ?2",
-        params![key.as_bytes().as_slice(), clamp_i64(now_ms)],
+    let (records, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM podcast_dht_records
+         WHERE expires_at_ms > ?1",
+        [now],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM podcast_dht_records WHERE dht_key = ?1",
-        [key.as_bytes().as_slice()],
-        |row| row.get(0),
-    )?;
-    if (count as usize) < MAX_PODCAST_RECORDS_PER_KEY {
+    let bytes = (bytes.max(0) as usize).saturating_sub(previous_bytes);
+    if bytes.saturating_add(new_bytes) > limits.bytes {
+        return Ok(false);
+    }
+    if !new_owner {
         return Ok(true);
     }
-    let victim: Option<(String, String, i64)> = conn
-        .query_row(
-            "SELECT podcast_id, publisher, expires_at_ms FROM podcast_dht_records
-             WHERE dht_key = ?1
-             ORDER BY expires_at_ms ASC, podcast_id, publisher
-             LIMIT 1",
-            [key.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    match victim {
-        Some((podcast_id, publisher, expires_at_ms))
-            if expires_at_ms < clamp_i64(record.expires_at_ms()) =>
-        {
-            conn.execute(
-                "DELETE FROM podcast_dht_records
-                 WHERE dht_key = ?1 AND podcast_id = ?2 AND publisher = ?3",
-                params![key.as_bytes().as_slice(), podcast_id, publisher],
-            )?;
-            Ok(true)
-        }
-        _ => Ok(false),
+    if records.max(0) as usize >= limits.records {
+        return Ok(false);
     }
+    let own: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM podcast_dht_records WHERE publisher = ?1 AND expires_at_ms > ?2",
+        params![publisher, now],
+        |row| row.get(0),
+    )?;
+    Ok((own.max(0) as usize) < limits.per_publisher)
+}
+
+/// Whether `key` has room for one more placement. Existing placements are
+/// never evicted.
+fn admits_placement(
+    conn: &Connection,
+    limits: &StoreLimits,
+    key: &PodcastDhtKey,
+    tombstone: bool,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let (total, tombstones): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(tombstone), 0) FROM podcast_dht_keys
+         WHERE dht_key = ?1 AND expires_at_ms > ?2",
+        params![key.as_bytes().as_slice(), now],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((total.max(0) as usize) < limits.per_key
+        && (!tombstone || (tombstones.max(0) as usize) < limits.tombstones_per_key))
+}
+
+fn delete_owner(conn: &Connection, podcast_id: &str, publisher: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM podcast_dht_keys WHERE podcast_id = ?1 AND publisher = ?2",
+        params![podcast_id, publisher],
+    )?;
+    conn.execute(
+        "DELETE FROM podcast_dht_records WHERE podcast_id = ?1 AND publisher = ?2",
+        params![podcast_id, publisher],
+    )?;
+    Ok(())
 }
 
 fn decode_valid(

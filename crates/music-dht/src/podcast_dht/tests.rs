@@ -3,7 +3,8 @@
 
 use federation_net::{NetworkId, SecretKey};
 
-use super::card::supersedes_everywhere;
+use crate::routing::NodeId;
+
 use super::search::{aggregate_hits, rank_hits};
 use super::*;
 use crate::podcast::{FeedUrl, PodcastMeta};
@@ -362,10 +363,6 @@ fn record_order_is_total_and_tombstones_win_ties() {
         compare_records(&edited, &older),
         compare_records(&older, &edited).reverse()
     );
-    assert!(supersedes_everywhere(&grave, &older));
-    assert!(supersedes_everywhere(&newer, &older));
-    assert!(!supersedes_everywhere(&refresh, &older));
-    assert!(!supersedes_everywhere(&older, &grave));
 }
 
 // --------------------------------------------------------------------- cache
@@ -437,7 +434,7 @@ async fn cache_converges_regardless_of_delivery_order() {
 }
 
 #[tokio::test]
-async fn cache_tombstone_supersedes_lower_and_equal_revisions_under_every_key() {
+async fn cache_tombstone_supersedes_lower_and_equal_revisions_under_every_key_it_holds() {
     let temp = tempfile::tempdir().unwrap();
     let db = open_db(&temp).await;
     let key = secret(1);
@@ -451,7 +448,7 @@ async fn cache_tombstone_supersedes_lower_and_equal_revisions_under_every_key() 
         vec![active.clone()]
     );
 
-    // A tombstone stored only under the id key still removes the card under
+    // A tombstone stored only under the id key still replaces the card under
     // the text keys of this node.
     let grave = tombstone(&key, 2, NOW);
     let id_key = PodcastDhtKey::podcast(&network(), grave.podcast_id());
@@ -462,7 +459,7 @@ async fn cache_tombstone_supersedes_lower_and_equal_revisions_under_every_key() 
         db.records_by_key(token_key, vec!["rust".into()], NOW, 10)
             .await
             .unwrap(),
-        Vec::<SignedPodcastRecord>::new()
+        vec![grave.clone()]
     );
     // An equal-revision card arriving later loses, under any key.
     let same = card(&key, 2);
@@ -564,43 +561,247 @@ async fn cache_read_path_filters_tokens_expiry_and_corruption() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        db.delete_expired(NOW + ttl).await.unwrap(),
-        MAX_RECORD_DHT_KEYS.min(record.dht_keys().len())
-    );
+    assert_eq!(db.delete_expired(NOW + ttl).await.unwrap(), 1);
+}
+
+fn numbered_secret(index: usize) -> SecretKey {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+    bytes[31] = 0x5a;
+    SecretKey::from_bytes(&bytes)
+}
+
+async fn open_db_with(
+    temp: &tempfile::TempDir,
+    limits: store::StoreLimits,
+) -> store::PodcastDhtDatabase {
+    store::PodcastDhtDatabase::open_with_limits(
+        &temp.path().join("podcast-dht.sqlite3"),
+        network(),
+        limits,
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
-async fn cache_bounds_records_per_key() {
+async fn cache_full_key_keeps_its_records_and_refuses_newcomers() {
     let temp = tempfile::tempdir().unwrap();
     let db = open_db(&temp).await;
     let token_key = PodcastDhtKey::token(&network(), "rust");
     let mut entries = Vec::new();
     for index in 0..=MAX_PODCAST_RECORDS_PER_KEY {
-        let key = SecretKey::from_bytes(&{
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
-            bytes
-        });
-        // Later publishers expire later, so the first one is evicted.
-        let record = card_with(spec("show.xml", "Rust Radio"), &key, 1, NOW + index as u64);
+        // Later publishers expire later; that buys them nothing.
+        let record = card_with(
+            spec("show.xml", "Rust Radio"),
+            &numbered_secret(index),
+            1,
+            NOW + index as u64,
+        );
         entries.push((vec![token_key], record));
     }
     let first = entries[0].1.clone();
-    for chunk in entries.chunks(64) {
-        db.store(chunk.to_vec(), NOW).await.unwrap();
+    let last = entries[MAX_PODCAST_RECORDS_PER_KEY].1.clone();
+    // The first publisher arrived first; the rest a moment later.
+    db.store(entries[..1].to_vec(), NOW).await.unwrap();
+    for chunk in entries[1..].chunks(64) {
+        db.store(chunk.to_vec(), NOW + 1).await.unwrap();
     }
     let cached = db
         .records_by_key(token_key, Vec::new(), NOW, usize::MAX)
         .await
         .unwrap();
     assert_eq!(cached.len(), MAX_PODCAST_RECORDS_PER_KEY);
-    assert!(!cached.contains(&first));
-    // A record expiring before every cached one is not admitted.
-    assert_eq!(
-        db.store(vec![(vec![token_key], first)], NOW).await.unwrap(),
-        0
+    assert!(cached.contains(&first));
+    assert!(!cached.contains(&last));
+    assert_eq!(cached[0], first, "records indexed longest come first");
+    // The first publisher keeps refreshing its place.
+    let refresh = card_with(
+        spec("show.xml", "Rust Radio"),
+        &numbered_secret(0),
+        1,
+        NOW + 1_000,
     );
+    assert_eq!(
+        db.store(vec![(vec![token_key], refresh)], NOW)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn sybil_tombstones_cannot_suppress_a_card() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db(&temp).await;
+    let victim = card(&secret(1), 1);
+    let id_key = PodcastDhtKey::podcast(&network(), victim.podcast_id());
+    let rust = PodcastDhtKey::token(&network(), "rust");
+    db.store(vec![entry(&victim)], NOW).await.unwrap();
+
+    // 256 throwaway identities sign tombstones of the victim's podcast that
+    // list the victim card's text keys, and issue them as late as allowed.
+    let skew = PODCAST_DHT_MAX_CLOCK_SKEW.as_millis() as u64;
+    let sybils: Vec<_> = (0..256)
+        .map(|index| {
+            let key = numbered_secret(index);
+            let tombstone = PodcastTombstone::new(
+                network(),
+                key.public(),
+                victim.podcast_id().clone(),
+                u64::MAX,
+                NOW + skew,
+                victim.dht_keys(),
+            );
+            let record =
+                SignedPodcastRecord::sign_tombstone(tombstone, |bytes| key.sign(bytes)).unwrap();
+            (record.dht_keys(), record)
+        })
+        .collect();
+    let mut written = 0;
+    for chunk in sybils.chunks(MAX_PODCAST_STORE_RECORDS) {
+        written += db.store(chunk.to_vec(), NOW).await.unwrap();
+    }
+    assert_eq!(
+        written, MAX_PODCAST_TOMBSTONES_PER_KEY,
+        "only the id key's tombstone budget is used"
+    );
+
+    let by_id = db
+        .records_by_key(id_key, Vec::new(), NOW, MAX_PODCAST_DHT_RECORDS)
+        .await
+        .unwrap();
+    assert!(by_id.contains(&victim));
+    assert_eq!(
+        by_id.iter().filter(|record| record.is_tombstone()).count(),
+        MAX_PODCAST_RESPONSE_TOMBSTONES
+    );
+    assert_eq!(
+        db.records_by_key(rust, vec!["rust".into()], NOW, MAX_PODCAST_DHT_RECORDS)
+            .await
+            .unwrap(),
+        vec![victim.clone()],
+        "no tombstone is indexed under a text key without its owner's card"
+    );
+    // Eleven hours later the victim's republish still lands.
+    let later = NOW + 11 * 3_600_000;
+    let republished = card_with(spec("show.xml", "Rust Radio"), &secret(1), 1, later);
+    assert_eq!(
+        db.store(vec![entry(&republished)], later).await.unwrap(),
+        republished.dht_keys().len()
+    );
+    // Sybil cards issued in the future cannot displace it either.
+    let sybil_cards: Vec<_> = (300..600)
+        .map(|index| {
+            entry(&card_with(
+                spec("show.xml", "Rust Radio"),
+                &numbered_secret(index),
+                u64::MAX,
+                later + skew,
+            ))
+        })
+        .collect();
+    for chunk in sybil_cards.chunks(MAX_PODCAST_STORE_RECORDS) {
+        db.store(chunk.to_vec(), later).await.unwrap();
+    }
+    for key in [id_key, rust] {
+        let records = db
+            .records_by_key(key, vec![], later, MAX_PODCAST_DHT_RECORDS)
+            .await
+            .unwrap();
+        assert!(records.contains(&republished));
+        assert!(records.len() <= MAX_PODCAST_DHT_RECORDS);
+    }
+}
+
+#[tokio::test]
+async fn cache_enforces_publisher_record_and_byte_quotas() {
+    let limits = store::StoreLimits {
+        per_key: 100,
+        tombstones_per_key: 10,
+        per_publisher: 3,
+        records: 5,
+        bytes: usize::MAX,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db_with(&temp, limits).await;
+    let show = |index: usize, key: &SecretKey| {
+        entry(&card_with(
+            spec(&format!("show-{index}.xml"), "Rust Radio"),
+            key,
+            1,
+            NOW,
+        ))
+    };
+    let heavy = secret(1);
+    let stored: Vec<usize> = {
+        let mut out = Vec::new();
+        for index in 0..4 {
+            out.push(db.store(vec![show(index, &heavy)], NOW).await.unwrap());
+        }
+        out
+    };
+    assert!(stored[..3].iter().all(|written| *written > 0));
+    assert_eq!(
+        stored[3], 0,
+        "the fourth podcast of one publisher is refused"
+    );
+    // A refresh of an admitted record is always accepted.
+    let refresh = card_with(spec("show-0.xml", "Rust Radio"), &heavy, 1, NOW + 1);
+    assert!(db.store(vec![entry(&refresh)], NOW).await.unwrap() > 0);
+    assert!(db.store(vec![show(10, &secret(2))], NOW).await.unwrap() > 0);
+    assert!(db.store(vec![show(11, &secret(3))], NOW).await.unwrap() > 0);
+    assert_eq!(
+        db.store(vec![show(12, &secret(4))], NOW).await.unwrap(),
+        0,
+        "the cache holds at most five records"
+    );
+
+    let one = card(&secret(1), 1);
+    let limits = store::StoreLimits {
+        bytes: one.encoded_len() * 2,
+        ..store::StoreLimits::default()
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db_with(&temp, limits).await;
+    assert!(
+        db.store(vec![entry(&card(&secret(1), 1))], NOW)
+            .await
+            .unwrap()
+            > 0
+    );
+    assert!(
+        db.store(vec![entry(&card(&secret(2), 1))], NOW)
+            .await
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        db.store(vec![entry(&card(&secret(3), 1))], NOW)
+            .await
+            .unwrap(),
+        0,
+        "the byte budget is full"
+    );
+}
+
+#[tokio::test]
+async fn cache_stores_each_payload_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = open_db(&temp).await;
+    let many: Vec<String> = (0..50).map(|index| format!("w{index}")).collect();
+    let record = card_with(spec("show.xml", &many.join(" ")), &secret(1), 1, NOW);
+    assert_eq!(
+        db.store(vec![entry(&record)], NOW).await.unwrap(),
+        MAX_RECORD_DHT_KEYS
+    );
+    let conn = rusqlite::Connection::open(temp.path().join("podcast-dht.sqlite3")).unwrap();
+    let payloads: i64 = conn
+        .query_row("SELECT COUNT(*) FROM podcast_dht_records", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(payloads, 1);
 }
 
 #[tokio::test]
@@ -634,6 +835,25 @@ async fn cache_refuses_a_newer_schema_and_keeps_local_publications() {
     assert_eq!(local[0].record, record);
     drop(db);
 
+    // A pre-release version-1 replica table is dropped; own publications
+    // survive.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE podcast_dht_records;
+             CREATE TABLE podcast_dht_records (dht_key BLOB, payload BLOB);
+             INSERT INTO podcast_dht_records VALUES (x'00', x'00');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let db = store::PodcastDhtDatabase::open(&path, network())
+        .await
+        .unwrap();
+    assert_eq!(db.local_publications().await.unwrap().len(), 1);
+    assert!(db.store(vec![entry(&record)], NOW).await.unwrap() > 0);
+    drop(db);
+
     rusqlite::Connection::open(&path)
         .unwrap()
         .pragma_update(None, "user_version", PODCAST_DHT_CACHE_SCHEMA_VERSION + 1)
@@ -655,12 +875,14 @@ fn store_batches_are_bounded_and_keys_must_belong() {
         keys: record.dht_keys(),
         record: record.clone(),
     };
-    validate_store_batch(vec![good.clone()], &network(), NOW).unwrap();
-    assert!(validate_store_batch(Vec::new(), &network(), NOW).is_err());
+    let publisher = key.public();
+    validate_store_batch(vec![good.clone()], &network(), publisher, NOW).unwrap();
+    assert!(validate_store_batch(Vec::new(), &network(), publisher, NOW).is_err());
     assert!(
         validate_store_batch(
             vec![good.clone(); MAX_PODCAST_STORE_RECORDS],
             &network(),
+            publisher,
             NOW
         )
         .is_ok()
@@ -669,19 +891,87 @@ fn store_batches_are_bounded_and_keys_must_belong() {
         validate_store_batch(
             vec![good.clone(); MAX_PODCAST_STORE_RECORDS + 1],
             &network(),
+            publisher,
             NOW
         )
         .is_err()
     );
     let mut foreign = good.clone();
     foreign.keys = vec![PodcastDhtKey::token(&network(), "jazz")];
-    assert!(validate_store_batch(vec![foreign], &network(), NOW).is_err());
+    assert!(validate_store_batch(vec![foreign], &network(), publisher, NOW).is_err());
     let mut duplicated = good.clone();
     duplicated.keys = vec![duplicated.keys[0], duplicated.keys[0]];
-    assert!(validate_store_batch(vec![duplicated], &network(), NOW).is_err());
-    let mut forged = good;
+    assert!(validate_store_batch(vec![duplicated], &network(), publisher, NOW).is_err());
+    let mut forged = good.clone();
     resign(&mut forged.record, &secret(2));
-    assert!(validate_store_batch(vec![forged], &network(), NOW).is_err());
+    assert!(validate_store_batch(vec![forged], &network(), publisher, NOW).is_err());
+    // A valid record of another publisher may not be stored (or replayed)
+    // by anyone else.
+    let error = validate_store_batch(vec![good], &network(), secret(2).public(), NOW).unwrap_err();
+    assert!(error.to_string().contains("publisher"), "{error}");
+}
+
+#[test]
+fn replicas_only_accept_keys_they_are_close_to() {
+    let own = NodeId::from_bytes([0; 32]);
+    let key = PodcastDhtKey::from_bytes([0; 32]);
+    let far: Vec<NodeId> = (0..100)
+        .map(|index| NodeId::from_bytes([0x80 | index as u8; 32]))
+        .collect();
+    assert!(is_responsible(&own, &far, &key));
+    let near: Vec<NodeId> = (1..=PODCAST_STORE_RESPONSIBILITY_WINDOW)
+        .map(|index| {
+            let mut bytes = [0; 32];
+            bytes[31] = index as u8;
+            NodeId::from_bytes(bytes)
+        })
+        .collect();
+    let own = NodeId::from_bytes([0xff; 32]);
+    assert!(!is_responsible(&own, &near, &key));
+    assert!(is_responsible(&own, &near[1..], &key));
+}
+
+#[test]
+fn inbound_requests_are_limited_per_peer() {
+    let inflight = Arc::new(Mutex::new(HashMap::new()));
+    let peer = secret(1).public();
+    let slots: Vec<_> = (0..MAX_PODCAST_DHT_REQUESTS_PER_PEER)
+        .map(|_| PeerSlot::acquire(&inflight, peer).unwrap())
+        .collect();
+    assert!(PeerSlot::acquire(&inflight, peer).is_none());
+    assert!(PeerSlot::acquire(&inflight, secret(2).public()).is_some());
+    drop(slots);
+    assert!(PeerSlot::acquire(&inflight, peer).is_some());
+    assert!(lock(&inflight).is_empty());
+}
+
+#[test]
+fn lookups_keep_a_bounded_number_of_owners() {
+    let mut winners = HashMap::new();
+    let id_key = PodcastDhtKey::podcast(&network(), card(&secret(1), 1).podcast_id());
+    let records: Vec<_> = (0..=MAX_PODCAST_LOOKUP_RECORDS)
+        .map(|index| {
+            card_with(
+                spec("show.xml", "Rust Radio"),
+                &numbered_secret(index),
+                1,
+                now_ms(),
+            )
+        })
+        .collect();
+    let first = records[0].clone();
+    merge_records(&mut winners, records, &network(), &id_key, &[]);
+    assert_eq!(winners.len(), MAX_PODCAST_LOOKUP_RECORDS);
+    // A newer record of a known owner still replaces its winner.
+    let newer = card_with(
+        spec("show.xml", "Rust Radio"),
+        &numbered_secret(0),
+        2,
+        now_ms(),
+    );
+    merge_records(&mut winners, vec![newer.clone()], &network(), &id_key, &[]);
+    let owner = (first.podcast_id().clone(), first.publisher());
+    assert_eq!(winners[&owner], newer);
 }
 
 #[test]
@@ -763,18 +1053,27 @@ fn music(name: &str, kind: ItemKind) -> LibraryItem {
     }
 }
 
+fn moved_spec(path: &str, origin: &str, title: &str) -> PodcastCardSpec {
+    let mut moved = spec(path, title);
+    moved.id_feed_url = Some(feed(origin));
+    moved.podcast_id = PodcastId::from_feed_url(&feed(origin));
+    moved
+}
+
 #[test]
 fn hits_merge_publishers_and_drop_tombstoned_ones() {
     let a = secret(1);
     let b = secret(2);
     let c = secret(3);
-    let mut moved = spec("moved.xml", "Rust Radio");
-    moved.id_feed_url = Some(feed("show.xml"));
-    moved.podcast_id = PodcastId::from_feed_url(&feed("show.xml"));
     let records = vec![
         card(&a, 1),
         card(&a, 2),
-        card_with(moved, &b, 1, NOW + 10),
+        card_with(
+            moved_spec("moved.xml", "show.xml", "Rust Radio"),
+            &b,
+            1,
+            NOW + 10,
+        ),
         card(&c, 1),
         tombstone(&c, 2, NOW),
         card_with(spec("other.xml", "Rust Hour"), &a, 1, NOW),
@@ -790,8 +1089,81 @@ fn hits_merge_publishers_and_drop_tombstoned_ones() {
     let mut expected = vec![a.public(), b.public()];
     expected.sort_by_key(|key| *key.as_bytes());
     assert_eq!(hit.publishers, expected);
-    // Equal votes per feed URL: the most recently issued card represents.
-    assert_eq!(hit.card.publisher, b.public());
+    // The card under the origin URL represents, whoever issued later.
+    assert_eq!(hit.card.publisher, a.public());
+    assert_eq!(hit.feed_url, feed("show.xml"));
+    assert_eq!(
+        hit.claimed_feed_urls,
+        vec![ClaimedFeedUrl {
+            feed_url: feed("moved.xml"),
+            publishers: vec![b.public()],
+        }]
+    );
+}
+
+#[test]
+fn sybil_cards_cannot_redirect_an_existing_podcast() {
+    let genuine = card(&secret(1), 1);
+    let id = genuine.podcast_id().clone();
+    let evil_feed = FeedUrl::parse("https://evil.example/feed.xml").unwrap();
+    let hijack = |seed: usize| {
+        let mut spec = spec("show.xml", "Rust Radio (official)");
+        spec.id_feed_url = Some(spec.feed_url.clone());
+        spec.feed_url = evil_feed.clone();
+        spec.validate().unwrap();
+        assert_eq!(spec.podcast_id, id, "a hijack card claims the genuine id");
+        let skew = PODCAST_DHT_MAX_CLOCK_SKEW.as_millis() as u64;
+        card_with(spec, &numbered_secret(seed), u64::MAX, NOW + skew)
+    };
+    let mut records = vec![genuine.clone()];
+    records.extend((0..10).map(hijack));
+    let hit = aggregate_hits(records).remove(0);
+    assert_eq!(
+        hit.feed_url,
+        feed("show.xml"),
+        "only the origin URL is offered"
+    );
+    assert_eq!(
+        hit.card,
+        *genuine.card().unwrap(),
+        "the origin card represents"
+    );
+    assert_eq!(hit.claimed_feed_urls.len(), 1);
+    assert_eq!(hit.claimed_feed_urls[0].feed_url, evil_feed);
+    assert_eq!(hit.claimed_feed_urls[0].publishers.len(), 10);
+
+    // Without any origin card the hit still offers the origin URL, never the
+    // claimed one, and ranks below podcasts that have an origin card.
+    let only_claims = aggregate_hits((0..3).map(hijack)).remove(0);
+    assert_eq!(only_claims.feed_url, feed("show.xml"));
+    assert!(!only_claims.card.feed_url_is_origin());
+    let honest = aggregate_hits(vec![card_with(
+        spec("b.xml", "Rust Radio Weekly"),
+        &secret(2),
+        1,
+        NOW,
+    )])
+    .remove(0);
+    let ranked = rank_hits(
+        vec![only_claims.clone(), honest.clone()],
+        "rust",
+        &podcast_query_tokens("rust"),
+    );
+    assert_eq!(ranked[0].podcast_id, honest.podcast_id);
+    // Publisher counts do not rank.
+    let crowded = aggregate_hits(
+        (20..60).map(|seed| card_with(spec("c.xml", "Rust Zone"), &numbered_secret(seed), 1, NOW)),
+    )
+    .remove(0);
+    let ranked = rank_hits(
+        vec![crowded, honest.clone()],
+        "rust",
+        &podcast_query_tokens("rust"),
+    );
+    assert_eq!(
+        ranked[0].podcast_id, honest.podcast_id,
+        "ranked by title, not crowd"
+    );
 }
 
 #[test]

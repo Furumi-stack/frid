@@ -1,15 +1,23 @@
 //! Integration test: public podcast discovery on three real loopback iroh
 //! nodes.
 //!
-//! * A publishes a podcast its user shared; B is one of A's trusted devices
-//!   (in this test merely another overlay node, then offline); C is an
-//!   unrelated peer outside A's trusted-device group, with no device-sync
-//!   pairing.
-//! * C finds the card by text and by id; a podcast A never shared is never
-//!   discoverable; after A unpublishes, the tombstone hides the card from C.
-//! * Forged, tampered, replayed, malformed, oversized and wrong-version
-//!   requests are rejected by a real peer.
-//! * D, a music-DHT peer without the overlay, is never added to the overlay.
+//! * A publishes a podcast its user shared. B is another device of the same
+//!   user: it applies the same merged registers (as device sync would deliver
+//!   them) and publishes the same podcast under its own key. C is an
+//!   unrelated peer outside the user's trusted-device group, with no
+//!   device-sync pairing.
+//! * C finds the podcast by text and by id, merged over publishers {A, B};
+//!   once B unshares and goes offline, C still finds A's card, so B is
+//!   irrelevant to discovery. A podcast the user never shared (held by both
+//!   A and B) is never discoverable; after A unpublishes, the tombstone hides
+//!   the card from C.
+//! * Forged, foreign, tampered, replayed, malformed, oversized and
+//!   wrong-version requests are rejected by a real peer.
+//! * D, a music-DHT peer without the overlay, is dialed by bootstrap but
+//!   never answers on the overlay ALPN, so it never becomes an overlay contact
+//!   and is never asked for records or to store them.
+//! * `sync_shares` stays fail-safe for revocation and holds back URLs that
+//!   look private (single node).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -214,14 +222,15 @@ async fn scenario() {
         (a.dht.known_peers() >= 2 && c.dht.known_peers() >= 1).then_some(())
     })
     .await;
-    // D never answers on the overlay ALPN, so it never becomes an overlay
-    // contact and is never queried or asked to store records.
+    // D is dialed by bootstrap but never answers on the overlay ALPN, so it
+    // never becomes an overlay contact: it is never asked for records or to
+    // store them.
     a.dht.bootstrap().await.unwrap();
     assert_eq!(a.dht.known_peers(), 2);
 
     // A capability manifest without podcast_dht evicts a peer; one with it
     // lets the peer be learned again.
-    let manifest = CapabilityManifest::frid("furumi", "test");
+    let manifest = CapabilityManifest::frid("furumi", "test").with_podcast_dht();
     a.dht
         .note_peer_capabilities(
             c.service.endpoint_id(),
@@ -260,11 +269,13 @@ async fn scenario() {
             subscription: shared.clone(),
             share: Some(share(&shared, true, 2)),
             card: None,
+            privacy_confirmed: false,
         },
         PodcastShareState {
             subscription: private.clone(),
             share: None,
             card: None,
+            privacy_confirmed: false,
         },
     ];
     let stats = a.dht.sync_shares(states.clone()).await.unwrap();
@@ -294,7 +305,54 @@ async fn scenario() {
     assert_eq!(published.len(), 1);
     let first_card = published[0].record.clone();
 
-    // B (A's trusted device) is not needed for discovery.
+    // B, the same user's other device, holds the same merged registers and
+    // publishes the same podcast under its own key; the private podcast
+    // stays private there too.
+    let b_states = vec![
+        PodcastShareState {
+            subscription: shared.clone(),
+            share: Some(share(&shared, true, 2)),
+            card: None,
+            privacy_confirmed: false,
+        },
+        PodcastShareState {
+            subscription: private.clone(),
+            share: None,
+            card: None,
+            privacy_confirmed: false,
+        },
+    ];
+    let stats = b.dht.sync_shares(b_states).await.unwrap();
+    assert_eq!((stats.published, stats.unpublished), (1, 0));
+    let mut both = vec![a.service.endpoint_id(), b.service.endpoint_id()];
+    both.sort_by_key(|key| *key.as_bytes());
+    let hits = wait_for("C sees both publishers", async || {
+        let hits = search(&c, "rust radio").await;
+        (hits.len() == 1 && hits[0].publishers == both).then_some(hits)
+    })
+    .await;
+    assert_eq!(hits[0].feed_url, shared.podcast.feed_url);
+    assert!(hits[0].claimed_feed_urls.is_empty());
+
+    // B unshares (for example a stale register on B) and goes offline: B is
+    // not needed for discovery, A's card is still found.
+    let stats = b
+        .dht
+        .sync_shares(vec![PodcastShareState {
+            subscription: shared.clone(),
+            share: Some(share(&shared, false, 3)),
+            card: None,
+            privacy_confirmed: false,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(stats.unpublished, 1);
+    let a_only = vec![a.service.endpoint_id()];
+    wait_for("B's tombstone reaches C's lookup", async || {
+        let hits = search(&c, "rust radio").await;
+        (hits.len() == 1 && hits[0].publishers == a_only).then_some(())
+    })
+    .await;
     b.stop().await;
 
     let hits = wait_for("C finds the card by text", async || {
@@ -305,6 +363,7 @@ async fn scenario() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].podcast_id, shared.podcast_id);
     assert_eq!(hits[0].publishers, vec![a.service.endpoint_id()]);
+    assert_eq!(hits[0].feed_url, shared.podcast.feed_url);
     assert_eq!(hits[0].card.feed_url, shared.podcast.feed_url);
     assert_eq!(hits[0].card.title, "Rust Radio Weekly");
     assert_eq!(search(&c, "ferris weekly").await.len(), 1, "author tokens");
@@ -350,7 +409,11 @@ async fn scenario() {
     let response = store_request(&c, &a, forged).await;
     assert!(!response.ok && response.stored == 0, "{response:?}");
 
-    // Tampered: A's genuine card with a different feed URL.
+    // Foreign: A's genuine card stored by C. Only publishers store records.
+    let response = store_request(&c, &a, first_card.clone()).await;
+    assert!(!response.ok && response.stored == 0, "{response:?}");
+
+    // Tampered: A's genuine card with a different description.
     let mut tampered = first_card.clone();
     if let PodcastRecordBody::Card(card) = &mut tampered.body {
         card.description = Some("Now with malware".into());
@@ -388,6 +451,7 @@ async fn scenario() {
         subscription: shared.clone(),
         share: Some(share(&shared, false, 3)),
         card: None,
+        privacy_confirmed: false,
     }];
     let stats = a.dht.sync_shares(unshare).await.unwrap();
     assert_eq!(stats.unpublished, 1);
@@ -407,10 +471,12 @@ async fn scenario() {
             .is_none()
     );
 
-    // Replaying the old card, even to the node that stores the tombstone,
-    // does not bring it back.
-    let response = store_request(&c, &a, first_card).await;
+    // A replaying its own old card to a replica that stores the tombstone
+    // does not bring it back; nobody else may replay it at all.
+    let response = store_request(&a, &c, first_card.clone()).await;
     assert!(response.ok && response.stored == 0, "{response:?}");
+    let response = store_request(&c, &a, first_card).await;
+    assert!(!response.ok, "{response:?}");
     assert!(search(&c, "rust radio").await.is_empty());
     assert!(search(&a, "rust radio").await.is_empty());
 
@@ -418,4 +484,85 @@ async fn scenario() {
     c.stop().await;
     d_events.abort();
     d.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_shares_is_fail_safe_and_holds_back_private_urls() {
+    tokio::time::timeout(TEST_TIMEOUT, single_node_scenario())
+        .await
+        .unwrap();
+}
+
+async fn single_node_scenario() {
+    let temp = tempfile::tempdir().unwrap();
+    let network = NetworkId::from_name("podcast-dht-sync-shares");
+    let a = Node::start(&temp.path().join("a"), network).await;
+    let state =
+        |subscription: &SubscriptionRecord, shared: bool, generation: u64| PodcastShareState {
+            subscription: subscription.clone(),
+            share: Some(share(subscription, shared, generation)),
+            card: None,
+            privacy_confirmed: false,
+        };
+    let first = subscription("first.xml", "First Show");
+    let second = subscription("second.xml", "Second Show");
+    let stats = a
+        .dht
+        .sync_shares(vec![state(&first, true, 2), state(&second, true, 2)])
+        .await
+        .unwrap();
+    assert_eq!(stats.published, 2);
+    assert!(stats.failed.is_empty() && stats.held_back.is_empty());
+
+    // In one call the user unshares the first podcast while the second
+    // one's card cannot be built (the URL its id derives from is unknown).
+    let mut broken = second.clone();
+    broken.podcast.feed_url = feed("elsewhere.xml");
+    let stats = a
+        .dht
+        .sync_shares(vec![state(&first, false, 3), state(&broken, true, 2)])
+        .await
+        .unwrap();
+    assert_eq!(stats.failed.len(), 1);
+    assert_eq!(stats.failed[0].podcast_id, second.podcast_id);
+    assert_eq!(stats.unpublished, 2, "the unshared and the broken podcast");
+    let published = a.dht.published().await.unwrap();
+    assert!(published.iter().all(|publication| !publication.active));
+    assert!(
+        published
+            .iter()
+            .all(|publication| publication.record.is_tombstone())
+    );
+    // Republishing re-sends tombstones only; nothing comes back.
+    a.dht.republish().await.unwrap();
+    assert!(search(&a, "first show").await.is_empty());
+    assert!(search(&a, "second show").await.is_empty());
+
+    // A feed URL that looks private is held back until the user confirms.
+    let mut member = subscription("member.xml?token=abc", "Member Show");
+    member.podcast_id = PodcastId::from_feed_url(&member.podcast.feed_url);
+    let stats = a
+        .dht
+        .sync_shares(vec![state(&member, true, 2)])
+        .await
+        .unwrap();
+    assert_eq!(stats.published, 0);
+    assert_eq!(stats.held_back.len(), 1);
+    assert_eq!(stats.held_back[0].podcast_id, member.podcast_id);
+    assert!(!stats.held_back[0].warnings.is_empty());
+    assert!(search(&a, "member show").await.is_empty());
+    let mut confirmed = state(&member, true, 2);
+    confirmed.privacy_confirmed = true;
+    let stats = a.dht.sync_shares(vec![confirmed]).await.unwrap();
+    assert_eq!(stats.published, 1);
+    assert_eq!(search(&a, "member show").await.len(), 1);
+    // Once published with the user's consent, the same URLs are kept.
+    let stats = a
+        .dht
+        .sync_shares(vec![state(&member, true, 2)])
+        .await
+        .unwrap();
+    assert_eq!((stats.unchanged, stats.held_back.len()), (1, 0));
+
+    a.stop().await;
 }

@@ -396,6 +396,19 @@ impl PodcastCard {
         card_index_tokens(&self.title, self.author.as_deref())
     }
 
+    /// The URL `podcast_id` is derived from (`id_feed_url`, or `feed_url`
+    /// when the feed has not moved). A valid card's id hashes from it, so it
+    /// is the only URL of the card bound to the podcast.
+    pub fn origin_feed_url(&self) -> &FeedUrl {
+        self.id_feed_url.as_ref().unwrap_or(&self.feed_url)
+    }
+
+    /// Whether `feed_url` is the URL the id is derived from. Otherwise
+    /// `feed_url` is an unverified claim of the publisher that the feed moved.
+    pub fn feed_url_is_origin(&self) -> bool {
+        self.id_feed_url.is_none()
+    }
+
     /// Canonical signing input (see `PODCASTS.md`).
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut out = Canonical::new(PODCAST_CARD_SIGNING_DOMAIN);
@@ -733,18 +746,6 @@ pub fn compare_records(left: &SignedPodcastRecord, right: &SignedPodcastRecord) 
         .then_with(|| left.issued_at_ms().cmp(&right.issued_at_ms()))
         .then_with(|| left.expires_at_ms().cmp(&right.expires_at_ms()))
         .then_with(|| left.signing_bytes().cmp(&right.signing_bytes()))
-}
-
-/// Whether `winner` makes `other` obsolete everywhere, not just under one key:
-/// `other` is a card of a lower revision, or `winner` is a tombstone of an
-/// equal or higher revision.
-pub(crate) fn supersedes_everywhere(
-    winner: &SignedPodcastRecord,
-    other: &SignedPodcastRecord,
-) -> bool {
-    !other.is_tombstone()
-        && (other.revision() < winner.revision()
-            || (winner.is_tombstone() && other.revision() <= winner.revision()))
 }
 
 struct Canonical(Vec<u8>);

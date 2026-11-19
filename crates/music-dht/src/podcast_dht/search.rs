@@ -8,15 +8,17 @@ use federation_net::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::normalization::{normalize_name, tokenize};
-use crate::podcast::PodcastId;
+use crate::podcast::{FeedUrl, PodcastId};
 use crate::record::{ItemKind, LibraryItem};
 
 use super::card::{MAX_INDEX_TOKEN_BYTES, PodcastCard, SignedPodcastRecord, compare_records};
 
 /// Maximum distinct query tokens used by a podcast text search.
 pub const MAX_PODCAST_QUERY_TOKENS: usize = 8;
-/// Maximum publishers reported per hit.
+/// Maximum publishers reported per hit and per claimed feed URL.
 pub const MAX_HIT_PUBLISHERS: usize = 64;
+/// Maximum claimed moved feed URLs reported per hit.
+pub const MAX_HIT_FEED_URL_CLAIMS: usize = 8;
 
 /// Kind of a federated search hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -64,18 +66,35 @@ impl From<ItemKind> for SearchHitKind {
 ///
 /// Cards of the same podcast published by several devices are merged by
 /// `podcast_id`. The hit carries no personal state of any publisher.
+///
+/// Only [`Self::feed_url`] is bound to the podcast: the id is its hash. Every
+/// other field is a claim of some publisher device, and device identities are
+/// free, so neither the metadata nor the number of publishers is a trust
+/// signal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodcastSearchHit {
     /// Podcast.
     pub podcast_id: PodcastId,
-    /// Representative card: the most common `feed_url` among the
-    /// publishers' current cards, then the most recently issued card, then
-    /// the greatest publisher key.
+    /// The URL `podcast_id` is derived from
+    /// (`PodcastId::from_feed_url(feed_url) == podcast_id`). Subscribe with
+    /// this URL; follow the feed's own HTTP redirects and
+    /// `itunes:new-feed-url` from there.
+    pub feed_url: FeedUrl,
+    /// Representative card for display: a card whose `feed_url` is the
+    /// origin URL when one exists, then the title most publishers agree on,
+    /// then the smallest publisher key. Its metadata is a publisher's claim.
     pub card: PodcastCard,
     /// Sorted distinct publisher devices with a current valid card, at most
     /// [`MAX_HIT_PUBLISHERS`]. These are devices, not users or subscribers:
-    /// one user may publish from several devices.
+    /// one user may publish from several devices, and anyone can mint
+    /// devices.
     pub publishers: Vec<EndpointId>,
+    /// Feed URLs other than [`Self::feed_url`] that publishers claim the
+    /// podcast moved to, most claimed first, at most
+    /// [`MAX_HIT_FEED_URL_CLAIMS`]. Unverified: never fetch one as this
+    /// podcast or record it as an alias unless the feed at
+    /// [`Self::feed_url`] itself redirects there.
+    pub claimed_feed_urls: Vec<ClaimedFeedUrl>,
 }
 
 impl PodcastSearchHit {
@@ -83,6 +102,16 @@ impl PodcastSearchHit {
     pub fn kind(&self) -> SearchHitKind {
         SearchHitKind::Podcast
     }
+}
+
+/// An unverified moved-feed URL claimed by some publishers of a podcast.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimedFeedUrl {
+    /// Claimed current feed URL.
+    pub feed_url: FeedUrl,
+    /// Sorted distinct publisher devices claiming it, at most
+    /// [`MAX_HIT_PUBLISHERS`].
+    pub publishers: Vec<EndpointId>,
 }
 
 /// A music or podcast result of a federated search.
@@ -184,37 +213,66 @@ pub(crate) fn aggregate_hits(
     by_podcast
         .into_iter()
         .map(|(podcast_id, cards)| {
-            let mut feed_votes: HashMap<&str, usize> = HashMap::new();
+            let mut title_votes: HashMap<String, usize> = HashMap::new();
             for card in &cards {
-                *feed_votes.entry(card.feed_url.as_str()).or_default() += 1;
+                *title_votes.entry(normalize_name(&card.title)).or_default() += 1;
             }
+            // Publisher-controlled times and revisions never break ties.
             let card = cards
                 .iter()
                 .max_by_key(|card| {
                     (
-                        feed_votes[card.feed_url.as_str()],
-                        card.issued_at_ms,
-                        *card.publisher.as_bytes(),
+                        card.feed_url_is_origin(),
+                        title_votes[&normalize_name(&card.title)],
+                        Reverse(*card.publisher.as_bytes()),
                     )
                 })
                 .cloned()
                 .expect("a group has at least one card");
-            let mut publishers: Vec<EndpointId> = cards.iter().map(|card| card.publisher).collect();
-            publishers.sort_by_key(|publisher| *publisher.as_bytes());
-            publishers.dedup();
-            publishers.truncate(MAX_HIT_PUBLISHERS);
+            let mut claims: BTreeMap<&FeedUrl, Vec<EndpointId>> = BTreeMap::new();
+            for card in cards.iter().filter(|card| !card.feed_url_is_origin()) {
+                claims
+                    .entry(&card.feed_url)
+                    .or_default()
+                    .push(card.publisher);
+            }
+            let mut claimed_feed_urls: Vec<ClaimedFeedUrl> = claims
+                .into_iter()
+                .map(|(feed_url, publishers)| ClaimedFeedUrl {
+                    feed_url: feed_url.clone(),
+                    publishers: sorted_publishers(publishers),
+                })
+                .collect();
+            claimed_feed_urls.sort_by(|left, right| {
+                right
+                    .publishers
+                    .len()
+                    .cmp(&left.publishers.len())
+                    .then_with(|| left.feed_url.cmp(&right.feed_url))
+            });
+            claimed_feed_urls.truncate(MAX_HIT_FEED_URL_CLAIMS);
             PodcastSearchHit {
                 podcast_id,
+                feed_url: card.origin_feed_url().clone(),
+                publishers: sorted_publishers(cards.iter().map(|card| card.publisher).collect()),
                 card,
-                publishers,
+                claimed_feed_urls,
             }
         })
         .collect()
 }
 
+fn sorted_publishers(mut publishers: Vec<EndpointId>) -> Vec<EndpointId> {
+    publishers.sort_by_key(|publisher| *publisher.as_bytes());
+    publishers.dedup();
+    publishers.truncate(MAX_HIT_PUBLISHERS);
+    publishers
+}
+
 /// Keeps hits whose card is indexed under every query token and ranks
-/// them: exact normalized title first, then more publishers, then title and
-/// id.
+/// them: exact normalized title first, then hits with a card published under
+/// the origin feed URL, then title and id. The publisher count is not used:
+/// anyone can inflate it with new device identities.
 pub(crate) fn rank_hits(
     mut hits: Vec<PodcastSearchHit>,
     query: &str,
@@ -229,7 +287,7 @@ pub(crate) fn rank_hits(
         let title = normalize_name(&hit.card.title);
         (
             title != normalized_query,
-            Reverse(hit.publishers.len()),
+            !hit.card.feed_url_is_origin(),
             title,
             hit.podcast_id.clone(),
         )

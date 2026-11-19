@@ -27,6 +27,13 @@
 //! [`crate::similarity_dht::SimilarityDht`]: declare [`PODCAST_DHT_ALPN`] with
 //! [`crate::MusicDhtConfigBuilder::schema_independent_stream_protocol`], take
 //! its acceptor and spawn [`PodcastDht::serve`] and [`PodcastDht::maintenance`].
+//! Advertise the overlay with [`CapabilityManifest::with_podcast_dht`] (it is
+//! opt-in) and pass peer manifests to [`PodcastDht::note_peer_capabilities`].
+//!
+//! Only the URL a podcast id hashes from is bound to the podcast; search hits
+//! offer that URL ([`PodcastSearchHit::feed_url`]) and report moved-feed URLs
+//! as unverified claims. The publisher key is the device's transport identity
+//! and therefore linkable to its network address and music-DHT records.
 
 mod card;
 mod privacy;
@@ -36,7 +43,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -69,10 +76,16 @@ pub use privacy::{
     FeedUrlPrivacyWarning, PRIVATE_FEED_HOSTS, SECRET_QUERY_WORDS, feed_url_privacy_warning,
 };
 pub use search::{
-    FederatedSearchHit, MAX_HIT_PUBLISHERS, MAX_PODCAST_QUERY_TOKENS, PodcastSearchHit,
-    SearchHitKind, merge_search_results, podcast_query_tokens,
+    ClaimedFeedUrl, FederatedSearchHit, MAX_HIT_FEED_URL_CLAIMS, MAX_HIT_PUBLISHERS,
+    MAX_PODCAST_QUERY_TOKENS, PodcastSearchHit, SearchHitKind, merge_search_results,
+    podcast_query_tokens,
 };
-pub use store::{MAX_PODCAST_RECORDS_PER_KEY, PODCAST_DHT_CACHE_SCHEMA_VERSION};
+pub use store::{
+    MAX_PERSISTED_PODCAST_DHT_PEERS, MAX_PODCAST_CACHE_BYTES, MAX_PODCAST_CACHE_RECORDS,
+    MAX_PODCAST_RECORDS_PER_KEY, MAX_PODCAST_RECORDS_PER_PUBLISHER,
+    MAX_PODCAST_RESPONSE_TOMBSTONES, MAX_PODCAST_TOMBSTONES_PER_KEY,
+    PODCAST_DHT_CACHE_SCHEMA_VERSION,
+};
 
 use card::publication_error;
 use search::{aggregate_hits, rank_hits};
@@ -105,6 +118,16 @@ pub const PODCAST_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Maximum inbound requests processed concurrently; further streams are
 /// dropped.
 pub const MAX_CONCURRENT_PODCAST_DHT_REQUESTS: usize = 64;
+/// Maximum inbound requests of one peer processed concurrently; further
+/// streams of that peer are dropped.
+pub const MAX_PODCAST_DHT_REQUESTS_PER_PEER: usize = 8;
+/// Maximum distinct `(podcast_id, publisher)` records one lookup keeps;
+/// records of further owners are ignored.
+pub const MAX_PODCAST_LOOKUP_RECORDS: usize = 512;
+/// A node stores a placement only when fewer than this many of its known
+/// overlay contacts are closer to the key than itself (`2 * K`: the `K`
+/// closest with slack for differing routing views).
+pub const PODCAST_STORE_RESPONSIBILITY_WINDOW: usize = 2 * K;
 /// How long a peer whose capability manifest lacks [`PODCAST_DHT_ID`] is
 /// not contacted.
 pub const UNSUPPORTED_PEER_BACKOFF: Duration = Duration::from_secs(60 * 60);
@@ -228,7 +251,7 @@ pub struct PodcastDhtPublishStats {
 }
 
 /// Result of [`PodcastDht::sync_shares`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PodcastDhtSyncStats {
     /// Cards published with a new revision, or refreshed because they used
     /// half their lifetime.
@@ -237,8 +260,36 @@ pub struct PodcastDhtSyncStats {
     pub unchanged: usize,
     /// Podcasts unpublished with a tombstone.
     pub unpublished: usize,
+    /// Shared podcasts not published because their card has privacy
+    /// warnings the user has not confirmed. The UI asks, then calls
+    /// [`PodcastDht::publish`] or `sync_shares` with
+    /// [`PodcastShareState::privacy_confirmed`]. An earlier publication of
+    /// the podcast stays as it was.
+    pub held_back: Vec<PodcastPrivacyHold>,
+    /// Podcasts whose card could not be built or signed. They are not
+    /// published, and an earlier publication of them is unpublished.
+    pub failed: Vec<PodcastSyncFailure>,
     /// Network statistics of the pushed records.
     pub push: PodcastDhtPublishStats,
+}
+
+/// A shared podcast held back by [`PodcastDht::sync_shares`] until the user
+/// confirms publishing URLs that look private.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodcastPrivacyHold {
+    /// Podcast.
+    pub podcast_id: PodcastId,
+    /// Warnings of [`PodcastCardSpec::privacy_warnings`].
+    pub warnings: Vec<FeedUrlPrivacyWarning>,
+}
+
+/// A podcast [`PodcastDht::sync_shares`] could not publish or unpublish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodcastSyncFailure {
+    /// Podcast.
+    pub podcast_id: PodcastId,
+    /// Diagnostic.
+    pub error: String,
 }
 
 /// Personal registers of one podcast, as input to [`PodcastDht::sync_shares`].
@@ -251,12 +302,33 @@ pub struct PodcastShareState {
     /// Card to publish when shared; `None` derives it with
     /// [`PodcastCardSpec::from_subscription`].
     pub card: Option<PodcastCardSpec>,
+    /// Whether the user confirmed publishing this card's feed URLs despite
+    /// its [`PodcastCardSpec::privacy_warnings`]. Without it, a card with
+    /// warnings is only published when this device already publishes the
+    /// same feed URLs.
+    pub privacy_confirmed: bool,
 }
 
 impl PodcastShareState {
     /// Whether the podcast must be published ([`effective_share`]).
     pub fn is_shared(&self) -> bool {
         effective_share(Some(&self.subscription), self.share.as_ref())
+    }
+
+    /// The bounded, validated card [`PodcastDht::sync_shares`] would
+    /// publish: [`Self::card`] or one derived from the subscription.
+    pub fn card_spec(&self) -> Result<PodcastCardSpec> {
+        let card = match &self.card {
+            Some(card) => card.bounded(),
+            None => PodcastCardSpec::from_subscription(&self.subscription)?,
+        };
+        if card.podcast_id != self.subscription.podcast_id {
+            return Err(publication_error(
+                "card and subscription describe different podcasts",
+            ));
+        }
+        card.validate()?;
+        Ok(card)
     }
 }
 
@@ -284,6 +356,7 @@ pub struct PodcastDht {
     failed: Mutex<HashMap<EndpointId, u64>>,
     publish_gate: Semaphore,
     serve_limit: Arc<Semaphore>,
+    inflight: Arc<Mutex<HashMap<EndpointId, usize>>>,
 }
 
 impl std::fmt::Debug for PodcastDht {
@@ -330,6 +403,7 @@ impl PodcastDht {
             failed: Mutex::new(HashMap::new()),
             publish_gate: Semaphore::new(1),
             serve_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_PODCAST_DHT_REQUESTS)),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
@@ -341,6 +415,10 @@ impl PodcastDht {
     /// Serves authenticated overlay requests until `acceptor` closes.
     pub async fn serve(self: Arc<Self>, mut acceptor: StreamAcceptor) {
         while let Some(stream) = acceptor.accept().await {
+            let Some(slot) = PeerSlot::acquire(&self.inflight, stream.peer_id) else {
+                debug!(peer = %stream.peer_id, "podcast DHT request dropped: peer limit");
+                continue;
+            };
             let Ok(permit) = Arc::clone(&self.serve_limit).try_acquire_owned() else {
                 debug!(peer = %stream.peer_id, "podcast DHT request dropped: overloaded");
                 continue;
@@ -348,6 +426,7 @@ impl PodcastDht {
             let this = Arc::clone(&self);
             tokio::spawn(async move {
                 let _permit = permit;
+                let _slot = slot;
                 let peer = stream.peer_id;
                 match tokio::time::timeout(SERVE_TIMEOUT, this.serve_one(stream)).await {
                     Ok(Ok(())) => {}
@@ -421,7 +500,10 @@ impl PodcastDht {
     }
 
     /// Discovers overlay peers among the routing table and the music DHT
-    /// contacts.
+    /// contacts with one `FindNode` each. Music-DHT contacts whose capability
+    /// manifest lacks the overlay ([`Self::note_peer_capabilities`]) are
+    /// skipped; others are dialed on [`PODCAST_DHT_ALPN`] and only become
+    /// overlay contacts when they answer.
     pub async fn bootstrap(&self) -> Result<()> {
         let known_feature: HashSet<EndpointId> = lock(&self.routing)
             .contacts()
@@ -521,44 +603,92 @@ impl PodcastDht {
     /// [`Self::republish`]). Every other podcast this device published,
     /// including podcasts absent from `states`, is unpublished. The call is
     /// idempotent: repeating it publishes nothing new.
+    ///
+    /// Each podcast is handled on its own, so revocation is fail-safe: a
+    /// shared podcast whose card cannot be built is reported in
+    /// [`PodcastDhtSyncStats::failed`] and unpublished, and never prevents
+    /// other podcasts from being unpublished. A card with
+    /// [`PodcastCardSpec::privacy_warnings`] is held back
+    /// ([`PodcastDhtSyncStats::held_back`]) unless
+    /// [`PodcastShareState::privacy_confirmed`] is set or this device already
+    /// publishes the same feed URLs.
     pub async fn sync_shares(&self, states: Vec<PodcastShareState>) -> Result<PodcastDhtSyncStats> {
-        let mut desired: HashMap<PodcastId, PodcastCardSpec> = HashMap::new();
-        for state in states {
+        let _permit = self.publish_permit().await?;
+        let local = self.database.local_publications().await?;
+        let active: HashMap<&PodcastId, &PodcastCardSpec> = local
+            .iter()
+            .filter_map(|publication| {
+                publication
+                    .spec
+                    .as_ref()
+                    .map(|spec| (&publication.podcast_id, spec))
+            })
+            .collect();
+        let mut stats = PodcastDhtSyncStats::default();
+        let mut desired: BTreeMap<PodcastId, PodcastCardSpec> = BTreeMap::new();
+        let mut held: HashSet<PodcastId> = HashSet::new();
+        for state in &states {
             if !state.is_shared() {
                 continue;
             }
-            let card = match state.card {
-                Some(card) => card.bounded(),
-                None => PodcastCardSpec::from_subscription(&state.subscription)?,
+            let podcast_id = state.subscription.podcast_id.clone();
+            let card = match state.card_spec() {
+                Ok(card) => card,
+                Err(error) => {
+                    debug!(%podcast_id, %error, "podcast card cannot be published");
+                    stats.failed.push(PodcastSyncFailure {
+                        podcast_id,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
             };
-            if card.podcast_id != state.subscription.podcast_id {
-                return Err(publication_error(
-                    "card and subscription describe different podcasts",
-                ));
+            let warnings = card.privacy_warnings();
+            let already_published = active.get(&podcast_id).is_some_and(|published| {
+                published.feed_url == card.feed_url && published.id_feed_url == card.id_feed_url
+            });
+            if !warnings.is_empty() && !state.privacy_confirmed && !already_published {
+                held.insert(podcast_id.clone());
+                stats.held_back.push(PodcastPrivacyHold {
+                    podcast_id,
+                    warnings,
+                });
+                continue;
             }
-            card.validate()?;
-            desired.insert(card.podcast_id.clone(), card);
+            desired.insert(podcast_id, card);
         }
 
-        let _permit = self.publish_permit().await?;
-        let local = self.database.local_publications().await?;
-        let mut stats = PodcastDhtSyncStats::default();
         let mut records = Vec::new();
         for publication in &local {
-            if publication.spec.is_some() && !desired.contains_key(&publication.podcast_id) {
-                records.extend(self.unpublish_locked(&publication.podcast_id).await?);
-                stats.unpublished += 1;
+            let podcast_id = &publication.podcast_id;
+            if publication.spec.is_none()
+                || desired.contains_key(podcast_id)
+                || held.contains(podcast_id)
+            {
+                continue;
+            }
+            match self.unpublish_locked(podcast_id).await {
+                Ok(record) => {
+                    records.extend(record);
+                    stats.unpublished += 1;
+                }
+                Err(error) => stats.failed.push(PodcastSyncFailure {
+                    podcast_id: podcast_id.clone(),
+                    error: error.to_string(),
+                }),
             }
         }
-        let mut desired: Vec<_> = desired.into_values().collect();
-        desired.sort_by(|left, right| left.podcast_id.cmp(&right.podcast_id));
-        for card in desired {
-            match self.sign_card_locked(card, false).await? {
-                Some(record) => {
+        for (podcast_id, card) in desired {
+            match self.sign_card_locked(card, false).await {
+                Ok(Some(record)) => {
                     records.push(record);
                     stats.published += 1;
                 }
-                None => stats.unchanged += 1,
+                Ok(None) => stats.unchanged += 1,
+                Err(error) => stats.failed.push(PodcastSyncFailure {
+                    podcast_id,
+                    error: error.to_string(),
+                }),
             }
         }
         stats.push = self.push(records).await?;
@@ -613,8 +743,8 @@ impl PodcastDht {
     /// normalized token of `query` ([`podcast_query_tokens`]).
     ///
     /// Hits are merged by `podcast_id` over publishers and ranked: exact
-    /// normalized title first, then more publishers. Partial results are
-    /// returned when peers fail.
+    /// normalized title first, then hits with a card under the origin feed
+    /// URL. Partial results are returned when peers fail.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<PodcastSearchHit>> {
         let tokens = podcast_query_tokens(query);
         if tokens.is_empty() || limit == 0 {
@@ -966,8 +1096,25 @@ impl PodcastDht {
                 ))
             }
             PodcastDhtOperation::StoreBatch { records } => {
-                let entries = validate_store_batch(records, &self.network_id, now_ms())?;
-                let stored = self.database.store(entries, now_ms()).await?;
+                let entries =
+                    validate_store_batch(records, &self.network_id, authenticated_peer, now_ms())?;
+                let nodes: Vec<NodeId> = lock(&self.routing)
+                    .contacts()
+                    .into_iter()
+                    .map(|contact| contact.node_id)
+                    .collect();
+                let entries: Vec<_> = entries
+                    .into_iter()
+                    .filter_map(|(mut keys, record)| {
+                        keys.retain(|key| is_responsible(&self.own_contact.node_id, &nodes, key));
+                        (!keys.is_empty()).then_some((keys, record))
+                    })
+                    .collect();
+                let stored = if entries.is_empty() {
+                    0
+                } else {
+                    self.database.store(entries, now_ms()).await?
+                };
                 Ok(PodcastDhtResponse::success(
                     Vec::new(),
                     Vec::new(),
@@ -1099,11 +1246,17 @@ impl PodcastDht {
     }
 }
 
-/// Validates a store batch received from a peer: bounds, every record's
-/// signature and lifetime, and that every key belongs to its record.
+/// Validates a store batch received from `requester`: bounds, that every
+/// record is published by the requester itself, every record's signature and
+/// lifetime, and that every key belongs to its record.
+///
+/// Replicas never forward records, so only a record's publisher stores it.
+/// Nobody can therefore replay or inject another device's records, and
+/// per-publisher quotas apply to the storing peer.
 fn validate_store_batch(
     entries: Vec<PodcastStoreEntry>,
     network_id: &NetworkId,
+    requester: EndpointId,
     now_ms: u64,
 ) -> Result<Vec<(Vec<PodcastDhtKey>, SignedPodcastRecord)>> {
     if entries.is_empty() || entries.len() > MAX_PODCAST_STORE_RECORDS {
@@ -1117,6 +1270,11 @@ fn validate_store_batch(
             if keys.is_empty() || keys.len() > MAX_RECORD_DHT_KEYS || unique.len() != keys.len() {
                 return Err(protocol_error("invalid podcast DHT store keys"));
             }
+            if entry.record.publisher() != requester {
+                return Err(protocol_error(
+                    "podcast records must be stored by their publisher",
+                ));
+            }
             entry.record.verify_at(network_id, now_ms)?;
             let valid_keys = entry.record.dht_keys();
             if keys.iter().any(|key| !valid_keys.contains(key)) {
@@ -1126,6 +1284,18 @@ fn validate_store_batch(
             Ok((keys, entry.record))
         })
         .collect()
+}
+
+/// Whether a node is among the nodes that should store `key`: fewer than
+/// [`PODCAST_STORE_RESPONSIBILITY_WINDOW`] known contacts are closer.
+fn is_responsible(own: &NodeId, contacts: &[NodeId], key: &PodcastDhtKey) -> bool {
+    let own_distance = distance(own.as_bytes(), key.as_bytes());
+    contacts
+        .iter()
+        .filter(|node| distance(node.as_bytes(), key.as_bytes()) < own_distance)
+        .take(PODCAST_STORE_RESPONSIBILITY_WINDOW)
+        .count()
+        < PODCAST_STORE_RESPONSIBILITY_WINDOW
 }
 
 fn validate_filter_tokens(tokens: &[String]) -> Result<()> {
@@ -1139,7 +1309,8 @@ fn validate_filter_tokens(tokens: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Adds verified records found under `key` to the per-owner winners.
+/// Adds verified records found under `key` to the per-owner winners, keeping
+/// at most [`MAX_PODCAST_LOOKUP_RECORDS`] owners.
 fn merge_records(
     winners: &mut HashMap<(PodcastId, EndpointId), SignedPodcastRecord>,
     records: Vec<SignedPodcastRecord>,
@@ -1161,8 +1332,45 @@ fn merge_records(
         let owner = (record.podcast_id().clone(), record.publisher());
         match winners.get(&owner) {
             Some(current) if compare_records(current, &record).is_ge() => {}
+            None if winners.len() >= MAX_PODCAST_LOOKUP_RECORDS => {}
             _ => {
                 winners.insert(owner, record);
+            }
+        }
+    }
+}
+
+/// One in-flight inbound request of a peer; released on drop.
+struct PeerSlot {
+    inflight: Arc<Mutex<HashMap<EndpointId, usize>>>,
+    peer: EndpointId,
+}
+
+impl PeerSlot {
+    fn acquire(
+        inflight: &Arc<Mutex<HashMap<EndpointId, usize>>>,
+        peer: EndpointId,
+    ) -> Option<Self> {
+        let mut map = lock(inflight);
+        let count = map.entry(peer).or_default();
+        if *count >= MAX_PODCAST_DHT_REQUESTS_PER_PEER {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            inflight: Arc::clone(inflight),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut map = lock(&self.inflight);
+        if let Some(count) = map.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.peer);
             }
         }
     }
