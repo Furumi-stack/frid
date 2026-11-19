@@ -64,4 +64,7 @@ The store is synchronous: methods take `&self` and lock one connection, so
 `TrackItem.podcast` marks a queue item as a podcast episode
 (`TrackItem::podcast_episode`). Music-only code (likes, playlists, history,
 content ids, federation downloads) must check `TrackItem::is_podcast`; the
-music library never stores episodes.
+music library never stores episodes. As a fail-safe for older code, podcast
+items have a negative per-episode `id` (`TrackItem::podcast_track_id`, at
+most `PODCAST_TRACK_ID_MAX`) and `release_id` / artist id -1, like pending
+federated tracks.

@@ -53,7 +53,8 @@ converges independently of delivery order. Migrations follow
 `PRAGMA user_version`; the prototype podcast database is imported and its
 tables are kept as `legacy_*`; newer or foreign files are refused unchanged.
 `TrackItem.podcast` marks episode queue items, which music-only code must
-skip. See the "SQLite reference store" section of [PODCASTS.md](PODCASTS.md).
+skip; their negative ids (`release_id` and artist id -1) keep code written
+for library tracks (`id >= 0`) away from them. See the "SQLite reference store" section of [PODCASTS.md](PODCASTS.md).
 
 Filesystem scanning schedules, playback, federation lifecycle, and UI state
 remain application responsibilities. Database and metadata work must stay off

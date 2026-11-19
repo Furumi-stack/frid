@@ -1,7 +1,7 @@
 //! Data shapes the views render. They mirror what the furumusic API used to
 //! return, but every field is now filled from the local SQLite library.
 
-use music_dht::podcast::PodcastEpisodeRef;
+use music_dht::podcast::{EpisodeId, PodcastEpisodeRef};
 use serde::{Deserialize, Serialize};
 
 /// Which catalog sources a client wants library queries to include.
@@ -124,19 +124,29 @@ pub struct ArtistRef {
 /// A playable queue item: a library track, a pending federated track or a
 /// podcast episode.
 ///
-/// Podcast episodes ([`TrackItem::podcast_episode`]) carry their
-/// [`PodcastEpisodeRef`] in [`TrackItem::podcast`]: `id` and `release_id` are
-/// 0, `file_path` is empty, `content_id`, `fed` and `cover_path` are `None`,
-/// and the display fields mirror the reference (episode title, podcast title
-/// as artist and release). The audio URL is only in the reference: it is
-/// never a local path, never content-addressed and never offered for P2P
-/// transfer.
+/// Library tracks have `id >= 0`. Items that are not library rows use
+/// negative ids, so code that only handles library tracks can keep skipping
+/// `id < 0` (and `release_id < 0`, artist `id < 0`):
+///
+/// * pending federated tracks count down from -1;
+/// * podcast episodes ([`TrackItem::podcast_episode`]) use
+///   [`TrackItem::podcast_track_id`], a per-episode id below
+///   [`PODCAST_TRACK_ID_MAX`], with `release_id` and artist ids -1.
+///
+/// Podcast episodes carry their [`PodcastEpisodeRef`] in
+/// [`TrackItem::podcast`]: `file_path` is empty, `content_id`, `fed` and
+/// `cover_path` are `None`, and the display fields mirror the reference
+/// (episode title, podcast title as artist and release). The audio URL is
+/// only in the reference: it is never a local path, never content-addressed
+/// and never offered for P2P transfer.
 ///
 /// **Music-only code paths must check [`TrackItem::is_podcast`]** (or
 /// `podcast.is_none()`) before treating an item as music: likes, playlists,
 /// listening history, content-id lookups, federation downloads, similarity
-/// and file operations do not apply to episodes. Library queries never
-/// return podcast items; the library database stores none.
+/// and file operations do not apply to episodes. The negative ids are a
+/// fail-safe for code that predates podcasts, not a replacement for that
+/// check. Library queries never return podcast items; the library database
+/// stores none.
 #[derive(Debug, Clone)]
 pub struct TrackItem {
     pub id: i64,
@@ -170,17 +180,37 @@ pub struct TrackItem {
     pub podcast: Option<PodcastEpisodeRef>,
 }
 
+/// Every [`TrackItem::podcast_track_id`] is at most this value
+/// (`i64::MIN + 2^62 - 1`), far below the ids of pending federated tracks,
+/// which count down from -1.
+pub const PODCAST_TRACK_ID_MAX: i64 = i64::MIN + (1 << 62) - 1;
+
 impl TrackItem {
+    /// The negative `TrackItem::id` of a podcast episode.
+    ///
+    /// Derived from the episode id (the low 62 bits of the first 8 bytes of
+    /// its digest), so the same episode always gets the same id and different
+    /// episodes practically never share one. Always `<=`
+    /// [`PODCAST_TRACK_ID_MAX`]; never persisted.
+    pub fn podcast_track_id(episode_id: &EpisodeId) -> i64 {
+        let digest = episode_id.digest();
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&digest[..8]);
+        let low = u64::from_be_bytes(head) & ((1u64 << 62) - 1);
+        i64::MIN + low as i64
+    }
+
     /// Queue item for a podcast episode streamed from the publisher.
     ///
     /// Display fields mirror `PlaybackTrack::podcast_episode` of
     /// `music_dht::device_sync` (the episode title, the podcast title as
     /// artist and release, the announced duration; no track or disc number)
     /// and add the publication year. Season and episode number stay in the
-    /// reference.
+    /// reference. `id` is [`TrackItem::podcast_track_id`]; `release_id` and
+    /// the artist id are -1, like pending federated tracks.
     pub fn podcast_episode(episode: PodcastEpisodeRef) -> Self {
         Self {
-            id: 0,
+            id: Self::podcast_track_id(&episode.episode_id),
             title: episode.episode_title.clone(),
             track_number: None,
             disc_number: None,
@@ -188,11 +218,11 @@ impl TrackItem {
                 .duration_ms
                 .map_or(0.0, |ms| ms.max(0) as f64 / 1_000.0),
             artists: vec![ArtistRef {
-                id: 0,
+                id: -1,
                 name: episode.podcast_title.clone(),
             }],
             featured_artists: Vec::new(),
-            release_id: 0,
+            release_id: -1,
             release_title: episode.podcast_title.clone(),
             release_year: episode.published_at_ms.map(year_of_unix_ms),
             file_path: String::new(),
@@ -441,7 +471,7 @@ mod tests {
 
     #[test]
     fn podcast_track_mirrors_the_episode_reference() {
-        use music_dht::podcast::{EpisodeId, FeedUrl, PodcastId};
+        use music_dht::podcast::{FeedUrl, PodcastId};
         let feed_url = FeedUrl::parse("https://example.test/feed.xml").unwrap();
         let podcast_id = PodcastId::from_feed_url(&feed_url);
         let episode = PodcastEpisodeRef {
@@ -462,7 +492,17 @@ mod tests {
         let track = TrackItem::podcast_episode(episode.clone());
         assert!(track.is_podcast());
         assert_eq!(track.podcast_episode_ref(), Some(&episode));
-        assert_eq!(track.id, 0);
+        // Fail-safe ids: never a library row, release or artist, stable per
+        // episode, distinct between episodes and below pending federated ids.
+        assert!(track.id <= PODCAST_TRACK_ID_MAX);
+        const { assert!(PODCAST_TRACK_ID_MAX < -(1 << 61)) };
+        assert_eq!(track.id, TrackItem::podcast_track_id(&episode.episode_id));
+        assert_eq!(TrackItem::podcast_episode(episode.clone()).id, track.id);
+        assert_eq!(track.release_id, -1);
+        assert!(track.artists.iter().all(|artist| artist.id == -1));
+        let other = EpisodeId::from_guid(&episode.podcast_id, "e2").unwrap();
+        assert_ne!(TrackItem::podcast_track_id(&other), track.id);
+        assert!(TrackItem::podcast_track_id(&other) <= PODCAST_TRACK_ID_MAX);
         assert!(track.file_path.is_empty());
         assert!(track.content_id.is_none() && track.fed.is_none());
         assert!(!track.is_fed_pending());
