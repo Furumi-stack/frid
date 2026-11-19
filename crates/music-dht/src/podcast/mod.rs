@@ -28,11 +28,13 @@
 //!
 //! # Personal state
 //!
-//! * [`SubscriptionRecord`]: last-writer-wins by `(hlc_ms, op_id)`;
-//!   unsubscribing is state, not a tombstone. Feed aliases merge as a bounded
-//!   grow-only set.
-//! * [`ShareRecord`]: last-writer-wins; `shared = false` is a tombstone. See
-//!   [`effective_share`] for the rule that a (re)subscription is private.
+//! * [`SubscriptionRecord`]: last-writer-wins by `(generation, hlc_ms, op_id)`
+//!   where `generation` is a per-podcast Lamport counter
+//!   ([`next_podcast_generation`]); unsubscribing is state, not a tombstone.
+//!   Feed aliases merge as a bounded grow-only set.
+//! * [`ShareRecord`]: last-writer-wins with the same ordering; `shared = false`
+//!   is register state that is never compacted. See [`effective_share`] for
+//!   the rule that a (re)subscription is private.
 //! * [`ProgressRecord`]: register ordered by
 //!   `(generation, hlc_ms, device_id, op_id)`. Explicit user actions bump the
 //!   generation to `max_seen + 1`; periodic checkpoints keep the generation of
@@ -85,7 +87,8 @@ pub use meta::{EpisodeMeta, EpisodeType, PodcastEpisodeRef, PodcastMeta};
 pub use state::{
     COMPLETION_TAIL_MAX_MS, ListenSession, MIN_RECORDED_EPISODE_LISTEN_MS, ProgressRecord,
     ProgressStatus, ShareRecord, SubscriptionRecord, completed_listen_count, effective_share,
-    merge_listen_session, merge_progress, merge_share, merge_subscription, reaches_completion,
+    merge_listen_session, merge_progress, merge_share, merge_subscription, next_podcast_generation,
+    reaches_completion,
 };
 
 /// Maximum characters of a title (podcast, episode, author).

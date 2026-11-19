@@ -57,15 +57,29 @@ pub enum ProgressStatus {
 /// seeking backwards and "start over" are real changes.
 ///
 /// * Explicit user actions (start of a new listening session, seek, "start
-///   over", "mark played", "mark unplayed", handoff to another device) use
-///   [`ProgressRecord::explicit_generation`]: one more than the greatest
-///   generation the device has seen for the episode. This is a Lamport clock,
-///   so wall-clock skew cannot undo an explicit action that was observed.
+///   over", "mark played", "mark unplayed", taking over playback through a
+///   handoff) use [`ProgressRecord::explicit_generation`]: one more than the
+///   greatest generation the device has seen for the episode. This is a
+///   Lamport clock, so wall-clock skew cannot undo an explicit action that was
+///   observed. An explicit action during a session becomes the generation of
+///   that session.
 /// * Periodic checkpoints keep the generation of the latest explicit action of
 ///   their session. A late checkpoint of an older session therefore loses
 ///   against any newer explicit action, whatever its `hlc_ms`.
 /// * Concurrent explicit actions on offline devices receive the same
 ///   generation and are ordered by `hlc_ms`, then `device_id`, then `op_id`.
+/// * Handoff: only the receiving device writes the explicit action, with
+///   `explicit_generation(max(local, carried))` where `carried` is
+///   [`PodcastEpisodeRef::progress_generation`](super::PodcastEpisodeRef::progress_generation)
+///   of the queue item. The sender writes a final checkpoint at its session
+///   generation.
+/// * A device that observes a greater generation for the episode it is
+///   playing stops writing at its old generation: either playback moved away,
+///   or the user keeps listening locally and the device writes its next
+///   record as an explicit action.
+/// * Outgoing-log coalescing may drop a pending progress operation only when
+///   another pending operation of the same episode [supersedes](Self::supersedes)
+///   it; dropping by sequence order could discard an explicit action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressRecord {
     /// Episode the register belongs to.
@@ -162,18 +176,25 @@ pub fn merge_progress(
 /// Personal subscription state of one podcast.
 ///
 /// `subscribed` and `podcast` form one last-writer-wins register ordered by
-/// `(hlc_ms, op_id)`. Unsubscribing writes `subscribed = false`: it is state,
-/// not a tombstone, and never deletes progress or history, so subscribing
-/// again continues where the user stopped.
+/// `(generation, hlc_ms, op_id)`. `generation` is a Lamport counter shared by
+/// the subscription and share registers of the podcast (see
+/// [`next_podcast_generation`]), so an action taken after observing another
+/// device's write wins whatever the device clocks say. Unsubscribing writes
+/// `subscribed = false`: it is state, not a tombstone, is never compacted, and
+/// never deletes progress or history, so subscribing again continues where
+/// the user stopped.
 ///
 /// Only explicit user actions (subscribe, unsubscribe) write this register.
 /// Background RSS refreshes keep their metadata locally and must not emit a
 /// subscription operation; otherwise a stale device could resurrect an
-/// unsubscribed podcast.
+/// unsubscribed podcast. Feed aliases learned by refreshes travel in their
+/// own grow-only operation.
 ///
 /// `feed_aliases` is a bounded grow-only set merged independently of the
-/// register (see [`merge_feed_aliases`]); it always contains every
-/// `podcast.feed_url` seen.
+/// register (see [`merge_feed_aliases`]): the URL the id was derived from
+/// plus the [`MAX_FEED_ALIASES`] smallest other URLs. The current
+/// `podcast.feed_url` may fall outside that bound, so look podcasts up by
+/// [`SubscriptionRecord::feed_urls`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionRecord {
     /// Podcast.
@@ -185,6 +206,9 @@ pub struct SubscriptionRecord {
     /// Known feed URLs of the podcast.
     #[serde(default)]
     pub feed_aliases: Vec<FeedUrl>,
+    /// Lamport generation shared with the share register (see type docs).
+    #[serde(default)]
+    pub generation: u64,
     /// Logical write time.
     pub hlc_ms: i64,
     /// Writing operation id.
@@ -192,9 +216,14 @@ pub struct SubscriptionRecord {
 }
 
 impl SubscriptionRecord {
+    /// Register ordering key: `(generation, hlc_ms, op_id)`.
+    pub fn order_key(&self) -> (u64, i64, &str) {
+        (self.generation, self.hlc_ms, self.op_id.as_str())
+    }
+
     fn total_cmp(&self, other: &Self) -> Ordering {
-        (self.hlc_ms, self.op_id.as_str())
-            .cmp(&(other.hlc_ms, other.op_id.as_str()))
+        self.order_key()
+            .cmp(&other.order_key())
             .then_with(|| self.subscribed.cmp(&other.subscribed))
             .then_with(|| self.podcast.cmp(&other.podcast))
     }
@@ -204,13 +233,33 @@ impl SubscriptionRecord {
         self.total_cmp(other) == Ordering::Greater
     }
 
-    /// Ensures `feed_aliases` is sorted, bounded and contains `podcast.feed_url`.
+    /// Merges `podcast.feed_url` into `feed_aliases` and bounds the set.
+    ///
+    /// The result is sorted and bounded by [`merge_feed_aliases`]; it may not
+    /// contain `podcast.feed_url` when many smaller aliases are known.
     pub fn normalize(&mut self) {
         self.feed_aliases = merge_feed_aliases(
             &self.podcast_id,
             &self.feed_aliases,
             std::slice::from_ref(&self.podcast.feed_url),
         );
+    }
+
+    /// Adds aliases learned through a `podcast_feed_aliases_added` operation.
+    ///
+    /// Only the grow-only alias set changes; the register is untouched.
+    pub fn add_feed_aliases(&mut self, aliases: &[FeedUrl]) {
+        self.feed_aliases = merge_feed_aliases(&self.podcast_id, &self.feed_aliases, aliases);
+    }
+
+    /// Every URL that identifies this podcast: the aliases and the current
+    /// `podcast.feed_url`, sorted and without duplicates.
+    ///
+    /// Stores pass these pairs to [`super::resolve_podcast_id`].
+    pub fn feed_urls(&self) -> Vec<FeedUrl> {
+        let mut urls: BTreeSet<FeedUrl> = self.feed_aliases.iter().cloned().collect();
+        urls.insert(self.podcast.feed_url.clone());
+        urls.into_iter().collect()
     }
 
     /// Validates contract bounds.
@@ -251,8 +300,12 @@ pub fn merge_subscription(
 
 /// Decision to publish a podcast card to the federation.
 ///
-/// Last-writer-wins by `(hlc_ms, op_id)`; `shared = false` is the tombstone
-/// that revokes the publication. Unsubscribing must also write
+/// Last-writer-wins by `(generation, hlc_ms, op_id)`, with `generation` the
+/// per-podcast Lamport counter shared with [`SubscriptionRecord`] (see
+/// [`next_podcast_generation`]). `shared = false` revokes the publication.
+/// It is privacy-protecting register state, **not** a tombstone: like an
+/// unsubscribe it is never compacted, otherwise a stale `shared = true`
+/// delivered again would republish the podcast. Unsubscribing must also write
 /// `shared = false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareRecord {
@@ -260,6 +313,9 @@ pub struct ShareRecord {
     pub podcast_id: PodcastId,
     /// Whether the user chose to share the podcast.
     pub shared: bool,
+    /// Lamport generation shared with the subscription register.
+    #[serde(default)]
+    pub generation: u64,
     /// Logical write time.
     pub hlc_ms: i64,
     /// Writing operation id.
@@ -267,12 +323,15 @@ pub struct ShareRecord {
 }
 
 impl ShareRecord {
+    /// Register ordering key: `(generation, hlc_ms, op_id)`.
+    pub fn order_key(&self) -> (u64, i64, &str) {
+        (self.generation, self.hlc_ms, self.op_id.as_str())
+    }
+
     fn total_cmp(&self, other: &Self) -> Ordering {
-        (self.hlc_ms, self.op_id.as_str(), self.shared).cmp(&(
-            other.hlc_ms,
-            other.op_id.as_str(),
-            other.shared,
-        ))
+        self.order_key()
+            .cmp(&other.order_key())
+            .then_with(|| self.shared.cmp(&other.shared))
     }
 
     /// Returns whether this record wins over `other`.
@@ -298,13 +357,36 @@ pub fn merge_share(current: &ShareRecord, incoming: &ShareRecord) -> PodcastResu
     })
 }
 
+/// Generation for a new write of the subscription or share register.
+///
+/// One more than the greatest generation of either register of the podcast
+/// (`None` when it has none), so a write made after observing another
+/// device's subscription, unsubscription or share decision orders after it
+/// even when that device's clock runs ahead. Concurrent writes on devices
+/// that did not see each other receive the same generation and are ordered
+/// by `hlc_ms`, then `op_id`.
+pub fn next_podcast_generation(
+    subscription: Option<&SubscriptionRecord>,
+    share: Option<&ShareRecord>,
+) -> u64 {
+    subscription
+        .map(|record| record.generation)
+        .into_iter()
+        .chain(share.map(|record| record.generation))
+        .max()
+        .map_or(1, |generation| generation.saturating_add(1))
+}
+
 /// Whether a podcast must currently be published.
 ///
 /// True only when the user is subscribed, chose to share, and the share
-/// decision is newer than the latest subscription write. A new subscription
-/// (including re-subscribing, or subscribing from someone else's public card)
-/// is therefore always private until the user shares it again, and a stale
-/// device cannot republish a podcast through an old share decision.
+/// decision orders after the latest subscription write (by
+/// `(generation, hlc_ms, op_id)`). A new subscription (including
+/// re-subscribing, or subscribing from someone else's public card) is
+/// therefore always private until the user shares it again, and a stale
+/// device cannot republish a podcast through an old share decision. A share
+/// decision taken after observing the subscription always applies, because it
+/// carries a greater generation.
 pub fn effective_share(
     subscription: Option<&SubscriptionRecord>,
     share: Option<&ShareRecord>,
@@ -314,8 +396,7 @@ pub fn effective_share(
             subscription.subscribed
                 && share.shared
                 && subscription.podcast_id == share.podcast_id
-                && (share.hlc_ms, share.op_id.as_str())
-                    > (subscription.hlc_ms, subscription.op_id.as_str())
+                && share.order_key() > subscription.order_key()
         }
         _ => false,
     }

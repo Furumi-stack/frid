@@ -314,6 +314,7 @@ mod tests {
             season: None,
             episode_number: None,
             image_url: None,
+            progress_generation: Some(7),
         };
         let snapshot = PlaybackSnapshot {
             device_id: "host".to_string(),

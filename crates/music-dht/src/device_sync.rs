@@ -11,13 +11,16 @@
 //! | 1 | likes, playlists, membership (`furumi/sync/1`) |
 //! | 2 | [`SyncOpPayload::ListenRecorded`] (`furumi/sync/2`) |
 //! | 3 | fenced personal playback coordination |
-//! | 4 | podcasts: four `podcast_*` operations, podcast snapshot sections, [`PlaybackSource`] on queue items, reserved `playback_rate` |
+//! | 4 | podcasts: five `podcast_*` operations, podcast snapshot sections, [`PlaybackSource`] on queue items, reserved `playback_rate` |
 //!
-//! The ALPN stays `furumi/sync/2` for v3 and v4. [`SyncOpPayload`] and
-//! [`PlaybackSource`] are closed serde enums: a peer that does not know a
-//! `kind` fails to deserialize the **whole** message that contains it, not
-//! just one operation. Senders must therefore filter by the peer's version
-//! with [`op_allowed_for_peer`] and [`playback_allowed_for_peer`]. See the
+//! The ALPN stays `furumi/sync/2` for v3 and v4. [`SyncOpPayload`] is a
+//! closed serde enum: a peer that does not know an operation `kind` fails to
+//! deserialize the **whole** message that contains it, not just one
+//! operation. Peers before v4 ignore [`PlaybackTrack::source`] and would treat
+//! episodes as broken music items. Senders must therefore filter by the
+//! peer's version ([`profile_protocol_version`], [`relayed_protocol_version`],
+//! [`InviteWire::inviter_protocol_version`]) with [`op_allowed_for_peer`],
+//! [`playback_allowed_for_peer`] and [`SyncSnapshot::for_peer`]. See the
 //! workspace `PODCASTS.md` for the podcast contract.
 
 use std::collections::BTreeMap;
@@ -29,10 +32,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{MusicDhtError, Result};
 use crate::podcast::{
-    EpisodeId, FeedUrl, ListenSession, MAX_PODCAST_SNAPSHOT_BYTES, MAX_SNAPSHOT_LISTEN_SESSIONS,
-    MAX_SNAPSHOT_PROGRESS, MAX_SNAPSHOT_SHARES, MAX_SNAPSHOT_SUBSCRIPTIONS, PodcastEpisodeRef,
-    PodcastError, PodcastId, PodcastMeta, PodcastResult, ProgressRecord, ProgressStatus,
-    ShareRecord, SubscriptionRecord,
+    EpisodeId, FeedUrl, ListenSession, MAX_FEED_ALIASES, MAX_PODCAST_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_LISTEN_SESSIONS, MAX_SNAPSHOT_PROGRESS, MAX_SNAPSHOT_SHARES,
+    MAX_SNAPSHOT_SUBSCRIPTIONS, PodcastEpisodeRef, PodcastError, PodcastId, PodcastMeta,
+    PodcastResult, ProgressRecord, ProgressStatus, ShareRecord, SubscriptionRecord,
 };
 
 /// Legacy ALPN used by personal-device sync v1.
@@ -83,17 +86,38 @@ pub const fn supports_podcasts(protocol_version: u16) -> bool {
     protocol_version >= PODCAST_PROTOCOL_VERSION
 }
 
-/// Protocol version to store for a device after reading one of its profiles.
+/// Protocol version to store for a device after reading **its own** report.
 ///
-/// `reported` is the version the device itself put into its
-/// [`DeviceProfileWire`] (Hello/pairing) or [`SyncOpPayload::DeviceProfileSet`];
-/// `previously_known` is the stored value. Receivers and relays must never
+/// Self-reports are: the `profile` of a `Hello`, `PairRequest` or
+/// `PairResponse` sent by that device; the entry of a `devices` list whose
+/// `device_id` is the authenticated sender of the message (a `SyncResponse`
+/// has no `profile` field, so this is how an initiator learns the responder's
+/// version); and a [`SyncOpPayload::DeviceProfileSet`] whose
+/// `origin_device_id` is that device. `reported` is the version in the report
+/// (`None` when an older client left it out) and `previously_known` the
+/// stored value. A self-report replaces the stored value, so a downgrade is
+/// noticed.
+///
+/// Profiles of **other** devices relayed by a peer are not self-reports: use
+/// [`relayed_protocol_version`] for them. Receivers and relays must never
 /// substitute their own [`DEVICE_SYNC_PROTOCOL_VERSION`] for another device:
 /// doing so would make version gating send podcast state to old clients.
 pub fn profile_protocol_version(reported: Option<u16>, previously_known: Option<u16>) -> u16 {
     reported
         .or(previously_known)
         .unwrap_or(UNREPORTED_PROTOCOL_VERSION)
+}
+
+/// Protocol version to store for a device after reading a profile of it
+/// relayed by **another** device (an entry of a `devices` list).
+///
+/// Deployed v1–v3 clients relay every device with their own protocol
+/// constant, so a relayed value can understate a device's version. A relayed
+/// value therefore only raises the stored version (`max(stored, relayed)`)
+/// and is taken as is only when nothing is stored. Lowering requires a
+/// self-report ([`profile_protocol_version`]).
+pub fn relayed_protocol_version(relayed: u16, previously_known: Option<u16>) -> u16 {
+    previously_known.map_or(relayed, |stored| stored.max(relayed))
 }
 
 /// Default invite lifetime used by applications unless they need a custom TTL.
@@ -122,6 +146,25 @@ pub struct InviteWire {
     /// Expiration timestamp in unix milliseconds.
     #[serde(rename = "e")]
     pub expires_at_ms: i64,
+    /// Device-sync protocol version of the inviter (v4+).
+    ///
+    /// `None` in invites created by older clients. The invite consumer sends
+    /// its `PairRequest` before it hears from the inviter, so it gates the
+    /// operations, snapshot sections and playback state of that request by
+    /// [`InviteWire::inviter_protocol_version`].
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u16>,
+}
+
+impl InviteWire {
+    /// Protocol version to assume for the inviter while building a
+    /// `PairRequest`: the version in the invite, or
+    /// [`UNREPORTED_PROTOCOL_VERSION`] for invites from older clients, which
+    /// strips all podcast state from the request. Podcast state then catches
+    /// up through the snapshot of the next regular sync.
+    pub fn inviter_protocol_version(&self) -> u16 {
+        self.protocol_version.unwrap_or(UNREPORTED_PROTOCOL_VERSION)
+    }
 }
 
 /// Public device profile exchanged inside a trusted sync group.
@@ -303,6 +346,13 @@ impl ListenEvent {
 /// Absent on music items from older clients, which are music. Podcast
 /// episodes are identified only by this field: never by a negative id, a
 /// placeholder release or a URL in `file_path`.
+///
+/// Clients before v4 do not know [`PlaybackTrack::source`] at all and ignore
+/// it: they would take an episode for a broken music item (id 0, no content
+/// id) and forward it that way, losing the episode for every device. That is
+/// why podcast-bearing playback state is gated by version. This enum is
+/// closed for v4 clients: a new variant needs a protocol bump, because a v4
+/// client fails to parse the whole message on an unknown `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlaybackSource {
@@ -621,9 +671,10 @@ pub enum SyncOpPayload {
     },
     /// Subscribe to or unsubscribe from a podcast (protocol v4).
     ///
-    /// Last-writer-wins by `(hlc_ms, op_id)` of the operation. Unsubscribing
-    /// is state, not a tombstone. Only explicit user actions emit it; RSS
-    /// refreshes never do. Materialize with [`SyncOpWire::podcast_subscription`].
+    /// Last-writer-wins by `(generation, hlc_ms, op_id)`; see
+    /// [`SubscriptionRecord`]. Unsubscribing is state, not a tombstone. Only
+    /// explicit user actions emit it; RSS refreshes never do. Materialize with
+    /// [`SyncOpWire::podcast_subscription`].
     PodcastSubscriptionSet {
         /// Podcast.
         podcast_id: PodcastId,
@@ -634,16 +685,37 @@ pub enum SyncOpPayload {
         /// Known feed URLs (grow-only, bounded).
         #[serde(default)]
         feed_aliases: Vec<FeedUrl>,
+        /// Per-podcast Lamport generation
+        /// ([`crate::podcast::next_podcast_generation`]).
+        #[serde(default)]
+        generation: u64,
     },
     /// Share or stop sharing a podcast card with the federation (protocol v4).
     ///
-    /// Last-writer-wins; `shared = false` is a tombstone. Unsubscribing also
-    /// emits `shared = false`.
+    /// Last-writer-wins by `(generation, hlc_ms, op_id)`; see [`ShareRecord`].
+    /// `shared = false` is privacy-protecting state and **not** a tombstone:
+    /// it is never compacted. Unsubscribing also emits `shared = false`.
     PodcastShareSet {
         /// Podcast.
         podcast_id: PodcastId,
         /// Desired share state.
         shared: bool,
+        /// Per-podcast Lamport generation, shared with the subscription.
+        #[serde(default)]
+        generation: u64,
+    },
+    /// Record feed URLs of a podcast learned by any device (protocol v4).
+    ///
+    /// Grow-only: merged into the bounded alias set with
+    /// [`crate::podcast::merge_feed_aliases`]; it never touches the
+    /// subscription or share register, so RSS refreshes may emit it (after a
+    /// permanent redirect or an `itunes:new-feed-url`), but only when merging
+    /// the new URLs changes the stored set.
+    PodcastFeedAliasesAdded {
+        /// Podcast.
+        podcast_id: PodcastId,
+        /// Canonical feed URLs to add (at most `MAX_FEED_ALIASES + 1`).
+        feed_aliases: Vec<FeedUrl>,
     },
     /// Write the durable resume register of an episode (protocol v4).
     ///
@@ -684,9 +756,12 @@ pub enum SyncOpPayload {
 impl SyncOpPayload {
     /// Returns true for operations that remove state and may eventually compact.
     ///
-    /// `podcast_share_set { shared: false }` is a tombstone. Unsubscribing
-    /// (`podcast_subscription_set { subscribed: false }`) is **not**: it is
-    /// last-writer-wins state that must keep beating stale subscriptions.
+    /// No podcast operation is a tombstone. Unsubscribing
+    /// (`podcast_subscription_set { subscribed: false }`) and revoking a share
+    /// (`podcast_share_set { shared: false }`) are last-writer-wins state that
+    /// must keep beating stale `true` writes delivered again later; compacting
+    /// them (and deleting the state row, as like tombstones do) would let an
+    /// older operation still in some log resubscribe or republish the podcast.
     pub fn is_tombstone(&self) -> bool {
         matches!(
             self,
@@ -694,7 +769,6 @@ impl SyncOpPayload {
                 | SyncOpPayload::PlaylistDeleted { .. }
                 | SyncOpPayload::PlaylistTrackRemoved { .. }
                 | SyncOpPayload::DeviceRevoked { .. }
-                | SyncOpPayload::PodcastShareSet { shared: false, .. }
         )
     }
 
@@ -704,6 +778,7 @@ impl SyncOpPayload {
             self,
             SyncOpPayload::PodcastSubscriptionSet { .. }
                 | SyncOpPayload::PodcastShareSet { .. }
+                | SyncOpPayload::PodcastFeedAliasesAdded { .. }
                 | SyncOpPayload::PodcastProgressSet { .. }
                 | SyncOpPayload::PodcastListenRecorded { .. }
         )
@@ -713,13 +788,15 @@ impl SyncOpPayload {
 impl SyncOpWire {
     /// Subscription record written by a `podcast_subscription_set` operation.
     ///
-    /// The register stamp is the operation's `(hlc_ms, op_id)`.
+    /// The register stamp is the payload `generation` and the operation's
+    /// `(hlc_ms, op_id)`.
     pub fn podcast_subscription(&self) -> Option<SubscriptionRecord> {
         let SyncOpPayload::PodcastSubscriptionSet {
             podcast_id,
             subscribed,
             podcast,
             feed_aliases,
+            generation,
         } = &self.payload
         else {
             return None;
@@ -729,6 +806,7 @@ impl SyncOpWire {
             subscribed: *subscribed,
             podcast: podcast.clone(),
             feed_aliases: feed_aliases.clone(),
+            generation: *generation,
             hlc_ms: self.hlc_ms,
             op_id: self.op_id.clone(),
         };
@@ -738,15 +816,35 @@ impl SyncOpWire {
 
     /// Share record written by a `podcast_share_set` operation.
     pub fn podcast_share(&self) -> Option<ShareRecord> {
-        let SyncOpPayload::PodcastShareSet { podcast_id, shared } = &self.payload else {
+        let SyncOpPayload::PodcastShareSet {
+            podcast_id,
+            shared,
+            generation,
+        } = &self.payload
+        else {
             return None;
         };
         Some(ShareRecord {
             podcast_id: podcast_id.clone(),
             shared: *shared,
+            generation: *generation,
             hlc_ms: self.hlc_ms,
             op_id: self.op_id.clone(),
         })
+    }
+
+    /// Podcast and feed URLs of a `podcast_feed_aliases_added` operation.
+    ///
+    /// Merge them with [`crate::podcast::merge_feed_aliases`] (or
+    /// [`SubscriptionRecord::add_feed_aliases`]); the registers are untouched.
+    pub fn podcast_feed_aliases(&self) -> Option<(&PodcastId, &[FeedUrl])> {
+        match &self.payload {
+            SyncOpPayload::PodcastFeedAliasesAdded {
+                podcast_id,
+                feed_aliases,
+            } => Some((podcast_id, feed_aliases)),
+            _ => None,
+        }
     }
 
     /// Progress register written by a `podcast_progress_set` operation.
@@ -789,7 +887,16 @@ impl SyncOpWire {
     /// Validates a podcast operation against the contract.
     ///
     /// Non-podcast operations are accepted unchanged. Receivers must skip
-    /// (but still acknowledge) invalid podcast operations.
+    /// (but still acknowledge) podcast operations that fail this check
+    /// (bounds, stamps, mismatched references).
+    ///
+    /// Ids ([`PodcastId`], [`EpisodeId`]) and feed URLs ([`FeedUrl`]) are
+    /// checked earlier, while the message is deserialized: a non-canonical id
+    /// or URL is a schema violation like a wrong JSON type, and the whole
+    /// message fails to parse. Conforming clients cannot produce one, because
+    /// these types only serialize canonical values and their rules are frozen
+    /// with the `v1` derivation domains; changing them requires a new protocol
+    /// version.
     pub fn validate_podcast(&self) -> PodcastResult<()> {
         let check_ref = |episode: &Option<PodcastEpisodeRef>,
                          episode_id: &EpisodeId,
@@ -811,6 +918,15 @@ impl SyncOpWire {
                 .validate(),
             SyncOpPayload::PodcastShareSet { .. } => {
                 self.podcast_share().expect("share payload").validate()
+            }
+            SyncOpPayload::PodcastFeedAliasesAdded { feed_aliases, .. } => {
+                if feed_aliases.is_empty() || feed_aliases.len() > MAX_FEED_ALIASES + 1 {
+                    return Err(PodcastError::InvalidField {
+                        field: "feed_aliases",
+                        reason: "must hold 1 to MAX_FEED_ALIASES + 1 URLs",
+                    });
+                }
+                Ok(())
             }
             SyncOpPayload::PodcastProgressSet {
                 episode_id,
@@ -960,7 +1076,8 @@ pub fn restore_jam_private_items(
 /// Podcast state (protocol v4) **is** included, bounded by
 /// [`SyncSnapshot::bound_podcast_state`]. Operations hidden from a peer while
 /// it ran an older version are never re-requested after it upgrades, because
-/// sync vectors only grow, so snapshots are the recovery path. Send podcast
+/// sync vectors only grow, so snapshots are the only recovery path for such a
+/// peer, and only for the records that fit the snapshot bounds. Send podcast
 /// sections only to v4 peers ([`SyncSnapshot::for_peer`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncSnapshot {
@@ -1019,31 +1136,75 @@ impl SyncSnapshot {
         snapshot
     }
 
-    /// Sorts and truncates the podcast sections to the snapshot limits.
-    ///
-    /// Each section is ordered newest first (subscriptions, shares and
-    /// progress by `hlc_ms`, sessions by `ended_at_ms`, ties by id) and capped
-    /// by its `MAX_SNAPSHOT_*` count. Sections then share
-    /// [`MAX_PODCAST_SNAPSHOT_BYTES`] of serialized JSON in priority order:
-    /// subscriptions, shares, progress, sessions. Older registers that do not
-    /// fit still propagate through operations.
+    /// Bounds the podcast sections with the default budget
+    /// [`MAX_PODCAST_SNAPSHOT_BYTES`]; see
+    /// [`SyncSnapshot::bound_podcast_state_to`].
     pub fn bound_podcast_state(&mut self) {
-        let mut budget = MAX_PODCAST_SNAPSHOT_BYTES;
+        self.bound_podcast_state_to(MAX_PODCAST_SNAPSHOT_BYTES);
+    }
+
+    /// Sorts and truncates the podcast sections to the snapshot limits and to
+    /// `budget_bytes` of serialized JSON.
+    ///
+    /// * Subscription records lose `podcast.description`: it is the largest
+    ///   field and every device refreshes channel metadata from the feed. The
+    ///   register (`subscribed`, stamps) and feed aliases are kept whole.
+    /// * Each section is ordered newest first (subscriptions and shares by
+    ///   `(generation, hlc_ms)`, progress by `(generation, hlc_ms)`, sessions
+    ///   by `ended_at_ms`; ties by id) and capped by its `MAX_SNAPSHOT_*`
+    ///   count.
+    /// * Each section has its own share of the budget (subscriptions 25 %,
+    ///   shares 5 %, progress 45 %, sessions 25 %), so large subscription
+    ///   records cannot crowd out progress. Unused budget passes on to the
+    ///   following sections in that order.
+    ///
+    /// Callers pass [`MAX_PODCAST_SNAPSHOT_BYTES`], or less when the rest of
+    /// the message (music snapshot, operations, playback) leaves less room
+    /// under [`MAX_SYNC_LINE`]; see [`podcast_snapshot_budget`].
+    ///
+    /// Records cut here reach a peer only through operations it has not
+    /// acknowledged yet. A peer that skipped podcast operations while it ran
+    /// an older version never receives the cut records: it recovers the newest
+    /// records only, and its play counts can differ from other devices.
+    pub fn bound_podcast_state_to(&mut self, budget_bytes: usize) {
+        let share = |percent: usize| budget_bytes / 100 * percent;
+        let mut budget = 0usize;
+        for record in &mut self.podcast_subscriptions {
+            record.podcast.description = None;
+        }
         self.podcast_subscriptions.sort_by(|a, b| {
-            (b.hlc_ms, &b.op_id, &b.podcast_id).cmp(&(a.hlc_ms, &a.op_id, &a.podcast_id))
+            (b.generation, b.hlc_ms, &b.op_id, &b.podcast_id).cmp(&(
+                a.generation,
+                a.hlc_ms,
+                &a.op_id,
+                &a.podcast_id,
+            ))
         });
+        budget += share(25);
         bound_section(
             &mut self.podcast_subscriptions,
             MAX_SNAPSHOT_SUBSCRIPTIONS,
             &mut budget,
         );
         self.podcast_shares.sort_by(|a, b| {
-            (b.hlc_ms, &b.op_id, &b.podcast_id).cmp(&(a.hlc_ms, &a.op_id, &a.podcast_id))
+            (b.generation, b.hlc_ms, &b.op_id, &b.podcast_id).cmp(&(
+                a.generation,
+                a.hlc_ms,
+                &a.op_id,
+                &a.podcast_id,
+            ))
         });
+        budget += share(5);
         bound_section(&mut self.podcast_shares, MAX_SNAPSHOT_SHARES, &mut budget);
         self.podcast_progress.sort_by(|a, b| {
-            (b.hlc_ms, &b.op_id, &b.episode_id).cmp(&(a.hlc_ms, &a.op_id, &a.episode_id))
+            (b.generation, b.hlc_ms, &b.op_id, &b.episode_id).cmp(&(
+                a.generation,
+                a.hlc_ms,
+                &a.op_id,
+                &a.episode_id,
+            ))
         });
+        budget += share(45);
         bound_section(
             &mut self.podcast_progress,
             MAX_SNAPSHOT_PROGRESS,
@@ -1051,6 +1212,7 @@ impl SyncSnapshot {
         );
         self.podcast_listen_sessions
             .sort_by(|a, b| (b.ended_at_ms, &b.session_id).cmp(&(a.ended_at_ms, &a.session_id)));
+        budget += budget_bytes - share(25) - share(5) - share(45);
         bound_section(
             &mut self.podcast_listen_sessions,
             MAX_SNAPSHOT_LISTEN_SESSIONS,
@@ -1068,6 +1230,17 @@ impl SyncSnapshot {
             && self.podcast_progress.len() <= MAX_SNAPSHOT_PROGRESS
             && self.podcast_listen_sessions.len() <= MAX_SNAPSHOT_LISTEN_SESSIONS
     }
+}
+
+/// Byte budget for the podcast snapshot sections of one message.
+///
+/// `other_bytes` is the serialized size of the message without podcast
+/// sections. The result keeps the whole line under [`MAX_SYNC_LINE`] with a
+/// 64 KiB margin and never exceeds [`MAX_PODCAST_SNAPSHOT_BYTES`].
+pub fn podcast_snapshot_budget(other_bytes: usize) -> usize {
+    MAX_SYNC_LINE
+        .saturating_sub(other_bytes.saturating_add(64 * 1024))
+        .min(MAX_PODCAST_SNAPSHOT_BYTES)
 }
 
 fn bound_section<T: Serialize>(items: &mut Vec<T>, max_items: usize, budget: &mut usize) {
@@ -1559,6 +1732,7 @@ mod tests {
                 season: Some(1),
                 episode_number: Some(3),
                 image_url: None,
+                progress_generation: Some(4),
             }
         }
 
@@ -1649,10 +1823,16 @@ mod tests {
                         image_url: None,
                     },
                     feed_aliases: vec![feed()],
+                    generation: 1,
                 },
                 SyncOpPayload::PodcastShareSet {
                     podcast_id: podcast_id(),
                     shared: false,
+                    generation: 2,
+                },
+                SyncOpPayload::PodcastFeedAliasesAdded {
+                    podcast_id: podcast_id(),
+                    feed_aliases: vec![FeedUrl::parse("https://moved.example.test/feed").unwrap()],
                 },
                 SyncOpPayload::PodcastProgressSet {
                     episode_id: episode_id(),
@@ -1675,6 +1855,7 @@ mod tests {
             let kinds = [
                 "podcast_subscription_set",
                 "podcast_share_set",
+                "podcast_feed_aliases_added",
                 "podcast_progress_set",
                 "podcast_listen_recorded",
             ];
@@ -1698,14 +1879,25 @@ mod tests {
                 (1_001, "dev-a:1")
             );
             assert!(subscription.subscribed);
+            assert_eq!(subscription.generation, 1);
             let share = ops[1].podcast_share().unwrap();
             assert!(!share.shared);
-            let progress = ops[2].podcast_progress().unwrap();
+            assert_eq!(share.generation, 2);
+            let (alias_podcast, aliases) = ops[2].podcast_feed_aliases().unwrap();
+            assert_eq!(alias_podcast, &podcast_id());
+            let mut with_alias = subscription.clone();
+            with_alias.add_feed_aliases(aliases);
+            assert!(with_alias.feed_aliases.contains(&aliases[0]));
+            // The alias operation never touches the register.
+            assert_eq!(with_alias.order_key(), subscription.order_key());
+            assert_eq!(with_alias.subscribed, subscription.subscribed);
+            let progress = ops[3].podcast_progress().unwrap();
             assert_eq!(progress.device_id, "dev-a");
-            assert_eq!(progress.op_id, "dev-a:3");
+            assert_eq!(progress.op_id, "dev-a:4");
             assert_eq!(progress.generation, 3);
-            assert_eq!(ops[3].podcast_listen_session(), Some(&session()));
+            assert_eq!(ops[4].podcast_listen_session(), Some(&session()));
             assert!(ops[0].podcast_share().is_none());
+            assert!(ops[0].podcast_feed_aliases().is_none());
         }
 
         #[test]
@@ -1719,16 +1911,21 @@ mod tests {
                     _ => unreachable!(),
                 },
                 feed_aliases: Vec::new(),
+                generation: 3,
             };
             assert!(!unsubscribe.is_tombstone(), "unsubscribe is LWW state");
-            assert!(ops[1].is_tombstone(), "share=false is a tombstone");
+            // share=false protects privacy: compacting it would let a stale
+            // share=true delivered again republish the podcast.
+            assert!(!ops[1].is_tombstone(), "share=false is LWW state");
             let share = SyncOpPayload::PodcastShareSet {
                 podcast_id: podcast_id(),
                 shared: true,
+                generation: 4,
             };
             assert!(!share.is_tombstone());
-            assert!(!ops[2].is_tombstone());
-            assert!(!ops[3].is_tombstone());
+            for payload in &ops {
+                assert!(!payload.is_tombstone(), "{payload:?}");
+            }
         }
 
         #[test]
@@ -1781,6 +1978,49 @@ mod tests {
                 },
             );
             like.validate_podcast().unwrap();
+            let empty_aliases = op(
+                5,
+                SyncOpPayload::PodcastFeedAliasesAdded {
+                    podcast_id: podcast_id(),
+                    feed_aliases: Vec::new(),
+                },
+            );
+            assert!(empty_aliases.validate_podcast().is_err());
+        }
+
+        #[test]
+        fn malformed_ids_and_feed_urls_reject_the_whole_message() {
+            // Pins the documented behaviour: ids and feed URLs are validated
+            // while deserializing, so a non-canonical value is a schema
+            // violation of the whole message, not a skippable operation.
+            let like = op(
+                1,
+                SyncOpPayload::TrackLikeSet {
+                    content_id: "b3:x".to_string(),
+                    liked: true,
+                    fed: None,
+                },
+            );
+            let share = op(
+                2,
+                SyncOpPayload::PodcastShareSet {
+                    podcast_id: podcast_id(),
+                    shared: true,
+                    generation: 1,
+                },
+            );
+            let batch = serde_json::to_string(&vec![like, share]).unwrap();
+            serde_json::from_str::<Vec<SyncOpWire>>(&batch).unwrap();
+            let upper = batch.replace(podcast_id().as_str(), &podcast_id().as_str().to_uppercase());
+            assert!(serde_json::from_str::<Vec<SyncOpWire>>(&upper).is_err());
+            let subscription = op(3, podcast_ops().remove(0));
+            let json = serde_json::to_string(&subscription).unwrap();
+            let non_canonical = json.replace(
+                "https://private.example.test/feed",
+                "HTTPS://private.example.test:443/feed",
+            );
+            assert_ne!(json, non_canonical);
+            assert!(serde_json::from_str::<SyncOpWire>(&non_canonical).is_err());
         }
 
         #[test]
@@ -2014,6 +2254,67 @@ mod tests {
                 UNREPORTED_PROTOCOL_VERSION
             );
             assert!(!supports_podcasts(profile_protocol_version(None, None)));
+            // A self-report may lower the version (downgrade).
+            assert_eq!(profile_protocol_version(Some(3), Some(4)), 3);
+        }
+
+        #[test]
+        fn relayed_versions_only_raise_the_stored_version() {
+            // A deployed v3 relay forwards every device with its own constant.
+            assert_eq!(relayed_protocol_version(3, Some(4)), 4);
+            assert!(supports_podcasts(relayed_protocol_version(3, Some(4))));
+            assert_eq!(relayed_protocol_version(4, Some(3)), 4);
+            assert_eq!(relayed_protocol_version(3, None), 3);
+            assert_eq!(relayed_protocol_version(1, Some(2)), 2);
+        }
+
+        #[test]
+        fn pair_requests_gate_by_the_invite_version() {
+            let invite = InviteWire {
+                v: 1,
+                ticket: "t".to_string(),
+                device_id: "inviter".to_string(),
+                invite_id: "i".to_string(),
+                secret: "s".to_string(),
+                expires_at_ms: 1,
+                protocol_version: None,
+            };
+            // Invites of older clients carry no version: assume the oldest.
+            let legacy = r#"{"v":1,"t":"t","d":"inviter","i":"i","s":"s","e":1}"#;
+            let parsed: InviteWire = serde_json::from_str(legacy).unwrap();
+            assert_eq!(parsed, invite);
+            assert_eq!(serde_json::to_string(&invite).unwrap(), legacy);
+            assert_eq!(
+                parsed.inviter_protocol_version(),
+                UNREPORTED_PROTOCOL_VERSION
+            );
+            let snapshot = SyncSnapshot {
+                podcast_listen_sessions: vec![session()],
+                ..SyncSnapshot::default()
+            };
+            assert!(
+                !snapshot
+                    .for_peer(parsed.inviter_protocol_version())
+                    .has_podcast_state()
+            );
+            for payload in podcast_ops() {
+                assert!(!op_allowed_for_peer(
+                    &payload,
+                    parsed.inviter_protocol_version()
+                ));
+            }
+            assert!(!playback_allowed_for_peer(
+                &mixed(),
+                parsed.inviter_protocol_version()
+            ));
+            let current = InviteWire {
+                protocol_version: Some(DEVICE_SYNC_PROTOCOL_VERSION),
+                ..invite
+            };
+            let link = encode_invite(&current).unwrap();
+            let back = parse_invite(&link).unwrap();
+            assert_eq!(back, current);
+            assert!(supports_podcasts(back.inviter_protocol_version()));
         }
 
         #[test]
@@ -2091,7 +2392,7 @@ mod tests {
             let snapshot = SyncSnapshot {
                 podcast_subscriptions: vec![ops[0].podcast_subscription().unwrap()],
                 podcast_shares: vec![ops[1].podcast_share().unwrap()],
-                podcast_progress: vec![ops[2].podcast_progress().unwrap()],
+                podcast_progress: vec![ops[3].podcast_progress().unwrap()],
                 podcast_listen_sessions: vec![session()],
                 ..SyncSnapshot::default()
             };
@@ -2130,6 +2431,7 @@ mod tests {
                             &FeedUrl::parse(&format!("https://a.test/{i}")).unwrap(),
                         ),
                         shared: i % 2 == 0,
+                        generation: 1,
                         hlc_ms: i as i64,
                         op_id: format!("dev:{i}"),
                     })
@@ -2156,7 +2458,10 @@ mod tests {
 
         #[test]
         fn snapshot_byte_budget_is_enforced() {
-            let big = "x".repeat(crate::podcast::MAX_DESCRIPTION_CHARS);
+            // Worst-case subscription records: long Cyrillic title, author and
+            // description, plus a few progress registers.
+            let big: String = "я".repeat(crate::podcast::MAX_DESCRIPTION_CHARS);
+            let title: String = big.chars().take(crate::podcast::MAX_TITLE_CHARS).collect();
             let subscriptions: Vec<SubscriptionRecord> = (0..MAX_SNAPSHOT_SUBSCRIPTIONS)
                 .map(|i| {
                     let url = FeedUrl::parse(&format!("https://a.test/{i}")).unwrap();
@@ -2165,38 +2470,82 @@ mod tests {
                         subscribed: true,
                         podcast: PodcastMeta {
                             feed_url: url,
-                            title: big.chars().take(1_000).collect(),
-                            author: None,
+                            title: title.clone(),
+                            author: Some(title.clone()),
                             description: Some(big.clone()),
                             link: None,
                             image_url: None,
                         },
                         feed_aliases: Vec::new(),
+                        generation: 1,
                         hlc_ms: i as i64,
                         op_id: format!("dev:{i}"),
                     }
                 })
                 .collect();
-            let mut snapshot = SyncSnapshot {
+            let progress: Vec<ProgressRecord> = (0..10)
+                .map(|i| {
+                    op(
+                        i + 1,
+                        SyncOpPayload::PodcastProgressSet {
+                            episode_id: EpisodeId::from_guid(&podcast_id(), &format!("e{i}"))
+                                .unwrap(),
+                            podcast_id: podcast_id(),
+                            position_ms: 1_000,
+                            status: ProgressStatus::InProgress,
+                            generation: 1,
+                            session_id: "s".to_string(),
+                            episode: None,
+                        },
+                    )
+                    .podcast_progress()
+                    .unwrap()
+                })
+                .collect();
+            let original = SyncSnapshot {
                 podcast_subscriptions: subscriptions,
+                podcast_progress: progress,
                 podcast_listen_sessions: vec![session()],
                 ..SyncSnapshot::default()
             };
+            let section_bytes = |snapshot: &SyncSnapshot| -> usize {
+                fn sum<T: Serialize>(items: &[T]) -> usize {
+                    items
+                        .iter()
+                        .map(|item| serde_json::to_vec(item).unwrap().len() + 1)
+                        .sum()
+                }
+                sum(&snapshot.podcast_subscriptions)
+                    + sum(&snapshot.podcast_shares)
+                    + sum(&snapshot.podcast_progress)
+                    + sum(&snapshot.podcast_listen_sessions)
+            };
+            let mut snapshot = original.clone();
             snapshot.bound_podcast_state();
-            let bytes: usize = snapshot
-                .podcast_subscriptions
-                .iter()
-                .map(|record| serde_json::to_vec(record).unwrap().len() + 1)
-                .sum::<usize>()
-                + snapshot
-                    .podcast_listen_sessions
+            assert!(section_bytes(&snapshot) <= MAX_PODCAST_SNAPSHOT_BYTES);
+            assert!(
+                snapshot
+                    .podcast_subscriptions
                     .iter()
-                    .map(|record| serde_json::to_vec(record).unwrap().len() + 1)
-                    .sum::<usize>();
-            assert!(bytes <= MAX_PODCAST_SNAPSHOT_BYTES);
+                    .all(|record| record.podcast.description.is_none()),
+                "descriptions are refreshed from RSS, not snapshotted"
+            );
             assert!(snapshot.podcast_subscriptions.len() < MAX_SNAPSHOT_SUBSCRIPTIONS);
             assert!(!snapshot.podcast_subscriptions.is_empty());
+            // Subscriptions cannot crowd out progress and sessions.
+            assert_eq!(snapshot.podcast_progress.len(), 10);
+            assert_eq!(snapshot.podcast_listen_sessions.len(), 1);
             assert!(serde_json::to_vec(&snapshot).unwrap().len() < MAX_SYNC_LINE);
+
+            // A smaller budget, for a message whose other parts are large.
+            let budget = podcast_snapshot_budget(6 * 1024 * 1024);
+            assert!(budget < MAX_PODCAST_SNAPSHOT_BYTES);
+            let mut small = original;
+            small.bound_podcast_state_to(budget);
+            assert!(section_bytes(&small) <= budget);
+            assert_eq!(small.podcast_progress.len(), 10);
+            assert_eq!(podcast_snapshot_budget(0), MAX_PODCAST_SNAPSHOT_BYTES);
+            assert_eq!(podcast_snapshot_budget(MAX_SYNC_LINE), 0);
         }
     }
 }

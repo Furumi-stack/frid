@@ -227,6 +227,7 @@ impl EpisodeMeta {
             episode_number: self.episode_number,
             image_url: valid_url(self.image_url.as_deref())
                 .or_else(|| valid_url(podcast.image_url.as_deref())),
+            progress_generation: None,
         }
     }
 }
@@ -236,8 +237,9 @@ impl EpisodeMeta {
 /// Carried by playback queues (`PlaybackSource::PodcastEpisode`) and by
 /// progress operations, so a receiving trusted device can display, resume and
 /// play the episode without being subscribed and without its own copy of the
-/// feed. It contains no personal state. It is private: Jam snapshots replace it
-/// with an opaque placeholder.
+/// feed. Apart from the optional handoff hint
+/// [`progress_generation`](Self::progress_generation) it contains no personal
+/// state. It is private: Jam snapshots replace it with an opaque placeholder.
 ///
 /// If the audio URL went stale, refresh the feed at `feed_url` and look the
 /// episode up by `episode_id`.
@@ -273,6 +275,17 @@ pub struct PodcastEpisodeRef {
     /// Episode or podcast artwork URL.
     #[serde(default)]
     pub image_url: Option<String>,
+    /// Greatest progress generation the sender has seen for this episode.
+    ///
+    /// Set on queue items of a playback state (in particular on handoff),
+    /// because the playback state can arrive before the sender's progress
+    /// operations. A device that starts playing the item writes its explicit
+    /// action with
+    /// [`ProgressRecord::explicit_generation`](super::ProgressRecord::explicit_generation)`(max(local, progress_generation))`.
+    /// Ignored in progress and listening operations, whose own generation is
+    /// authoritative. Not part of the episode identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_generation: Option<u64>,
 }
 
 impl PodcastEpisodeRef {

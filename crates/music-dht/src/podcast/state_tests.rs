@@ -282,10 +282,17 @@ fn subscription(
         subscribed,
         podcast: podcast_meta(title, url),
         feed_aliases: Vec::new(),
+        generation: 1,
         hlc_ms,
         op_id: op.to_string(),
     };
     record.normalize();
+    record
+}
+
+fn with_generation<T: Clone>(record: &T, set: impl Fn(&mut T)) -> T {
+    let mut record = record.clone();
+    set(&mut record);
     record
 }
 
@@ -330,13 +337,14 @@ fn share(shared: bool, hlc_ms: i64, op: &str) -> ShareRecord {
     ShareRecord {
         podcast_id: podcast_id(),
         shared,
+        generation: 1,
         hlc_ms,
         op_id: op.to_string(),
     }
 }
 
 #[test]
-fn shares_converge_and_false_is_a_tombstone() {
+fn shares_converge_and_false_is_never_beaten_by_a_stale_true() {
     let ops = [
         share(true, 100, "dev-a:1"),
         share(false, 200, "dev-a:2"),
@@ -362,6 +370,129 @@ fn effective_share_rules() {
     let unsubscribed = subscription(false, 200, "dev-a:3", "Show", "feed");
     let stale = share(true, 250, "dev-b:1");
     assert!(!effective_share(Some(&unsubscribed), Some(&stale)));
+}
+
+#[test]
+fn clock_skew_cannot_undo_an_observed_unsubscribe() {
+    // Device A's clock runs ten minutes ahead. B sees A's subscription, then
+    // the user unsubscribes on B.
+    let sub_a = subscription(true, 1_000_600_000, "dev-a:1", "Show", "feed");
+    assert_eq!(next_podcast_generation(None, None), 1);
+    let generation = next_podcast_generation(Some(&sub_a), None);
+    assert_eq!(generation, 2);
+    let unsub_b = with_generation(
+        &subscription(false, 1_000_060_000, "dev-b:1", "Show", "feed"),
+        |r| r.generation = generation,
+    );
+    let merged = assert_converges(&[sub_a.clone(), unsub_b.clone()], merge_subscription);
+    assert!(!merged.subscribed, "the later unsubscribe wins");
+    // Concurrent writes (same generation) still fall back to the clock.
+    let concurrent = with_generation(&unsub_b, |r| r.generation = 1);
+    assert!(merge_subscription(&sub_a, &concurrent).unwrap().subscribed);
+}
+
+#[test]
+fn share_after_subscribe_applies_despite_clock_skew() {
+    let sub_a = subscription(true, 1_000_600_000, "dev-a:1", "Show", "feed");
+    let share_b = with_generation(&share(true, 1_000_060_000, "dev-b:1"), |r| {
+        r.generation = next_podcast_generation(Some(&sub_a), None)
+    });
+    assert!(effective_share(Some(&sub_a), Some(&share_b)));
+    // Unsubscribe written after the share (higher generation) revokes it,
+    // and so does a later re-subscription until the user shares again.
+    let unsub = with_generation(&subscription(false, 1, "dev-a:2", "Show", "feed"), |r| {
+        r.generation = next_podcast_generation(Some(&sub_a), Some(&share_b))
+    });
+    assert!(!effective_share(Some(&unsub), Some(&share_b)));
+    let resub = with_generation(&subscription(true, 2, "dev-a:3", "Show", "feed"), |r| {
+        r.generation = next_podcast_generation(Some(&unsub), Some(&share_b))
+    });
+    assert!(!effective_share(Some(&resub), Some(&share_b)));
+    let reshare = with_generation(&share(true, 3, "dev-a:4"), |r| {
+        r.generation = next_podcast_generation(Some(&resub), Some(&share_b))
+    });
+    assert!(effective_share(Some(&resub), Some(&reshare)));
+    // Revoking (shared = false) with a higher generation wins over every
+    // stale true, in any order.
+    let revoke = with_generation(&share(false, 0, "dev-b:2"), |r| {
+        r.generation = next_podcast_generation(Some(&resub), Some(&reshare))
+    });
+    let merged = assert_converges(&[share_b, reshare, revoke.clone()], merge_share);
+    assert_eq!(merged, revoke);
+}
+
+#[test]
+fn current_feed_url_stays_resolvable_beyond_the_alias_bound() {
+    let mut record = subscription(true, 1, "dev-a:1", "Show", "feed");
+    record.add_feed_aliases(
+        &(0..=crate::podcast::MAX_FEED_ALIASES)
+            .map(|i| feed_url(&format!("a{i}")))
+            .collect::<Vec<_>>(),
+    );
+    record.podcast.feed_url = FeedUrl::parse("https://z.test/current").unwrap();
+    record.normalize();
+    assert!(!record.feed_aliases.contains(&record.podcast.feed_url));
+    let urls = record.feed_urls();
+    assert!(urls.contains(&record.podcast.feed_url));
+    assert!(urls.contains(&feed_url("feed")), "origin is kept");
+    let known: Vec<(&PodcastId, &FeedUrl)> =
+        urls.iter().map(|url| (&record.podcast_id, url)).collect();
+    assert_eq!(
+        crate::podcast::resolve_podcast_id(&record.podcast.feed_url, known),
+        podcast_id()
+    );
+}
+
+#[test]
+fn handoff_receiver_continues_with_the_carried_generation() {
+    use ProgressStatus::*;
+    // Sender A plays session s1 at generation 5 with a fast clock; its
+    // progress operations have not reached B when the handoff arrives.
+    let a_checkpoint = progress(5, 9_000_000, "dev-a", "dev-a:9", 600_000, InProgress, "s1");
+    let carried = Some(a_checkpoint.generation);
+    let b_local = Some(2);
+    let generation = ProgressRecord::explicit_generation(b_local.max(carried));
+    assert_eq!(generation, 6);
+    let b_start = progress(
+        generation, 1_000, "dev-b", "dev-b:1", 600_000, InProgress, "s2",
+    );
+    let b_pause = progress(
+        generation, 2_000, "dev-b", "dev-b:2", 660_000, InProgress, "s2",
+    );
+    // Without the carried generation B would write generation 3 and lose
+    // every write to A's older checkpoint.
+    let uninformed = progress(
+        ProgressRecord::explicit_generation(b_local),
+        2_000,
+        "dev-b",
+        "dev-b:2",
+        660_000,
+        InProgress,
+        "s2",
+    );
+    assert!(a_checkpoint.supersedes(&uninformed));
+    let merged = assert_converges(&[a_checkpoint, b_start, b_pause.clone()], merge_progress);
+    assert_eq!(merged, b_pause);
+    assert_eq!(merged.resume_position_ms(), 660_000);
+}
+
+#[test]
+fn coalescing_keeps_the_superseding_record_not_the_last_queued() {
+    use ProgressStatus::*;
+    // "Mark played" (explicit, generation 5) during a session, followed in
+    // the outgoing log by a checkpoint of the old session (generation 3).
+    let mark_played = progress(5, 100, "dev-a", "dev-a:7", 0, Completed, "mark");
+    let late_checkpoint = progress(3, 101, "dev-a", "dev-a:8", 30_000, InProgress, "s1");
+    let pending = [mark_played.clone(), late_checkpoint.clone()];
+    // Keep only records that no other pending record supersedes.
+    let kept: Vec<&ProgressRecord> = pending
+        .iter()
+        .filter(|record| !pending.iter().any(|other| other.supersedes(record)))
+        .collect();
+    assert_eq!(kept, vec![&mark_played]);
+    // Dropping by sequence order would have published the wrong state.
+    assert_ne!(pending.last(), Some(&mark_played));
+    assert_eq!(fold(&pending, merge_progress), mark_played);
 }
 
 /// Minimal client store used to show that whole operation sets converge and

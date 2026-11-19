@@ -43,18 +43,25 @@ impl FeedUrl {
     ///
     /// Surrounding whitespace is trimmed, `feed:`, `podcast:`, `pcast:` and
     /// `itpc:` prefixes map to `https://` (or to the embedded `http(s)` URL),
-    /// and input without a scheme defaults to `https://`.
+    /// and input without a scheme defaults to `https://`. `http:` or `https:`
+    /// not followed by `//` (for example `https:/host/feed`) is rejected.
     pub fn from_user_input(input: &str) -> PodcastResult<Self> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err(invalid("feed URL is empty"));
         }
         let lower = trimmed.to_ascii_lowercase();
+        if is_http_scheme_typo(&lower) {
+            return Err(invalid("feed URL must start with http:// or https://"));
+        }
         let mut candidate = trimmed.to_string();
         for scheme in ["feed:", "podcast:", "pcast:", "itpc:"] {
             if lower.starts_with(scheme) {
                 let rest = &trimmed[scheme.len()..];
                 let rest_lower = rest.to_ascii_lowercase();
+                if is_http_scheme_typo(&rest_lower) {
+                    return Err(invalid("feed URL must start with http:// or https://"));
+                }
                 candidate =
                     if rest_lower.starts_with("http://") || rest_lower.starts_with("https://") {
                         rest.to_string()
@@ -108,6 +115,13 @@ impl AsRef<str> for FeedUrl {
 
 fn invalid(reason: &str) -> PodcastError {
     PodcastError::InvalidFeedUrl(reason.to_string())
+}
+
+/// `http:` or `https:` not followed by `//`, such as `https:/host/feed`.
+fn is_http_scheme_typo(lower: &str) -> bool {
+    ["http:", "https:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme) && !lower[scheme.len()..].starts_with("//"))
 }
 
 fn has_scheme(text: &str) -> bool {
@@ -252,7 +266,8 @@ fn push_ascii(out: &mut String, value: &str) {
 ///
 /// `known` yields `(podcast_id, url)` pairs of every URL already associated
 /// with a podcast: the URL of its first subscription, its current fetch URL
-/// and its feed aliases. When `url` matches, the existing id is returned (the
+/// and its feed aliases ([`super::SubscriptionRecord::feed_urls`]; the bounded
+/// alias set alone can miss the current fetch URL). When `url` matches, the existing id is returned (the
 /// smallest id if, after a concurrent offline subscription, several podcasts
 /// share the URL). Otherwise a new id is derived from `url`.
 ///
@@ -277,7 +292,9 @@ pub fn resolve_podcast_id<'a>(
 /// derived is always kept; of the other URLs the [`MAX_FEED_ALIASES`]
 /// lexicographically smallest are kept. Taking the smallest `k` elements of a
 /// union is commutative, associative and idempotent, so devices converge
-/// regardless of delivery order.
+/// regardless of delivery order. Other URLs, including a podcast's current
+/// fetch URL, can fall outside the bound; the materialized subscription keeps
+/// its `podcast.feed_url` separately.
 pub fn merge_feed_aliases(podcast: &PodcastId, a: &[FeedUrl], b: &[FeedUrl]) -> Vec<FeedUrl> {
     let mut origin = None;
     let mut rest = BTreeSet::new();
@@ -437,6 +454,12 @@ mod tests {
             "https://",
             "file:///etc/passwd",
             "javascript:alert(1)",
+            // One-slash typos must not become a host named "https".
+            "https:/a.test/feed",
+            "http:/a.test/feed",
+            "HTTPS:a.test/feed",
+            "https:///a.test/feed",
+            "feed:https:/a.test/feed",
         ] {
             assert!(FeedUrl::from_user_input(bad).is_err(), "{bad:?}");
         }
