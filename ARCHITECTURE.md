@@ -243,16 +243,25 @@ device publishes a card only for podcasts whose merged registers satisfy
 nothing is sent for a podcast the device never published. A card is the
 public projection of a podcast (feed URL and channel metadata, no personal
 state), signed by the device's iroh identity over a domain-separated
-canonical encoding and bound to its id by the URL the id hashes from. Cards
-live under the podcast-id key and one key per normalized title/author token;
-unpublishing writes a signed tombstone of the next revision that supersedes
-lower and equal revisions under every key and outlives every older card.
-Records use the music DHT's active/tombstone TTLs and republish cadence, are
-verified on every receive and cache read, and are kept in a separate,
-replaceable SQLite cache. Search filters on every replica by all query tokens,
-merges cards of one podcast across publisher devices, and returns typed
-`podcast` hits that clients merge with music results. Capability data only
-helps skip peers; it never authorizes. See the "Public discovery" section of
+canonical encoding. Only the origin URL the id hashes from is bound to the
+podcast; a moved `feed_url` is an unverified publisher claim that search never
+offers as the podcast's feed. Cards live under the podcast-id key and one key
+per normalized title/author token; unpublishing writes a signed tombstone of
+the next revision that supersedes lower and equal revisions on replicas that
+hold it, for the keys it lists, and outlives every older card. Only a record's
+publisher may store it; replicas keep one payload per publisher and podcast,
+admit placements only for keys they are close to, within per-key,
+per-publisher and total budgets, and never evict existing records for
+newcomers (tombstones cannot displace cards). Records use the music DHT's
+active/tombstone TTLs and republish cadence, are verified on every receive and
+cache read, and are kept in a separate, replaceable SQLite cache. Search
+filters on every replica by all query tokens, merges cards of one podcast
+across publisher devices, and returns typed `podcast` hits that clients merge
+with music results; publisher counts are not a trust signal. The publisher key
+is the device's transport identity, so a card is linkable to the device's
+network address and music-DHT records. Applications advertise the
+`podcast_dht` capability only when they run the overlay; capability data only
+helps skip peers, it never authorizes. See the "Public discovery" section of
 [PODCASTS.md](PODCASTS.md).
 
 Music discovery identifies an owner and content; it does not force all domain

@@ -4,17 +4,27 @@
 
 - `music-dht 0.6.0`: new `music_dht::podcast_dht` overlay for public podcast
   discovery on its own ALPN `furumi-fd/podcast-dht/1` (version 1) and its own
-  SQLite cache: signed `PodcastCard`s and `PodcastTombstone`s
+  SQLite cache (schema 2): signed `PodcastCard`s and `PodcastTombstone`s
   (`furumi-podcast-card:v1` / `furumi-podcast-card-tombstone:v1` canonical
   signing input), monotonic revisions with a total tie-break, text and id
   keys, `PodcastDht::{publish, unpublish, sync_shares, republish, search,
   lookup_podcast}` gated by `effective_share`, typed search hits
-  (`PodcastSearchHit`, `FederatedSearchHit`, `SearchHitKind`,
-  `merge_search_results`) and the advisory `feed_url_privacy_warning`.
-- `music-dht 0.6.0`: capability manifests advertise `podcast_dht = 1`
-  (`capabilities::PODCAST_DHT_ID`, `CapabilityManifest::protocol_version`,
-  `CapabilityManifest::supports_podcast_dht`); applications that do not run
-  the overlay must remove it with `without_protocol`.
+  (`PodcastSearchHit`, `ClaimedFeedUrl`, `FederatedSearchHit`,
+  `SearchHitKind`, `merge_search_results`) and the advisory
+  `feed_url_privacy_warning`.
+- Replicas accept records only from their publisher, store one payload per
+  `(podcast_id, publisher)`, admit placements only for keys they are close to
+  and within per-key, per-publisher and total budgets, and never evict
+  existing records for newcomers. Search offers only the URL the podcast id
+  hashes from; moved-feed URLs are reported as unverified claims.
+- `sync_shares` is fail-safe for revocation (per-podcast `failed`) and holds
+  back cards with privacy warnings until confirmed (`held_back`,
+  `PodcastShareState::privacy_confirmed`).
+- `music-dht 0.6.0`: capability manifests can advertise `podcast_dht = 1`
+  (`capabilities::PODCAST_DHT_ID`, `CapabilityManifest::with_podcast_dht`,
+  `CapabilityManifest::protocol_version`,
+  `CapabilityManifest::supports_podcast_dht`). It is opt-in:
+  `CapabilityManifest::frid()` does not include it.
 - `music-dht 0.6.0`: new `MusicDhtError::PodcastPublication` variant (the enum
   is `#[non_exhaustive]`).
 - The music DHT (`music-dht-v5`), `federation-net` and device-sync protocol v4
