@@ -36,8 +36,11 @@
   so existing `id < 0` / `release_id < 0` checks already treat them as
   non-library items; the sentinel carries no identity. New
   `TrackItem::key` / `TrackItemKey` (`lib:<id>`, `fed:<owner>:<item_id>`,
-  `ep:<episode id>`): clients must key queue items by it, not by `id`. The
-  library database is unchanged.
+  `ep:<episode id>`), the source identity: episodes must be keyed by it (or
+  `TrackItem.podcast`), never by `id`; content-first music matching stays
+  as it is. New `TrackItem::from_playback_track` / `PlaybackItem` convert
+  received playback items without copying wire ids (0 for episodes and Jam
+  private placeholders). The library database is unchanged.
 - `furumi-library 0.3.0`: prototype import collapses rows of one GUID-less
   item under several enclosure URLs, and the first refresh re-keys imported
   GUID-less episodes without personal state to the ids the current feed

@@ -1,6 +1,7 @@
 //! Data shapes the views render. They mirror what the furumusic API used to
 //! return, but every field is now filled from the local SQLite library.
 
+use music_dht::device_sync::{PlaybackSource, PlaybackTrack};
 use music_dht::podcast::{EpisodeId, PodcastEpisodeRef};
 use serde::{Deserialize, Serialize};
 
@@ -142,14 +143,20 @@ pub struct ArtistRef {
 ///
 /// A negative `id` therefore means "not a library row" and nothing else: it
 /// carries no identity and must never be decoded, compared across items or
-/// used as a key. Clients key queue items, current-track and position
-/// matching by [`TrackItem::key`] (or, on the wire, by
-/// `music_dht::device_sync::PlaybackSource`), not by `id`. The -1 sentinel
-/// only keeps music-only code that predates podcasts (`id >= 0` /
-/// `release_id < 0` checks) from treating an episode as library track,
-/// release or artist 0; code that keys items by `id` (for example a
-/// `local:{id}` string) would still merge all episodes and must switch to
-/// [`TrackItem::key`].
+/// used as a key. The -1 sentinel only keeps music-only code that predates
+/// podcasts (`id >= 0` / `release_id < 0` checks) from treating an episode
+/// as library track, release or artist 0.
+///
+/// [`TrackItem::key`] is the *source* identity. It does not merge a pending
+/// federated item with its imported library copy, which share a content id
+/// but have different keys (`fed:` and `lib:`). Clients that key playback
+/// items content-first (content id, then federated source, then id) keep
+/// doing so for music; what they must add is a podcast branch
+/// ([`TrackItem::podcast`], or [`TrackItemKey::PodcastEpisode`]) checked
+/// before any fallback to `id`. An episode must never be keyed by `id`: a
+/// `local:{id}` key would merge all episodes into one. On the wire the item
+/// kind is `music_dht::device_sync::PlaybackSource`; convert received items
+/// with [`TrackItem::from_playback_track`], never by copying wire ids.
 ///
 /// # Podcast episodes
 ///
@@ -198,12 +205,14 @@ pub struct TrackItem {
     pub podcast: Option<PodcastEpisodeRef>,
 }
 
-/// Typed identity of a [`TrackItem`], from [`TrackItem::key`].
+/// Typed source identity of a [`TrackItem`], from [`TrackItem::key`].
 ///
-/// Use it (or its string form) to key queue items, the current track and
-/// position matching instead of [`TrackItem::id`], which identifies library
-/// rows only. Two items with equal keys are the same track or episode; the
-/// same track may still appear more than once in a queue.
+/// Two items with equal keys are the same track or episode; the same track
+/// may still appear more than once in a queue. The key has no content-id
+/// equivalence: a pending federated item and its library copy differ. Use it
+/// where the source matters (and always for podcast episodes, which have no
+/// other identity); code that matches music by content id keeps doing that
+/// and checks the podcast variant first (see [`TrackItem`]).
 ///
 /// The [`Display`](std::fmt::Display) form is stable and suitable as a map
 /// key or in logs:
@@ -232,6 +241,21 @@ pub enum TrackItemKey {
     /// no `podcast`). furumi-library never builds one; clients that do must
     /// keep its `id` unique within the process.
     Transient(i64),
+}
+
+/// What a received `music_dht::device_sync::PlaybackTrack` is locally, from
+/// [`TrackItem::from_playback_track`].
+#[derive(Debug, Clone)]
+pub enum PlaybackItem {
+    /// A music track. Convert it with the client's music path (content id,
+    /// then federated source); its wire ids are the sender's.
+    Music,
+    /// A podcast episode, built with [`TrackItem::podcast_episode`].
+    PodcastEpisode(Box<TrackItem>),
+    /// A Jam private placeholder: not playable and without identity. Show it
+    /// as `music_dht::device_sync::PRIVATE_ITEM_TITLE` where the queue is
+    /// displayed; never insert it as a library or queue track, never key it.
+    Private,
 }
 
 impl std::fmt::Display for TrackItemKey {
@@ -277,15 +301,20 @@ impl TrackItem {
 
     /// Queue item for a podcast episode streamed from the publisher.
     ///
-    /// Display fields mirror `PlaybackTrack::podcast_episode` of
+    /// Title, artist and release follow `PlaybackTrack::podcast_episode` of
     /// `music_dht::device_sync` (the episode title, the podcast title as
-    /// artist and release, the announced duration; no track or disc number)
-    /// and add the publication year. Season and episode number stay in the
-    /// reference.
+    /// artist and release, the announced duration; no track or disc number).
+    /// The other fields differ from that wire form on purpose:
     ///
-    /// `id`, `release_id` and the artist id are the sentinel
-    /// [`TrackItem::NOT_A_LIBRARY_ROW`] for every episode: the item's identity
-    /// is [`TrackItem::podcast`] alone ([`TrackItem::key`]).
+    /// * `id`, `release_id` and the artist id are the sentinel
+    ///   [`TrackItem::NOT_A_LIBRARY_ROW`] (-1) for every episode, where the
+    ///   wire form carries `0`; the item's identity is [`TrackItem::podcast`]
+    ///   alone ([`TrackItem::key`]);
+    /// * `release_year` is the publication year (`None` on the wire);
+    /// * `audio_format` is `None` (the wire form carries the MIME type, which
+    ///   stays in the reference).
+    ///
+    /// Season and episode number stay in the reference.
     pub fn podcast_episode(episode: PodcastEpisodeRef) -> Self {
         Self {
             id: Self::NOT_A_LIBRARY_ROW,
@@ -314,6 +343,32 @@ impl TrackItem {
             play_count: 0,
             fed: None,
             podcast: Some(episode),
+        }
+    }
+
+    /// Classifies a received `music_dht::device_sync::PlaybackTrack` and
+    /// builds the local queue item for non-music sources.
+    ///
+    /// The wire `id` and `release_id` of podcast episodes and of Jam private
+    /// placeholders are `0`, and those of music items are the sender's local
+    /// ids. None of them identifies anything on this device, so they are
+    /// never copied:
+    ///
+    /// * a podcast episode becomes [`TrackItem::podcast_episode`] of its
+    ///   [`PlaybackSource::PodcastEpisode`] reference (sentinel ids, key
+    ///   `ep:`), whatever the legacy display fields say;
+    /// * a private placeholder ([`PlaybackSource::Private`]) is not playable
+    ///   and has no identity, so no `TrackItem` exists for it;
+    /// * music (no source, or [`PlaybackSource::Music`]) is left to the
+    ///   client's music path, which resolves it by content id or federated
+    ///   source.
+    pub fn from_playback_track(track: &PlaybackTrack) -> PlaybackItem {
+        match &track.source {
+            None | Some(PlaybackSource::Music) => PlaybackItem::Music,
+            Some(PlaybackSource::PodcastEpisode(episode)) => PlaybackItem::PodcastEpisode(
+                Box::new(Self::podcast_episode(episode.as_ref().clone())),
+            ),
+            Some(PlaybackSource::Private) => PlaybackItem::Private,
         }
     }
 
@@ -679,6 +734,56 @@ mod tests {
         pending_minus_one.id = TrackItem::NOT_A_LIBRARY_ROW;
         assert_eq!(pending_minus_one.key(), fed_key);
         assert_ne!(pending_minus_one.key(), track.key());
+    }
+
+    #[test]
+    fn received_playback_tracks_never_copy_wire_ids() {
+        // F1 wire form of an episode: id 0, release_id 0.
+        let episode = episode_ref("e1");
+        let wire = PlaybackTrack::podcast_episode(episode.clone());
+        assert_eq!((wire.id, wire.release_id), (0, 0));
+        let PlaybackItem::PodcastEpisode(item) = TrackItem::from_playback_track(&wire) else {
+            panic!("an episode is not music");
+        };
+        assert_eq!(item.id, TrackItem::NOT_A_LIBRARY_ROW);
+        assert_eq!(item.release_id, TrackItem::NOT_A_LIBRARY_ROW);
+        assert!(item.artists.iter().all(|artist| artist.id < 0));
+        assert_eq!(
+            item.key(),
+            TrackItemKey::PodcastEpisode(episode.episode_id.clone())
+        );
+        assert_eq!(item.podcast_episode_ref(), Some(&episode));
+        // Legacy display fields an older sender filled in do not matter.
+        let mut odd = wire.clone();
+        odd.id = 42;
+        odd.release_id = 7;
+        odd.title = "Something else".into();
+        let PlaybackItem::PodcastEpisode(odd) = TrackItem::from_playback_track(&odd) else {
+            panic!("the source decides");
+        };
+        assert_eq!(odd.key(), item.key());
+        assert_eq!(odd.id, TrackItem::NOT_A_LIBRARY_ROW);
+
+        // A private placeholder (also id 0) never becomes library row 0.
+        let private = PlaybackTrack::private_placeholder();
+        assert_eq!(private.id, 0);
+        assert!(matches!(
+            TrackItem::from_playback_track(&private),
+            PlaybackItem::Private
+        ));
+
+        // Music is left to the client's music path.
+        let mut music = wire;
+        music.source = None;
+        assert!(matches!(
+            TrackItem::from_playback_track(&music),
+            PlaybackItem::Music
+        ));
+        music.source = Some(PlaybackSource::Music);
+        assert!(matches!(
+            TrackItem::from_playback_track(&music),
+            PlaybackItem::Music
+        ));
     }
 
     #[test]

@@ -66,12 +66,18 @@ The store is synchronous: methods take `&self` and lock one connection, so
 content ids, federation downloads) must check `TrackItem::is_podcast`; the
 music library never stores episodes.
 
-Key queue items, the current track and position matching by
-`TrackItem::key`, which returns a typed `TrackItemKey` (`lib:<id>`,
-`fed:<owner>:<item_id>` or `ep:<episode id>` as a string), not by
-`TrackItem::id`: a negative id only means "not a library row". Every podcast
-item has the same sentinel `id`, `release_id` and artist id
+`TrackItem::key` returns the typed source identity of a queue item
+(`TrackItemKey`: `lib:<id>`, `fed:<owner>:<item_id>` or `ep:<episode id>` as
+a string). A negative `TrackItem::id` only means "not a library row". Every
+podcast item has the same sentinel `id`, `release_id` and artist id
 (`TrackItem::NOT_A_LIBRARY_ROW` = -1). It carries no identity and must not
 be decoded; it only keeps music-only code that predates podcasts from taking
 an episode for library track, release or artist 0. The episode's identity is
-`TrackItem.podcast` alone.
+`TrackItem.podcast` alone, so queue, current-track and position matching
+must check it before any fallback to the id. `TrackItemKey` does not equate
+a pending federated item with its library copy; clients that match music by
+content id keep doing so.
+
+Convert received `PlaybackTrack`s with `TrackItem::from_playback_track`
+(`PlaybackItem::Music`, `PodcastEpisode` or `Private`): podcast items and
+Jam private placeholders carry id 0 on the wire, which must never be copied.

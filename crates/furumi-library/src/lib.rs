@@ -26,8 +26,8 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 pub use models::{
     ArtistCard, ArtistDetail, ArtistRef, ArtistsPage, Availability, FederatedTrack, LibraryFilters,
-    LibrarySourceMode, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail, ReleaseEdit,
-    SearchResults, TrackEdit, TrackItem, TrackItemKey,
+    LibrarySourceMode, PlaybackItem, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail,
+    ReleaseEdit, SearchResults, TrackEdit, TrackItem, TrackItemKey,
 };
 
 /// The virtual "Liked tracks" playlist id, kept from the server API.

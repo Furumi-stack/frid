@@ -53,11 +53,13 @@ converges independently of delivery order. Migrations follow
 `PRAGMA user_version`; the prototype podcast database is imported and its
 tables are kept as `legacy_*`; newer or foreign files are refused unchanged.
 `TrackItem.podcast` marks episode queue items, which music-only code must
-skip. Queue items are keyed by `TrackItem::key` (a typed `TrackItemKey`:
-library row, federated owner and item id, or episode id), never by the
-numeric id: episodes use the fixed sentinel id, `release_id` and artist id
--1, which carries no identity and only keeps code written for library
-tracks (`id >= 0`) away from them. See the "SQLite reference store" section
+skip. An episode queue item is identified by its episode id
+(`TrackItem::key`, a typed source identity: library row, federated owner and
+item id, or episode id), never by the numeric id: episodes use the fixed
+sentinel id, `release_id` and artist id -1, which carries no identity and
+only keeps code written for library tracks (`id >= 0`) away from them.
+Received playback items are converted with `TrackItem::from_playback_track`,
+which never copies the wire ids (0 for episodes and private placeholders). See the "SQLite reference store" section
 of [PODCASTS.md](PODCASTS.md).
 
 Filesystem scanning schedules, playback, federation lifecycle, and UI state

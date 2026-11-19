@@ -634,11 +634,24 @@ must keep the same invariants.
   decoded; it only keeps music-only code that predates podcasts
   (`id >= 0`, `release_id < 0` checks) from taking an episode for library
   track, release or artist 0. There is no reserved range of negative ids.
-* Clients key queue items, the current track and position matching by
-  `TrackItem::key` (a typed `TrackItemKey`; string form `lib:<id>`,
-  `fed:<owner>:<item_id>`, `ep:<episode id>`), and on the wire by
-  `PlaybackSource`, never by the numeric id. Keying by id (for example a
-  `local:{id}` string) would merge all episodes into one.
+* `TrackItem::key` (a typed `TrackItemKey`; string form `lib:<id>`,
+  `fed:<owner>:<item_id>`, `ep:<episode id>`) is the source identity of a
+  queue item; on the wire it is `PlaybackSource`. An episode is identified
+  by `TrackItem.podcast` / `ep:` only and must never be keyed by its numeric
+  id: keying by id (for example a `local:{id}` string) would merge all
+  episodes into one. `TrackItemKey` has no content-id equivalence (a pending
+  federated item and its imported library copy differ), so clients that
+  match music content-first keep doing that and add the podcast branch
+  before any fallback to the id.
+* Wire ids of podcast items and of Jam private placeholders are `0`
+  (`PlaybackTrack::podcast_episode`, `PlaybackTrack::private_placeholder`)
+  and must not be copied into a `TrackItem`.
+  `TrackItem::from_playback_track` classifies a received item as
+  `PlaybackItem::Music` (the client's music path), `PodcastEpisode` (built
+  with `TrackItem::podcast_episode`, sentinel ids) or `Private` (not
+  playable, no `TrackItem`). Besides the ids, `TrackItem::podcast_episode`
+  also differs from the wire form in `release_year` (publication year) and
+  `audio_format` (`None`; the MIME type stays in the reference).
 
 ## Versioning
 
