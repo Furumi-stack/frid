@@ -12,6 +12,7 @@ application
 furumi-library
     ├── local catalog, import, migrations
     ├── playlists, likes, history, similarity persistence
+    ├── podcast store (podcasts.sqlite3)
     │
 music-dht
     ├── Kademlia routing and iterative lookup
@@ -41,9 +42,23 @@ metadata import, artwork resolution, playlists, likes, listening history, and
 similarity index storage. Connections enable foreign keys, WAL, and a bounded
 busy timeout so independently running clients can safely share the database.
 
+Podcasts use a separate store, `furumi_library::podcasts::PodcastStore`, in
+its own `podcasts.sqlite3` file next to the library database. It implements
+the podcast contract of `music_dht::podcast` for SQLite clients: the episode
+catalog refreshed from RSS, the subscription, share and progress registers,
+grow-only listening sessions, feed aliases and local-only fetch state.
+Local actions, received operations and snapshot sections share one apply
+path built on the `music-dht` materializers and merge functions, so the store
+converges independently of delivery order. Migrations follow
+`PRAGMA user_version`; the prototype podcast database is imported and its
+tables are kept as `legacy_*`; newer or foreign files are refused unchanged.
+`TrackItem.podcast` marks episode queue items, which music-only code must
+skip. See the "SQLite reference store" section of [PODCASTS.md](PODCASTS.md).
+
 Filesystem scanning schedules, playback, federation lifecycle, and UI state
 remain application responsibilities. Database and metadata work must stay off
-interactive and async reactor threads.
+interactive and async reactor threads. RSS fetching and refresh scheduling are
+application work as well.
 
 ## Transport: federation-net
 

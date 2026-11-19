@@ -18,6 +18,20 @@
   Jam redaction. New struct fields and enum variants break exhaustive
   construction and matching in clients.
 - `furumi-library 0.3.0`: follows `music-dht 0.6.0`, whose types it re-exposes.
+- `furumi-library 0.3.0`: new `furumi_library::podcasts::PodcastStore`, the
+  SQLite reference store of the podcast contract in its own
+  `podcasts.sqlite3`: `user_version` migrations that import the prototype
+  podcast database (tables kept as `legacy_*`, unimportable rows in
+  `legacy_quarantine`) and refuse newer or foreign files unchanged; podcasts,
+  feed aliases, seasons, episodes, subscription/share/progress registers,
+  listening sessions and local-only fetch state; local actions that return
+  the `podcast_*` operations for the client's sync log; `apply_remote_op`,
+  bounded snapshot export and merge; RSS refresh ingestion with stable
+  episode ids; UI queries. Enables the `music-dht` `podcast-feed` feature.
+- `furumi-library 0.3.0` (breaking): `TrackItem.podcast:
+  Option<PodcastEpisodeRef>` and `TrackItem::podcast_episode`/`is_podcast`.
+  Exhaustive `TrackItem` literals in clients need the new field; music-only
+  code must skip podcast items. The library database is unchanged.
 - See `PODCASTS.md` for the normative contract.
 
 ## v0.4.1 — 2026-09-02

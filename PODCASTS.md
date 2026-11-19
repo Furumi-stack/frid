@@ -19,7 +19,7 @@ of this version of the contract; it will be specified with the overlay.
 | --- | --- |
 | `music_dht::podcast` | ids, URL canonicalization, no-GUID rule, metadata DTOs and bounds, merge functions, RSS/Atom parser (feature `podcast-feed`) |
 | `music_dht::device_sync` | sync operation kinds, snapshot sections, `PlaybackSource`, version gating, Jam redaction |
-| Client storage (`furumi-library`, web PostgreSQL) | persistence and migrations implementing the rules below |
+| Client storage (`furumi_library::podcasts::PodcastStore`, web PostgreSQL) | persistence and migrations implementing the rules below (SQLite reference: see "SQLite reference store") |
 | Client runtime | HTTP fetching, conditional requests, scheduling, audio buffering and decoding, UI |
 
 Audio is always fetched from the publisher. It is never imported into the
@@ -510,6 +510,101 @@ extracts `itunes:season`, `itunes:episode`, `itunes:episodeType`,
 `resolve_episode_ids`; those hints are normative (see the no-GUID rule).
 Links are kept verbatim (trimmed only) because they are identity material.
 Text cleanup is linear in the input size. It performs no I/O.
+
+## SQLite reference store
+
+`furumi_library::podcasts::PodcastStore` (`furumi-library` 0.3) implements
+this contract for SQLite clients. Other stores (the web client's PostgreSQL)
+must keep the same invariants.
+
+### File and migrations
+
+* Own file, conventionally `podcasts.sqlite3` next to `library.db`; the caller
+  passes the path. WAL, foreign keys, 5 s busy timeout.
+* `PRAGMA user_version` drives migrations. Each runs in a `BEGIN IMMEDIATE`
+  transaction that re-reads the version, so concurrent openers and
+  interrupted upgrades are safe and reopening is idempotent.
+
+| Version | Content |
+| --- | --- |
+| 0 | empty file |
+| 1 | prototype schema of the original podcast PR (`podcasts`, `podcast_episodes`), verbatim |
+| 2 | the model below; the prototype tables are renamed and imported |
+
+* Before writing anything (including the WAL switch), the store refuses a
+  file with a `user_version` above its own, and a file whose tables are not
+  the expected ones for its version (for example `library.db` passed by
+  mistake). The file is left byte-for-byte unchanged.
+* Prototype import (migration 2). Tables are renamed `legacy_podcasts` and
+  `legacy_podcast_episodes`, never dropped.
+  * Each feed becomes a podcast with `podcast_id` from the canonical feed URL
+    (`FeedUrl::parse`, then `FeedUrl::from_user_input`) and a subscription
+    register `subscribed = true`, generation 0, `hlc_ms` = `added_at`,
+    `op_id` = `legacy-import:<podcast_id>`, not shared. Every contract write
+    orders after it; other devices learn it through the snapshot sections.
+    Rows with the same canonical URL merge (first row wins).
+  * URLs that cannot be canonicalized, episodes with a non-`http(s)` audio URL,
+    invalid metadata or no identity are listed in `legacy_quarantine`; the
+    rows stay in the `legacy_*` tables.
+  * Episode ids come from `resolve_episode_ids` over the stored items. The
+    prototype stored the enclosure URL as `guid` when an item had none: such
+    rows are imported as GUID-less items and keep the value in
+    `episodes.legacy_guid`. When a later refresh shows that value as a real
+    GUID, the episode is re-keyed to its GUID id if it has no progress and no
+    session (otherwise the GUID item becomes a new episode).
+  * ETag, Last-Modified, check time, last error and the cover cache move to the
+    fetch state. The prototype stores no progress or history, so none is
+    created.
+
+### Tables (version 2)
+
+| Table | Key | Content | Synced |
+| --- | --- | --- | --- |
+| `podcasts` | `podcast_id` | local channel metadata, `feed_url` = URL this device fetches, `meta_from_feed` | catalog, no |
+| `podcast_feed_aliases` | `(podcast_id, feed_url)` | bounded grow-only alias set (`merge_feed_aliases`) | yes, inside subscription records and `podcast_feed_aliases_added` |
+| `episodes` | `episode_id` | `EpisodeMeta` columns (season, number, type, published, duration, audio URL, MIME, length, artwork, link), `source` (`feed`/`sync`), `in_feed`, `legacy_guid` | catalog, no |
+| `podcast_seasons` | `(podcast_id, season)` | derived from `episodes`: episode count, first/last publication; `season` NULL groups episodes without a season | no |
+| `podcast_subscriptions` | `podcast_id` | subscription register: `subscribed`, `PodcastMeta` JSON, `generation`, `hlc_ms`, `op_id` | yes |
+| `podcast_shares` | `podcast_id` | share register | yes |
+| `episode_progress` | `episode_id` | progress register (`ProgressRecord`) | yes |
+| `podcast_listen_sessions` | `session_id` | grow-only set of `ListenSession` | yes |
+| `podcast_fetch_state` | `podcast_id` | ETag, Last-Modified, checked / last success / next check times, last error, consecutive failures, cover cache | **never** |
+| `legacy_quarantine` | `(legacy_table, legacy_id)` | prototype rows that could not be imported | no |
+
+### Invariants
+
+* Registers and sessions have no foreign keys to the catalog: operations for
+  podcasts or episodes the device has not fetched are stored as they arrive,
+  in any order. An operation's `PodcastEpisodeRef` adds a `source = 'sync'`
+  catalog row only when the episode is unknown; feed metadata always wins.
+* One apply path. Local actions validate the payload, draw a stamp from the
+  client's sync log, build the `SyncOpWire`, and apply it like a received
+  operation: `SyncOpWire::podcast_*` materializers, then `merge_*`. The
+  returned operation must be appended with exactly that stamp. Snapshot
+  records go through the same functions after validation. The result is
+  therefore commutative, associative and idempotent, and a snapshot never
+  replaces newer local state.
+* Invalid operations (`validate_podcast`, a generation above `i64::MAX`, a
+  session whose identity differs from the stored one) are skipped and
+  reported as rejected, so the client can still acknowledge them.
+* Only `subscribe`/`unsubscribe` write the subscription register and only
+  `set_shared`/`unsubscribe` the share register, with
+  `next_podcast_generation`. No-op actions draw no stamp and emit nothing.
+  `unsubscribe` emits `subscribed = false` and `shared = false` and keeps
+  progress, sessions and the catalog.
+* Explicit progress actions use `explicit_generation(max(local, carried))`;
+  checkpoints keep the session generation and are refused (`Superseded`)
+  once the register holds a greater one, or after the session completed.
+* RSS refreshes update the catalog (channel metadata, episode metadata and
+  audio URLs, `in_feed`) and the alias set only; episodes missing from the
+  feed are kept. Permanent redirects and `itunes:new-feed-url` become the
+  fetch URL and aliases, and emit `podcast_feed_aliases_added` only when the
+  stored alias set changes.
+* Snapshot export reads each section newest first up to its count, then
+  applies `bound_podcast_state_to(budget)`. Fetch state and the catalog
+  (descriptions, episodes) are never exported.
+* Feed URLs resolve through `resolve_podcast_id` over the alias set, the
+  catalog fetch URL and the register's `podcast.feed_url`.
 
 ## Versioning
 
