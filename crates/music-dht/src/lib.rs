@@ -92,6 +92,7 @@ pub mod jam;
 mod message;
 mod node;
 mod normalization;
+pub mod podcast;
 mod record;
 mod request;
 mod routing;
