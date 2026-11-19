@@ -35,6 +35,8 @@ pub const CATALOG_ID: &str = "catalog";
 pub const SIMILARITY_ID: &str = "similarity";
 /// Stable protocol identifier for DHT-routed similarity discovery.
 pub const SIMILARITY_DHT_ID: &str = "similarity_dht";
+/// Stable protocol identifier for the public podcast-discovery overlay.
+pub const PODCAST_DHT_ID: &str = "podcast_dht";
 /// Stable protocol identifier for personal-device synchronization.
 pub const DEVICE_SYNC_ID: &str = "device_sync";
 /// Stable protocol identifier for Jam playback control.
@@ -80,6 +82,10 @@ impl CapabilityManifest {
             crate::similarity_lsh::SIMILARITY_DHT_PROTOCOL_VERSION,
         );
         protocols.insert(
+            PODCAST_DHT_ID.to_string(),
+            crate::podcast_dht::PODCAST_DHT_PROTOCOL_VERSION,
+        );
+        protocols.insert(
             DEVICE_SYNC_ID.to_string(),
             crate::device_sync::DEVICE_SYNC_PROTOCOL_VERSION,
         );
@@ -103,6 +109,18 @@ impl CapabilityManifest {
     pub fn without_protocol(mut self, id: &str) -> Self {
         self.protocols.remove(id);
         self
+    }
+
+    /// Version of protocol `id` advertised by the peer, if any.
+    pub fn protocol_version(&self, id: &str) -> Option<u16> {
+        self.protocols.get(id).copied()
+    }
+
+    /// Whether the peer advertises the public podcast-discovery overlay at
+    /// the version this crate speaks. Peers without it are never queried.
+    pub fn supports_podcast_dht(&self) -> bool {
+        self.protocol_version(PODCAST_DHT_ID)
+            == Some(crate::podcast_dht::PODCAST_DHT_PROTOCOL_VERSION)
     }
 
     /// Validates bounds and identifiers received from a peer.
@@ -219,12 +237,27 @@ mod tests {
             CATALOG_ID,
             SIMILARITY_ID,
             SIMILARITY_DHT_ID,
+            PODCAST_DHT_ID,
             DEVICE_SYNC_ID,
             JAM_ID,
         ] {
             assert!(manifest.protocols.contains_key(id), "missing {id}");
         }
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn podcast_dht_capability_is_advertised_and_removable() {
+        let manifest = CapabilityManifest::frid("furumi", "1.2.3");
+        assert_eq!(
+            manifest.protocol_version(PODCAST_DHT_ID),
+            Some(crate::podcast_dht::PODCAST_DHT_PROTOCOL_VERSION)
+        );
+        assert!(manifest.supports_podcast_dht());
+        let without = manifest.clone().without_protocol(PODCAST_DHT_ID);
+        assert!(!without.supports_podcast_dht());
+        let other_version = manifest.with_protocol(PODCAST_DHT_ID, 2);
+        assert!(!other_version.supports_podcast_dht());
     }
 
     #[test]
