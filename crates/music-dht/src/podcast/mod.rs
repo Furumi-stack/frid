@@ -46,6 +46,12 @@
 //! playback queues and progress operations. A receiving device can show and
 //! play the episode without being subscribed to the podcast.
 //!
+//! # Feed parser
+//!
+//! With the `podcast-feed` cargo feature, `feed` provides the shared tolerant
+//! RSS 2.0 / RSS 1.0 / Atom parser that produces the identity hints consumed
+//! by [`resolve_episode_ids`].
+//!
 //! ```
 //! use music_dht::podcast::{EpisodeId, FeedUrl, PodcastId};
 //!
@@ -62,6 +68,9 @@ mod id;
 mod identity;
 mod meta;
 mod state;
+
+#[cfg(feature = "podcast-feed")]
+pub mod feed;
 
 pub use feed_url::{FeedUrl, merge_feed_aliases, resolve_podcast_id};
 pub use id::{

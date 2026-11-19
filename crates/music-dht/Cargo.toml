@@ -26,6 +26,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 data-encoding = { workspace = true }
+quick-xml = { workspace = true, optional = true }
+encoding_rs = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[features]
+# RSS 2.0 / RSS 1.0 / Atom podcast feed parser (`music_dht::podcast::feed`).
+podcast-feed = ["dep:quick-xml", "dep:encoding_rs", "dep:url"]
 
 [dev-dependencies]
 anyhow = { workspace = true }
