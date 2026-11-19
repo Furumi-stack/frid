@@ -121,7 +121,9 @@ fn has_personal_state(conn: &Connection, episode_id: &EpisodeId) -> Result<bool>
 /// enclosure URL (`legacy_guid`) when the feed shows it is a real GUID.
 ///
 /// Only episodes without progress or sessions move, so no personal state is
-/// touched; otherwise the GUID item becomes a separate episode.
+/// touched; otherwise the GUID item becomes a separate episode. When another
+/// episode already holds the GUID id (for example one a remote operation
+/// created), the imported episode is a duplicate of it and is deleted.
 fn rekey_legacy_guids(conn: &Connection, podcast_id: &PodcastId, feed: &ParsedFeed) -> Result<()> {
     for item in &feed.episodes {
         let Some(guid) = item.guid.as_deref() else {
@@ -138,9 +140,6 @@ fn rekey_legacy_guids(conn: &Connection, podcast_id: &PodcastId, feed: &ParsedFe
             )
             .optional()?
             .is_some();
-        if taken {
-            continue;
-        }
         let legacy: Option<String> = conn
             .query_row(
                 "SELECT episode_id FROM episodes
@@ -153,7 +152,14 @@ fn rekey_legacy_guids(conn: &Connection, podcast_id: &PodcastId, feed: &ParsedFe
             continue;
         };
         let legacy = super::episode_id_col(legacy)?;
-        if has_personal_state(conn, &legacy)? {
+        if legacy == guid_id || has_personal_state(conn, &legacy)? {
+            continue;
+        }
+        if taken {
+            conn.execute(
+                "DELETE FROM episodes WHERE episode_id = ?1",
+                [legacy.as_str()],
+            )?;
             continue;
         }
         conn.execute(
@@ -199,9 +205,11 @@ fn provisional_episode_ids(
 /// * Each provisional episode is matched to the item it was imported from
 ///   with the same rule (enclosure, then link, then date and title; GUIDs
 ///   ignored, since the prototype may have stored the enclosure URL as GUID)
-///   and re-keyed to that item's id unless another stored episode already
-///   holds it. Unmatched provisional episodes stay as they are (not in the
-///   feed); the next refresh that lists them re-keys them.
+///   and re-keyed to that item's id. When another stored episode that stays
+///   already holds that id, it is the item's episode and the provisional one
+///   is a duplicate: it is deleted. Unmatched provisional episodes stay as
+///   they are (not in the feed); the next refresh that lists them re-keys
+///   them.
 ///
 /// Provisional episodes have no progress and no session, so no personal
 /// state moves. The refresh then clears `legacy_guid` on every episode it
@@ -244,12 +252,18 @@ fn resolve_and_rekey_provisional(
             (matched != target).then_some((matched, target))
         })
         .collect();
-    // A target held by an episode that does not move away blocks the move.
-    let occupied: BTreeSet<EpisodeId> = stable_known
+    // A target held by an episode that stays (for example a row a remote
+    // operation created before this first refresh) is the item's episode
+    // already: the provisional episode is a duplicate of it. It has no
+    // progress and no session, and its metadata would be overwritten by the
+    // item anyway, so it is removed instead of kept as a second copy. A
+    // removed duplicate frees its own id for other moves.
+    let mut occupied: BTreeSet<EpisodeId> = stable_known
         .iter()
         .chain(&provisional_known)
         .map(|episode| episode.episode_id.clone())
         .collect();
+    let mut duplicates: Vec<EpisodeId> = Vec::new();
     loop {
         let leaving: BTreeSet<&EpisodeId> = moves.iter().map(|(from, _)| from).collect();
         let blocked: BTreeSet<EpisodeId> = moves
@@ -261,6 +275,22 @@ fn resolve_and_rekey_provisional(
             break;
         }
         moves.retain(|(from, _)| !blocked.contains(from));
+        for from in blocked {
+            occupied.remove(&from);
+            duplicates.push(from);
+        }
+    }
+    for duplicate in &duplicates {
+        // Guarded again: only a provisional episode without personal state.
+        conn.execute(
+            "DELETE FROM episodes
+              WHERE episode_id = ?1 AND legacy_guid IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM episode_progress p
+                                 WHERE p.episode_id = episodes.episode_id)
+                AND NOT EXISTS (SELECT 1 FROM podcast_listen_sessions s
+                                 WHERE s.episode_id = episodes.episode_id)",
+            [duplicate.as_str()],
+        )?;
     }
     // Two phases, so a move may take an id another move vacates.
     for (index, (from, _)) in moves.iter().enumerate() {

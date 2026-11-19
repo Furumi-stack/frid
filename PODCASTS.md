@@ -560,12 +560,16 @@ must keep the same invariants.
     item ids are resolved against the stored episodes except provisional
     ones without progress or sessions; each such provisional episode is
     matched to its item (enclosure, then link, then date and title, GUIDs
-    ignored) and re-keyed to that item's id unless another episode holds
-    it. The same applies when `legacy_guid` turns out to be the item's real
-    GUID. Listing an episode clears `legacy_guid`, which makes its id final.
-    Provisional episodes carry no personal state, so nothing personal moves;
-    an imported episode played before its first refresh keeps its id (the
-    feed item then becomes a separate episode if the ids differ).
+    ignored) and re-keyed to that item's id. When another episode that
+    stays already holds that id (for example one a remote operation created
+    before this device's first refresh), it is the item's episode and the
+    provisional one is a duplicate: it is deleted rather than kept as a
+    second copy. The same applies when `legacy_guid` turns out to be the
+    item's real GUID. Listing an episode clears `legacy_guid`, which makes
+    its id final. Provisional episodes carry no personal state, so nothing
+    personal moves or is lost; an imported episode played before its first
+    refresh is not provisional and keeps its id (the feed item then becomes
+    a separate episode if the ids differ).
   * ETag, Last-Modified, check time, last error and the cover cache move to the
     fetch state. The prototype stores no progress or history, so none is
     created.

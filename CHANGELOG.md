@@ -41,7 +41,10 @@
 - `furumi-library 0.3.0`: prototype import collapses rows of one GUID-less
   item under several enclosure URLs, and the first refresh re-keys imported
   GUID-less episodes without personal state to the ids the current feed
-  gives, so they match devices that never had the prototype. Fetch-state
+  gives, so they match devices that never had the prototype; when another
+  episode (for example one created by a remote operation) already holds
+  that id, the imported copy is deleted instead of kept as a duplicate.
+  Fetch-state
   writes are atomic across threads and processes.
 - See `PODCASTS.md` for the normative contract.
 
