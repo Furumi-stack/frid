@@ -31,11 +31,13 @@
 - `furumi-library 0.3.0` (breaking): `TrackItem.podcast:
   Option<PodcastEpisodeRef>` and `TrackItem::podcast_episode`/`is_podcast`.
   Exhaustive `TrackItem` literals in clients need the new field; music-only
-  code must skip podcast items. Podcast items use a negative per-episode id
-  (`TrackItem::podcast_track_id`, at most `PODCAST_TRACK_ID_MAX`) and
-  `release_id`/artist id -1, so existing `id < 0` / `release_id < 0` checks
-  already treat them as non-library items. The library database is
-  unchanged.
+  code must skip podcast items. Podcast items use the fixed sentinel
+  `TrackItem::NOT_A_LIBRARY_ROW` (-1) as `id`, `release_id` and artist id,
+  so existing `id < 0` / `release_id < 0` checks already treat them as
+  non-library items; the sentinel carries no identity. New
+  `TrackItem::key` / `TrackItemKey` (`lib:<id>`, `fed:<owner>:<item_id>`,
+  `ep:<episode id>`): clients must key queue items by it, not by `id`. The
+  library database is unchanged.
 - `furumi-library 0.3.0`: prototype import collapses rows of one GUID-less
   item under several enclosure URLs, and the first refresh re-keys imported
   GUID-less episodes without personal state to the ids the current feed

@@ -622,11 +622,19 @@ must keep the same invariants.
 * Fetch-state writes (`record_fetch_*`, `set_cover_cache`) read and write
   the row in one immediate transaction, so concurrent writers on one or
   several connections never lose a column or a failure increment.
-* `TrackItem::podcast_episode` builds queue items with a negative,
-  per-episode `id` (`TrackItem::podcast_track_id`, at most
-  `PODCAST_TRACK_ID_MAX`, below the ids of pending federated tracks) and
-  `release_id` / artist id -1, so code written for library tracks
-  (`id >= 0`) skips them even before it checks `is_podcast()`.
+* `TrackItem::podcast_episode` builds queue items whose identity is the
+  explicit source `TrackItem.podcast` alone. Their `id`, `release_id` and
+  artist id are the fixed sentinel `TrackItem::NOT_A_LIBRARY_ROW` (-1),
+  shared by every episode, the same "not a library row" convention as
+  pending federated tracks. The sentinel carries no identity and is never
+  decoded; it only keeps music-only code that predates podcasts
+  (`id >= 0`, `release_id < 0` checks) from taking an episode for library
+  track, release or artist 0. There is no reserved range of negative ids.
+* Clients key queue items, the current track and position matching by
+  `TrackItem::key` (a typed `TrackItemKey`; string form `lib:<id>`,
+  `fed:<owner>:<item_id>`, `ep:<episode id>`), and on the wire by
+  `PlaybackSource`, never by the numeric id. Keying by id (for example a
+  `local:{id}` string) would merge all episodes into one.
 
 ## Versioning
 

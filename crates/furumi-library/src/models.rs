@@ -124,14 +124,34 @@ pub struct ArtistRef {
 /// A playable queue item: a library track, a pending federated track or a
 /// podcast episode.
 ///
-/// Library tracks have `id >= 0`. Items that are not library rows use
-/// negative ids, so code that only handles library tracks can keep skipping
-/// `id < 0` (and `release_id < 0`, artist `id < 0`):
+/// # Identity
 ///
-/// * pending federated tracks count down from -1;
-/// * podcast episodes ([`TrackItem::podcast_episode`]) use
-///   [`TrackItem::podcast_track_id`], a per-episode id below
-///   [`PODCAST_TRACK_ID_MAX`], with `release_id` and artist ids -1.
+/// What an item *is* comes from its explicit source fields, never from the
+/// numeric `id` alone; [`TrackItem::key`] returns it as a typed
+/// [`TrackItemKey`]:
+///
+/// * a library track is a library row: `id >= 0`, `fed` and `podcast` are
+///   `None`;
+/// * a federated track is identified by [`TrackItem::fed`] (owner and item
+///   id). While it is not in the library its `id` is a negative,
+///   process-local counter value (pending federated tracks count down from
+///   -1) and `release_id` / artist ids are -1;
+/// * a podcast episode is identified **only** by [`TrackItem::podcast`] (its
+///   [`EpisodeId`]). Its `id`, `release_id` and artist id are the fixed
+///   sentinel [`TrackItem::NOT_A_LIBRARY_ROW`] (-1), shared by every episode.
+///
+/// A negative `id` therefore means "not a library row" and nothing else: it
+/// carries no identity and must never be decoded, compared across items or
+/// used as a key. Clients key queue items, current-track and position
+/// matching by [`TrackItem::key`] (or, on the wire, by
+/// `music_dht::device_sync::PlaybackSource`), not by `id`. The -1 sentinel
+/// only keeps music-only code that predates podcasts (`id >= 0` /
+/// `release_id < 0` checks) from treating an episode as library track,
+/// release or artist 0; code that keys items by `id` (for example a
+/// `local:{id}` string) would still merge all episodes and must switch to
+/// [`TrackItem::key`].
+///
+/// # Podcast episodes
 ///
 /// Podcast episodes carry their [`PodcastEpisodeRef`] in
 /// [`TrackItem::podcast`]: `file_path` is empty, `content_id`, `fed` and
@@ -143,10 +163,8 @@ pub struct ArtistRef {
 /// **Music-only code paths must check [`TrackItem::is_podcast`]** (or
 /// `podcast.is_none()`) before treating an item as music: likes, playlists,
 /// listening history, content-id lookups, federation downloads, similarity
-/// and file operations do not apply to episodes. The negative ids are a
-/// fail-safe for code that predates podcasts, not a replacement for that
-/// check. Library queries never return podcast items; the library database
-/// stores none.
+/// and file operations do not apply to episodes. Library queries never
+/// return podcast items; the library database stores none.
 #[derive(Debug, Clone)]
 pub struct TrackItem {
     pub id: i64,
@@ -180,24 +198,81 @@ pub struct TrackItem {
     pub podcast: Option<PodcastEpisodeRef>,
 }
 
-/// Every [`TrackItem::podcast_track_id`] is at most this value
-/// (`i64::MIN + 2^62 - 1`), far below the ids of pending federated tracks,
-/// which count down from -1.
-pub const PODCAST_TRACK_ID_MAX: i64 = i64::MIN + (1 << 62) - 1;
+/// Typed identity of a [`TrackItem`], from [`TrackItem::key`].
+///
+/// Use it (or its string form) to key queue items, the current track and
+/// position matching instead of [`TrackItem::id`], which identifies library
+/// rows only. Two items with equal keys are the same track or episode; the
+/// same track may still appear more than once in a queue.
+///
+/// The [`Display`](std::fmt::Display) form is stable and suitable as a map
+/// key or in logs:
+///
+/// | Variant | String form |
+/// | --- | --- |
+/// | `Library(123)` | `lib:123` |
+/// | `Federated { owner, item_id }` | `fed:<owner>:<item_id>` |
+/// | `PodcastEpisode(id)` | `ep:<episode id>`, e.g. `ep:ep1:...` |
+/// | `Transient(-5)` | `tmp:-5` |
+///
+/// `owner` is a peer endpoint id and contains no `:`, so the federated form
+/// is unambiguous. Keys are not persisted by this crate; a `Transient` key is
+/// only meaningful inside the process that built the item.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TrackItemKey {
+    /// A row of the local music library (`TrackItem::id >= 0`).
+    Library(i64),
+    /// A federated track that is not a library row, identified by its owner
+    /// peer and DHT item id ([`FederatedTrack::owner`] /
+    /// [`FederatedTrack::item_id`]), not by its process-local negative `id`.
+    Federated { owner: String, item_id: String },
+    /// A podcast episode, identified by its [`EpisodeId`] only.
+    PodcastEpisode(EpisodeId),
+    /// A non-library item with no explicit source (negative `id`, no `fed`,
+    /// no `podcast`). furumi-library never builds one; clients that do must
+    /// keep its `id` unique within the process.
+    Transient(i64),
+}
+
+impl std::fmt::Display for TrackItemKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Library(id) => write!(f, "lib:{id}"),
+            Self::Federated { owner, item_id } => write!(f, "fed:{owner}:{item_id}"),
+            Self::PodcastEpisode(episode_id) => write!(f, "ep:{}", episode_id.as_str()),
+            Self::Transient(id) => write!(f, "tmp:{id}"),
+        }
+    }
+}
 
 impl TrackItem {
-    /// The negative `TrackItem::id` of a podcast episode.
+    /// The `id`, `release_id` and artist id of items that are not library
+    /// rows and have no numeric identity: every podcast episode uses it.
     ///
-    /// Derived from the episode id (the low 62 bits of the first 8 bytes of
-    /// its digest), so the same episode always gets the same id and different
-    /// episodes practically never share one. Always `<=`
-    /// [`PODCAST_TRACK_ID_MAX`]; never persisted.
-    pub fn podcast_track_id(episode_id: &EpisodeId) -> i64 {
-        let digest = episode_id.digest();
-        let mut head = [0u8; 8];
-        head.copy_from_slice(&digest[..8]);
-        let low = u64::from_be_bytes(head) & ((1u64 << 62) - 1);
-        i64::MIN + low as i64
+    /// It is a sentinel, not an identifier: it is shared by all episodes
+    /// (and can coincide with the first pending federated track's id), so it
+    /// must never be decoded or used as a key. See [`TrackItem::key`].
+    pub const NOT_A_LIBRARY_ROW: i64 = -1;
+
+    /// The typed identity of this item; see [`TrackItemKey`].
+    ///
+    /// Precedence: [`TrackItem::podcast`] makes it a podcast episode; else a
+    /// non-negative `id` is a library row; else [`TrackItem::fed`] makes it
+    /// a federated track; anything else is [`TrackItemKey::Transient`].
+    pub fn key(&self) -> TrackItemKey {
+        if let Some(episode) = &self.podcast {
+            return TrackItemKey::PodcastEpisode(episode.episode_id.clone());
+        }
+        if self.id >= 0 {
+            return TrackItemKey::Library(self.id);
+        }
+        match &self.fed {
+            Some(fed) => TrackItemKey::Federated {
+                owner: fed.owner.clone(),
+                item_id: fed.item_id.clone(),
+            },
+            None => TrackItemKey::Transient(self.id),
+        }
     }
 
     /// Queue item for a podcast episode streamed from the publisher.
@@ -206,11 +281,14 @@ impl TrackItem {
     /// `music_dht::device_sync` (the episode title, the podcast title as
     /// artist and release, the announced duration; no track or disc number)
     /// and add the publication year. Season and episode number stay in the
-    /// reference. `id` is [`TrackItem::podcast_track_id`]; `release_id` and
-    /// the artist id are -1, like pending federated tracks.
+    /// reference.
+    ///
+    /// `id`, `release_id` and the artist id are the sentinel
+    /// [`TrackItem::NOT_A_LIBRARY_ROW`] for every episode: the item's identity
+    /// is [`TrackItem::podcast`] alone ([`TrackItem::key`]).
     pub fn podcast_episode(episode: PodcastEpisodeRef) -> Self {
         Self {
-            id: Self::podcast_track_id(&episode.episode_id),
+            id: Self::NOT_A_LIBRARY_ROW,
             title: episode.episode_title.clone(),
             track_number: None,
             disc_number: None,
@@ -218,11 +296,11 @@ impl TrackItem {
                 .duration_ms
                 .map_or(0.0, |ms| ms.max(0) as f64 / 1_000.0),
             artists: vec![ArtistRef {
-                id: -1,
+                id: Self::NOT_A_LIBRARY_ROW,
                 name: episode.podcast_title.clone(),
             }],
             featured_artists: Vec::new(),
-            release_id: -1,
+            release_id: Self::NOT_A_LIBRARY_ROW,
             release_title: episode.podcast_title.clone(),
             release_year: episode.published_at_ms.map(year_of_unix_ms),
             file_path: String::new(),
@@ -469,13 +547,12 @@ mod tests {
         assert_eq!(year_of_unix_ms(1_735_689_600_000), 2025);
     }
 
-    #[test]
-    fn podcast_track_mirrors_the_episode_reference() {
+    fn episode_ref(guid: &str) -> PodcastEpisodeRef {
         use music_dht::podcast::{FeedUrl, PodcastId};
         let feed_url = FeedUrl::parse("https://example.test/feed.xml").unwrap();
         let podcast_id = PodcastId::from_feed_url(&feed_url);
-        let episode = PodcastEpisodeRef {
-            episode_id: EpisodeId::from_guid(&podcast_id, "e1").unwrap(),
+        PodcastEpisodeRef {
+            episode_id: EpisodeId::from_guid(&podcast_id, guid).unwrap(),
             podcast_id,
             feed_url,
             podcast_title: "Show".into(),
@@ -488,21 +565,65 @@ mod tests {
             episode_number: Some(7),
             image_url: None,
             progress_generation: None,
-        };
+        }
+    }
+
+    fn library_track(id: i64) -> TrackItem {
+        TrackItem {
+            id,
+            title: "Track".into(),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: 1.0,
+            artists: vec![artist("Main")],
+            featured_artists: Vec::new(),
+            release_id: 1,
+            release_title: "Release".into(),
+            release_year: None,
+            file_path: "/tmp/track.mp3".into(),
+            content_id: None,
+            cover_path: None,
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
+            podcast: None,
+        }
+    }
+
+    fn federated(owner: &str, item_id: &str) -> FederatedTrack {
+        FederatedTrack {
+            item_id: item_id.into(),
+            owner: owner.into(),
+            own: false,
+            title: "Remote".into(),
+            artist_names: vec!["Someone".into()],
+            featured_artist_names: Vec::new(),
+            year: None,
+            duration_seconds: None,
+            content_id: None,
+            release_title: None,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    #[test]
+    fn podcast_track_mirrors_the_episode_reference() {
+        let episode = episode_ref("e1");
         let track = TrackItem::podcast_episode(episode.clone());
         assert!(track.is_podcast());
         assert_eq!(track.podcast_episode_ref(), Some(&episode));
-        // Fail-safe ids: never a library row, release or artist, stable per
-        // episode, distinct between episodes and below pending federated ids.
-        assert!(track.id <= PODCAST_TRACK_ID_MAX);
-        const { assert!(PODCAST_TRACK_ID_MAX < -(1 << 61)) };
-        assert_eq!(track.id, TrackItem::podcast_track_id(&episode.episode_id));
-        assert_eq!(TrackItem::podcast_episode(episode.clone()).id, track.id);
+        // The sentinel marks "not a library row, release or artist" and
+        // carries no identity.
+        assert_eq!(TrackItem::NOT_A_LIBRARY_ROW, -1);
+        assert_eq!(track.id, -1);
         assert_eq!(track.release_id, -1);
         assert!(track.artists.iter().all(|artist| artist.id == -1));
-        let other = EpisodeId::from_guid(&episode.podcast_id, "e2").unwrap();
-        assert_ne!(TrackItem::podcast_track_id(&other), track.id);
-        assert!(TrackItem::podcast_track_id(&other) <= PODCAST_TRACK_ID_MAX);
+        assert!(track.featured_artists.is_empty());
         assert!(track.file_path.is_empty());
         assert!(track.content_id.is_none() && track.fed.is_none());
         assert!(!track.is_fed_pending());
@@ -511,5 +632,76 @@ mod tests {
         assert_eq!(track.release_title, "Show");
         assert_eq!(track.release_year, Some(2024));
         assert_eq!(track.duration_label(), "1:31");
+    }
+
+    #[test]
+    fn key_is_typed_by_source() {
+        let library = library_track(123);
+        assert_eq!(library.key(), TrackItemKey::Library(123));
+        assert_eq!(library.key().to_string(), "lib:123");
+        assert_eq!(library_track(0).key(), TrackItemKey::Library(0));
+
+        let mut pending = library_track(-5);
+        pending.release_id = -1;
+        pending.file_path.clear();
+        pending.fed = Some(federated("peer1", "item-9"));
+        let fed_key = TrackItemKey::Federated {
+            owner: "peer1".into(),
+            item_id: "item-9".into(),
+        };
+        assert_eq!(pending.key(), fed_key);
+        assert_eq!(pending.key().to_string(), "fed:peer1:item-9");
+        // The process-local negative id is not part of a federated identity.
+        let mut renumbered = pending.clone();
+        renumbered.id = -6;
+        assert_eq!(renumbered.key(), pending.key());
+
+        let episode = episode_ref("e1");
+        let track = TrackItem::podcast_episode(episode.clone());
+        let ep_key = TrackItemKey::PodcastEpisode(episode.episode_id.clone());
+        assert_eq!(track.key(), ep_key);
+        assert_eq!(
+            track.key().to_string(),
+            format!("ep:{}", episode.episode_id.as_str())
+        );
+        assert!(track.key().to_string().starts_with("ep:ep1:"));
+
+        let transient = library_track(-7);
+        assert_eq!(transient.key(), TrackItemKey::Transient(-7));
+        assert_eq!(transient.key().to_string(), "tmp:-7");
+
+        // The source wins over the numeric id: a podcast item is never keyed
+        // as a library row, a federated item never by its counter value.
+        let mut odd = TrackItem::podcast_episode(episode);
+        odd.id = 42;
+        assert_eq!(odd.key(), ep_key);
+        let mut pending_minus_one = pending.clone();
+        pending_minus_one.id = TrackItem::NOT_A_LIBRARY_ROW;
+        assert_eq!(pending_minus_one.key(), fed_key);
+        assert_ne!(pending_minus_one.key(), track.key());
+    }
+
+    #[test]
+    fn episodes_share_the_sentinel_id_but_not_the_key() {
+        let first = TrackItem::podcast_episode(episode_ref("e1"));
+        let second = TrackItem::podcast_episode(episode_ref("e2"));
+        assert_eq!(first.id, TrackItem::NOT_A_LIBRARY_ROW);
+        assert_eq!(second.id, TrackItem::NOT_A_LIBRARY_ROW);
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.release_id, second.release_id);
+        assert_ne!(first.key(), second.key());
+        assert_ne!(first.key().to_string(), second.key().to_string());
+        assert_eq!(
+            TrackItem::podcast_episode(episode_ref("e1")).key(),
+            first.key()
+        );
+        let keys: std::collections::HashSet<TrackItemKey> =
+            [first.key(), second.key(), first.key()]
+                .into_iter()
+                .collect();
+        assert_eq!(keys.len(), 2);
+        let mut ordered = [second.key(), first.key(), TrackItemKey::Library(1)];
+        ordered.sort();
+        assert_eq!(ordered[0], TrackItemKey::Library(1));
     }
 }
