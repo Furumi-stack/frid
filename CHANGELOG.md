@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased — podcast discovery (`podcast_dht`)
+## v0.6.0 — 2026-11-20
+
+Releases `music-dht 0.6.0` and `furumi-library 0.3.0`.
+`federation-net` remains at `0.3.1`.
+
+- Tag-driven CI publishes every unpublished workspace crate version to
+  crates.io, in dependency order; already published versions are skipped on
+  retries. Authentication uses the `CARGO_REGISTRY_TOKEN` Actions secret.
+
+### Podcast discovery (`podcast_dht`)
 
 - `music-dht 0.6.0`: new `music_dht::podcast_dht` overlay for public podcast
   discovery on its own ALPN `furumi-fd/podcast-dht/1` (version 1) and its own
@@ -38,7 +47,7 @@
 - The music DHT (`music-dht-v5`), `federation-net` and device-sync protocol v4
   are unchanged. See "Public discovery (podcast_dht)" in `PODCASTS.md`.
 
-## Unreleased — podcast contract
+### Podcast contract and storage
 
 - `music-dht 0.6.0` (breaking): new `music_dht::podcast` module with the shared
   podcast contract: canonical `FeedUrl`, `PodcastId`/`EpisodeId` derivation

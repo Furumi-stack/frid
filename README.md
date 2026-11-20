@@ -50,13 +50,13 @@ crates/
 
 ## Using the libraries
 
-Until crates are published to a registry, depend on the repository directly:
+Use the published crates from crates.io:
 
 ```toml
 [dependencies]
-federation-net = { git = "https://gt.hexor.cy/ab/frid.git" }
-music-dht = { git = "https://gt.hexor.cy/ab/frid.git" }
-furumi-library = { git = "https://gt.hexor.cy/ab/frid.git" }
+federation-net = "0.3.1"
+music-dht = "0.6.0"
+furumi-library = "0.3.0"
 ```
 
 Start with the crate documentation:
@@ -79,6 +79,37 @@ cargo test --workspace
 The integration tests open real local sockets and establish iroh connections.
 Some rendezvous tests also use public discovery infrastructure, so a restricted
 sandbox may need explicit network permission.
+
+## Publishing
+
+Add one repository Actions secret named `CARGO_REGISTRY_TOKEN`, containing a
+crates.io API token with publish access to `federation-net`, `music-dht` and
+`furumi-library`. No registry username or Gitea token secret is needed.
+
+Update changed crate versions, workspace dependency requirements, `Cargo.lock`
+and `CHANGELOG.md`, then merge to `main`. Create `<crate>-v<version>` tags for
+the changed crates and one workspace release tag, for example:
+
+```bash
+git tag -a music-dht-v0.6.0 -m 'music-dht 0.6.0'
+git tag -a furumi-library-v0.3.0 -m 'furumi-library 0.3.0'
+git tag -a v0.6.0 -m 'Frid podcast release'
+git push origin music-dht-v0.6.0 furumi-library-v0.3.0 v0.6.0
+```
+
+Only the `v*` workspace tag triggers `.github/workflows/publish.yml`; the
+crate tags identify each package release without starting duplicate uploads.
+The workflow runs the workspace checks, selects every publishable workspace
+crate whose exact version is absent from the crates.io sparse index, and lets
+Cargo verify and publish the selected packages in dependency order. Versions
+already published are skipped, so rerunning a partially completed release is
+safe. A registry lookup error fails the release instead of assuming absence.
+
+Preview the selection with `python3 scripts/publish_crates.py --plan`, or
+verify the packages without uploading with `--dry-run`. If the secret was
+missing or a publish failed, fix the cause and rerun the existing tag workflow;
+do not move release tags. Manual dispatch must select the release tag as its
+ref. Publication is performed by CI, not by the tagging commands above.
 
 ## License
 
