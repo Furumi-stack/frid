@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — podcast discovery (`podcast_dht`)
+
+- `music-dht 0.6.0`: new `music_dht::podcast_dht` overlay for public podcast
+  discovery on its own ALPN `furumi-fd/podcast-dht/1` (version 1) and its own
+  SQLite cache (schema 2): signed `PodcastCard`s and `PodcastTombstone`s
+  (`furumi-podcast-card:v1` / `furumi-podcast-card-tombstone:v1` canonical
+  signing input), monotonic revisions with a total tie-break, text and id
+  keys, `PodcastDht::{publish, unpublish, sync_shares, republish, search,
+  lookup_podcast}` gated by `effective_share`, typed search hits
+  (`PodcastSearchHit`, `ClaimedFeedUrl`, `FederatedSearchHit`,
+  `SearchHitKind`, `merge_search_results`) and the advisory
+  `feed_url_privacy_warning`.
+- Replicas accept records only from their publisher, store one payload per
+  `(podcast_id, publisher)`, admit placements only for keys they are close to
+  (counting verified contacts only) and within per-key, per-publisher and
+  total budgets. A key never holds more than one response carries; full keys
+  and caches admit newcomers by evicting random records from their younger
+  half. Lookups give each response a bounded share of owners. Search offers
+  only the URL the podcast id hashes from; moved-feed URLs are reported as
+  unverified claims.
+- `sync_shares` is fail-safe for revocation (per-podcast `failed`) and holds
+  back cards with privacy warnings until confirmed (`held_back`,
+  `PodcastShareState::privacy_confirmed`).
+- Own cards persisted by an earlier run are neither republished (by
+  `maintenance` or `republish`) nor served to lookups until the first
+  `sync_shares` of the process, so a share revoked on another trusted device
+  while this one was offline is not re-sent on startup. That first call also
+  re-sends unchanged cards; tombstones are always re-sent.
+- `music-dht 0.6.0`: capability manifests can advertise `podcast_dht = 1`
+  (`capabilities::PODCAST_DHT_ID`, `CapabilityManifest::with_podcast_dht`,
+  `CapabilityManifest::protocol_version`,
+  `CapabilityManifest::supports_podcast_dht`). It is opt-in:
+  `CapabilityManifest::frid()` does not include it.
+- `music-dht 0.6.0`: new `MusicDhtError::PodcastPublication` variant (the enum
+  is `#[non_exhaustive]`).
+- The music DHT (`music-dht-v5`), `federation-net` and device-sync protocol v4
+  are unchanged. See "Public discovery (podcast_dht)" in `PODCASTS.md`.
+
 ## Unreleased — podcast contract
 
 - `music-dht 0.6.0` (breaking): new `music_dht::podcast` module with the shared

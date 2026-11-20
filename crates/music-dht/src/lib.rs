@@ -27,6 +27,9 @@
 //!   podcast/episode ids, metadata DTOs and convergent merge rules), with an
 //!   optional RSS/Atom parser behind the `podcast-feed` feature;
 //!   [`device_sync`] protocol v4 carries it between trusted devices.
+//! * [`podcast_dht`] is a separate signed overlay for public podcast
+//!   discovery: cards a user explicitly shared, found by title/author tokens
+//!   or podcast id, retracted by signed tombstones.
 //! * Records are replicated to the `K` nodes whose ids are XOR-closest to
 //!   each key. Publishers pick the targets from their routing table and send
 //!   batched store requests (one pipeline per peer), so even a large library
@@ -97,6 +100,7 @@ mod message;
 mod node;
 mod normalization;
 pub mod podcast;
+pub mod podcast_dht;
 mod record;
 mod request;
 mod routing;

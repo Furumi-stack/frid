@@ -2242,3 +2242,82 @@ fn concurrent_fetch_state_writers_lose_no_update() {
     assert_eq!(state.consecutive_failures as usize, THREADS * FAILURES);
     assert_eq!(state.cover_path.as_deref(), Some("/covers/c.jpg"));
 }
+
+// ---------------------------------------------------------------------------
+// Public discovery (`music_dht::podcast_dht`)
+
+/// The share state `PodcastDht::sync_shares` takes, built from the store the
+/// way clients do it.
+fn discovery_state(
+    store: &PodcastStore,
+    podcast_id: &PodcastId,
+) -> music_dht::podcast_dht::PodcastShareState {
+    music_dht::podcast_dht::PodcastShareState {
+        subscription: store.subscription(podcast_id).unwrap().unwrap(),
+        share: store.share(podcast_id).unwrap(),
+        card: None,
+        privacy_confirmed: false,
+    }
+}
+
+#[test]
+fn store_registers_drive_discovery_publication() {
+    let store = PodcastStore::open_in_memory().unwrap();
+    let mut stamps = TestStamps::new("device-a", 1_000);
+    let podcast_id = store
+        .subscribe(&mut stamps, &meta(FEED, "Show"))
+        .unwrap()
+        .podcast_id;
+
+    // Subscribed but private: nothing to publish.
+    let state = discovery_state(&store, &podcast_id);
+    assert!(!state.is_shared());
+    assert!(!store.podcast(&podcast_id).unwrap().unwrap().shared);
+
+    store.set_shared(&mut stamps, &podcast_id, true).unwrap();
+    let state = discovery_state(&store, &podcast_id);
+    assert!(state.is_shared());
+    assert!(store.podcast(&podcast_id).unwrap().unwrap().shared);
+    let card = state.card_spec().unwrap();
+    assert_eq!(card.podcast_id, podcast_id);
+    assert_eq!(card.feed_url, url(FEED));
+    assert_eq!(card.id_feed_url, None);
+    assert_eq!(card.title, "Show");
+    assert!(card.privacy_warnings().is_empty());
+
+    // After a permanent move the register's alias set still holds the origin
+    // URL, so the card stays bound to the podcast id.
+    let items = [Item::new(
+        Some("g1"),
+        "One",
+        "https://cdn.example.test/1.mp3",
+    )];
+    let moved = url("https://new.example.test/feed.xml");
+    let feed = parse(&rss("Show", None, &items), &moved);
+    refresh(&store, &mut stamps, &podcast_id, &feed, &moved, true);
+    let state = discovery_state(&store, &podcast_id);
+    assert!(state.subscription.feed_urls().contains(&moved));
+    let card = state.card_spec().unwrap();
+    assert_eq!(card.podcast_id, podcast_id);
+    // A card for the URL this device now fetches names the origin URL.
+    let summary = store.podcast(&podcast_id).unwrap().unwrap();
+    assert_eq!(summary.meta.feed_url, moved);
+    let fetched = music_dht::podcast_dht::PodcastShareState {
+        card: Some(music_dht::podcast_dht::PodcastCardSpec {
+            feed_url: summary.meta.feed_url.clone(),
+            id_feed_url: Some(url(FEED)),
+            ..card
+        }),
+        ..state
+    };
+    let card = fetched.card_spec().unwrap();
+    assert_eq!(card.feed_url, moved);
+    assert_eq!(card.id_feed_url, Some(url(FEED)));
+    card.validate().unwrap();
+
+    // Unsubscribing revokes the share decision: the card must be unpublished.
+    store.unsubscribe(&mut stamps, &podcast_id).unwrap();
+    let state = discovery_state(&store, &podcast_id);
+    assert!(!state.is_shared());
+    assert!(!store.podcast(&podcast_id).unwrap().unwrap().shared);
+}

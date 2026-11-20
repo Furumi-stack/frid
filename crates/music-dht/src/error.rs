@@ -50,6 +50,11 @@ pub enum MusicDhtError {
     /// The service is shutting down and no longer accepts operations.
     #[error("service is shutting down")]
     ShuttingDown,
+
+    /// A podcast card cannot be published, for example because the user did
+    /// not share the podcast (see `music_dht::podcast::effective_share`).
+    #[error("podcast publication refused: {0}")]
+    PodcastPublication(String),
 }
 
 impl From<federation_net::NetworkError> for MusicDhtError {

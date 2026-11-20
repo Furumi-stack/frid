@@ -35,6 +35,8 @@ pub const CATALOG_ID: &str = "catalog";
 pub const SIMILARITY_ID: &str = "similarity";
 /// Stable protocol identifier for DHT-routed similarity discovery.
 pub const SIMILARITY_DHT_ID: &str = "similarity_dht";
+/// Stable protocol identifier for the public podcast-discovery overlay.
+pub const PODCAST_DHT_ID: &str = "podcast_dht";
 /// Stable protocol identifier for personal-device synchronization.
 pub const DEVICE_SYNC_ID: &str = "device_sync";
 /// Stable protocol identifier for Jam playback control.
@@ -54,7 +56,13 @@ pub struct CapabilityManifest {
 }
 
 impl CapabilityManifest {
-    /// Creates a manifest containing every protocol owned by Frid.
+    /// Creates a manifest containing every protocol owned by Frid that a
+    /// music-DHT application serves.
+    ///
+    /// The public podcast-discovery overlay is opt-in: applications that run
+    /// [`crate::podcast_dht::PodcastDht`] add it with
+    /// [`Self::with_podcast_dht`], so an application that does not serve the
+    /// overlay never advertises it.
     pub fn frid(application: impl Into<String>, application_version: impl Into<String>) -> Self {
         let mut protocols = BTreeMap::new();
         protocols.insert(
@@ -103,6 +111,29 @@ impl CapabilityManifest {
     pub fn without_protocol(mut self, id: &str) -> Self {
         self.protocols.remove(id);
         self
+    }
+
+    /// Advertises the public podcast-discovery overlay
+    /// ([`PODCAST_DHT_ID`] at [`crate::podcast_dht::PODCAST_DHT_PROTOCOL_VERSION`]).
+    /// Call it only when the application serves
+    /// [`crate::podcast_dht::PODCAST_DHT_ALPN`].
+    pub fn with_podcast_dht(self) -> Self {
+        self.with_protocol(
+            PODCAST_DHT_ID,
+            crate::podcast_dht::PODCAST_DHT_PROTOCOL_VERSION,
+        )
+    }
+
+    /// Version of protocol `id` advertised by the peer, if any.
+    pub fn protocol_version(&self, id: &str) -> Option<u16> {
+        self.protocols.get(id).copied()
+    }
+
+    /// Whether the peer advertises the public podcast-discovery overlay at
+    /// the version this crate speaks. Peers without it are never queried.
+    pub fn supports_podcast_dht(&self) -> bool {
+        self.protocol_version(PODCAST_DHT_ID)
+            == Some(crate::podcast_dht::PODCAST_DHT_PROTOCOL_VERSION)
     }
 
     /// Validates bounds and identifiers received from a peer.
@@ -225,6 +256,24 @@ mod tests {
             assert!(manifest.protocols.contains_key(id), "missing {id}");
         }
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn podcast_dht_capability_is_opt_in_and_removable() {
+        let plain = CapabilityManifest::frid("furumi", "1.2.3");
+        assert_eq!(plain.protocol_version(PODCAST_DHT_ID), None);
+        assert!(!plain.supports_podcast_dht());
+        let manifest = plain.with_podcast_dht();
+        assert_eq!(
+            manifest.protocol_version(PODCAST_DHT_ID),
+            Some(crate::podcast_dht::PODCAST_DHT_PROTOCOL_VERSION)
+        );
+        assert!(manifest.supports_podcast_dht());
+        manifest.validate().unwrap();
+        let without = manifest.clone().without_protocol(PODCAST_DHT_ID);
+        assert!(!without.supports_podcast_dht());
+        let other_version = manifest.with_protocol(PODCAST_DHT_ID, 2);
+        assert!(!other_version.supports_podcast_dht());
     }
 
     #[test]

@@ -57,6 +57,10 @@ It lives in its own file, conventionally `podcasts.sqlite3`
 - **Queries**: `list_podcasts`, `seasons`, `episodes` (season, played-state
   and text filters, date or episode-number order), `resume_position_ms`,
   `episode_ref` / `episode_track` for queueing, `listen_history`.
+- **Public discovery**: the store records share decisions only. Build each
+  `music_dht::podcast_dht::PodcastShareState` for `PodcastDht::sync_shares`
+  from `subscription` and `share` (workspace `PODCASTS.md`, section "Public
+  discovery (podcast_dht)"); the client keeps the user's `privacy_confirmed` decision.
 
 The store is synchronous: methods take `&self` and lock one connection, so
 `Arc<PodcastStore>` can be shared; run calls on a blocking pool.
