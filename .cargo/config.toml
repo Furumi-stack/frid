@@ -1,0 +1,3 @@
+[registries.gitea]
+index = "sparse+https://gt.hexor.cy/api/packages/Furumi/cargo/"
+credential-provider = "cargo:token"

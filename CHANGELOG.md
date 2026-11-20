@@ -5,9 +5,10 @@
 Releases `music-dht 0.6.0` and `furumi-library 0.3.0`.
 `federation-net` remains at `0.3.1`.
 
-- Tag-driven CI publishes every unpublished workspace crate version to
-  crates.io, in dependency order; already published versions are skipped on
-  retries. Authentication uses the `CARGO_REGISTRY_TOKEN` Actions secret.
+- Tag-driven CI verifies release packages once, then publishes to crates.io
+  and the Furumi Gitea Cargo mirror in parallel jobs without recompiling.
+  Already published versions are skipped independently in each registry.
+  Authentication uses `CARGO_REGISTRY_TOKEN` and `GITEA_PACKAGES_TOKEN`.
 
 ### Podcast discovery (`podcast_dht`)
 

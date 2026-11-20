@@ -82,9 +82,14 @@ sandbox may need explicit network permission.
 
 ## Publishing
 
-Add one repository Actions secret named `CARGO_REGISTRY_TOKEN`, containing a
-crates.io API token with publish access to `federation-net`, `music-dht` and
-`furumi-library`. No registry username or Gitea token secret is needed.
+Add these repository Actions secrets:
+
+- `CARGO_REGISTRY_TOKEN`: a crates.io API token with publish access to
+  `federation-net`, `music-dht` and `furumi-library`.
+- `GITEA_PACKAGES_TOKEN`: a raw Gitea personal access token with
+  `write:package` and permission to publish under the `Furumi` organization.
+  Create it under user Settings → Applications. The workflow adds the
+  required `Bearer` prefix itself; no username secret is needed.
 
 Update changed crate versions, workspace dependency requirements, `Cargo.lock`
 and `CHANGELOG.md`, then merge to `main`. Create `<crate>-v<version>` tags for
@@ -99,14 +104,20 @@ git push origin music-dht-v0.6.0 furumi-library-v0.3.0 v0.6.0
 
 Only the `v*` workspace tag triggers `.github/workflows/publish.yml`; the
 crate tags identify each package release without starting duplicate uploads.
-The workflow runs the workspace checks, selects every publishable workspace
-crate whose exact version is absent from the crates.io sparse index, and lets
-Cargo verify and publish the selected packages in dependency order. Versions
-already published are skipped, so rerunning a partially completed release is
-safe. A registry lookup error fails the release instead of assuming absence.
+The workflow runs the workspace checks and verifies the release packages in
+one build job. Two publishing jobs then upload without rebuilding
+(`cargo publish --no-verify`), selecting missing versions independently in
+crates.io and the Gitea mirror at
+`https://gt.hexor.cy/api/packages/Furumi/cargo/`. The mirror includes all three
+crates, including an unchanged version missing there. Already published
+versions are skipped on retries; a registry lookup error fails the release
+instead of assuming absence. Mirrored manifests retain crates.io dependency
+references, so the mirror waits up to ten minutes for new workspace
+dependencies to appear in crates.io before packaging its uploads.
 
 Preview the selection with `python3 scripts/publish_crates.py --plan`, or
-verify the packages without uploading with `--dry-run`. If the secret was
+verify the packages without uploading with `--dry-run`. Add `--registry gitea`
+to preview or publish to the mirror. If a secret was
 missing or a publish failed, fix the cause and rerun the existing tag workflow;
 do not move release tags. Manual dispatch must select the release tag as its
 ref. Publication is performed by CI, not by the tagging commands above.
