@@ -3,6 +3,12 @@
 //! Jam is separate from personal-device sync. Possession of a [`JamInvite`]
 //! capability authorizes playback control for one host process, but never
 //! grants likes, playlists, history, or trusted-device membership.
+//!
+//! Podcast episodes are private. Hosts send [`redact_jam_snapshot`] to
+//! participants, reject participant commands for which
+//! [`crate::device_sync::jam_command_allowed`] is false, and map placeholders
+//! back with [`crate::device_sync::restore_jam_private_items`] before applying
+//! a participant's state.
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -140,6 +146,17 @@ pub enum JamWireMessage {
     },
 }
 
+/// Returns a playback snapshot safe to send to Jam participants.
+///
+/// Podcast episodes become opaque placeholders (see
+/// [`crate::device_sync::redact_for_jam`]) and the personal coordination
+/// envelope is removed, since it belongs to the trusted-device scope.
+pub fn redact_jam_snapshot(mut snapshot: PlaybackSnapshot) -> PlaybackSnapshot {
+    snapshot.state = crate::device_sync::redact_for_jam(snapshot.state);
+    snapshot.coordination = None;
+    snapshot
+}
+
 /// Reads a bounded Jam message from an async reader.
 pub async fn read_message_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<JamWireMessage> {
     let mut line = Vec::new();
@@ -275,6 +292,54 @@ mod tests {
     #[test]
     fn personal_device_invites_are_not_jam_capabilities() {
         assert!(JamInvite::from_uri("frid://i/abcd").is_err());
+    }
+
+    #[test]
+    fn jam_snapshots_hide_podcast_episodes() {
+        use crate::device_sync::{PlaybackRepeat, PlaybackStateWire, PlaybackTrack};
+        use crate::podcast::{EpisodeId, FeedUrl, PodcastEpisodeRef, PodcastId};
+
+        let feed = FeedUrl::parse("https://private.test/feed").unwrap();
+        let podcast_id = PodcastId::from_feed_url(&feed);
+        let episode = PodcastEpisodeRef {
+            episode_id: EpisodeId::from_guid(&podcast_id, "e").unwrap(),
+            podcast_id,
+            feed_url: feed,
+            podcast_title: "Hidden show".to_string(),
+            episode_title: "Hidden episode".to_string(),
+            audio_url: "https://private.test/e.mp3".to_string(),
+            mime: None,
+            duration_ms: None,
+            published_at_ms: None,
+            season: None,
+            episode_number: None,
+            image_url: None,
+            progress_generation: Some(7),
+        };
+        let snapshot = PlaybackSnapshot {
+            device_id: "host".to_string(),
+            device_name: "Host".to_string(),
+            active: true,
+            updated_at_ms: 1,
+            state: PlaybackStateWire {
+                queue: vec![PlaybackTrack::podcast_episode(episode)],
+                queue_pos: 0,
+                playing: true,
+                paused: false,
+                idle_since_ms: None,
+                position_secs: 1.0,
+                volume: 50,
+                shuffle: false,
+                repeat: PlaybackRepeat::Off,
+                playback_rate: None,
+            },
+            coordination: None,
+        };
+        let redacted = redact_jam_snapshot(snapshot);
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(!json.contains("Hidden"));
+        assert!(!json.contains("private.test"));
+        assert!(redacted.state.queue[0].is_private_placeholder());
     }
 
     #[test]

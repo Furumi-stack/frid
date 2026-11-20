@@ -14,7 +14,7 @@ repository = "https://gt.hexor.cy/ab/frid"
 
 [workspace.dependencies]
 federation-net = { path = "crates/federation-net", version = "0.3.1" }
-music-dht = { path = "crates/music-dht", version = "0.5.0" }
+music-dht = { path = "crates/music-dht", version = "0.6.0" }
 iroh = "1"
 iroh-base = "1"
 iroh-tickets = "1"
@@ -38,3 +38,6 @@ lofty = "0.22"
 data-encoding = "2"
 rand = "0.9"
 tempfile = "3"
+quick-xml = "0.41"
+encoding_rs = "0.8.35"
+url = "2.5"

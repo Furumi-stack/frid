@@ -177,12 +177,41 @@ their local output is playing. The web gateway uses a passive server profile;
 browser startup and explicit selection are separate inputs.
 
 This register provides eventual exclusivity after a partition heals, not a
-quorum lock during a partition. Device-sync profiles now advertise version 3;
+quorum lock during a partition. Device-sync profiles now advertise version 4
+(version 3 introduced coordination, version 4 adds podcast queue items);
 the additive coordination envelope is independently versioned and transported
 over the existing JSON `furumi/sync/2` stream. Legacy library records remain
 readable, but legacy unfenced personal playback messages cannot control an
 upgraded output. See [PLAYBACK_PROTOCOL.md](PLAYBACK_PROTOCOL.md) for the
 contract, adapter obligations, configuration and rollout rules.
+
+Podcasts are a separate content type with a pure shared contract in
+`music_dht::podcast` (normative description: [PODCASTS.md](PODCASTS.md)). It
+owns canonical feed URLs, domain-separated BLAKE3 podcast and episode ids,
+feed aliases, the no-GUID episode rule, bounded metadata DTOs, the
+self-contained `PodcastEpisodeRef` queue item, and convergent merge functions
+for subscriptions, share decisions, progress registers and listening
+sessions. The tolerant RSS/Atom parser is shared behind the `podcast-feed`
+feature because episode identity depends on it. HTTP fetching, scheduling,
+buffering and decoding remain client runtime work, and persistence lives in
+client storage that implements the same rules. Podcast audio is fetched from
+the publisher: it is never imported, content-addressed or offered for P2P
+transfer.
+
+Device-sync protocol v4 carries podcast state between trusted devices only:
+five `podcast_*` operations, bounded snapshot sections (the recovery path,
+because sync vectors never re-request operations hidden from an older peer;
+past the bounds an upgraded peer recovers only the newest records), and an
+explicit `PlaybackTrack.source`. The operation enum is closed and v3 clients
+ignore `source`, so senders gate on the version each peer reported itself
+(relayed profiles only raise it; pairing requests use the version in the
+invite); podcast state is never sent to peers below v4, handoff to them is
+refused, and their playback commands are ignored while the queue contains
+episodes. Jam snapshots replace episodes with opaque placeholders. Progress,
+subscription and share registers order by a Lamport generation before
+wall-clock `hlc_ms`, so a device with a fast clock cannot undo an observed
+seek, restart, unsubscribe or share decision. Public podcast discovery is a future
+separate overlay; the music DHT schema and `federation-net` are unchanged.
 
 Music discovery identifies an owner and content; it does not force all domain
 traffic through DHT messages. `music-dht` exposes the underlying authenticated
@@ -283,3 +312,8 @@ architectural constraint:
 - Local durable state survives ordinary peer and network failure.
 - Additional stream protocols reuse authenticated connectivity without
   coupling bulk data to the typed control channel.
+- Private personal state (podcast subscriptions, progress, history) stays in
+  the trusted-device group; Jam and public overlays only see explicit public
+  projections or opaque placeholders.
+- A device's protocol version is what that device reported; relays never
+  substitute their own.

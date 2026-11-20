@@ -3,6 +3,25 @@
 //! The storage and UI policy live in applications. This module only defines
 //! the stable JSON-lines messages spoken over the auxiliary iroh stream ALPN,
 //! plus small helpers for opaque `frid://i/...` invites.
+//!
+//! # Versions
+//!
+//! | Profile `protocol_version` | Adds |
+//! | --- | --- |
+//! | 1 | likes, playlists, membership (`furumi/sync/1`) |
+//! | 2 | [`SyncOpPayload::ListenRecorded`] (`furumi/sync/2`) |
+//! | 3 | fenced personal playback coordination |
+//! | 4 | podcasts: five `podcast_*` operations, podcast snapshot sections, [`PlaybackSource`] on queue items, reserved `playback_rate` |
+//!
+//! The ALPN stays `furumi/sync/2` for v3 and v4. [`SyncOpPayload`] is a
+//! closed serde enum: a peer that does not know an operation `kind` fails to
+//! deserialize the **whole** message that contains it, not just one
+//! operation. Peers before v4 ignore [`PlaybackTrack::source`] and would treat
+//! episodes as broken music items. Senders must therefore filter by the
+//! peer's version ([`profile_protocol_version`], [`relayed_protocol_version`],
+//! [`InviteWire::inviter_protocol_version`]) with [`op_allowed_for_peer`],
+//! [`playback_allowed_for_peer`] and [`SyncSnapshot::for_peer`]. See the
+//! workspace `PODCASTS.md` for the podcast contract.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -12,6 +31,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{MusicDhtError, Result};
+use crate::podcast::{
+    EpisodeId, FeedUrl, ListenSession, MAX_FEED_ALIASES, MAX_PODCAST_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_LISTEN_SESSIONS, MAX_SNAPSHOT_PROGRESS, MAX_SNAPSHOT_SHARES,
+    MAX_SNAPSHOT_SUBSCRIPTIONS, PodcastEpisodeRef, PodcastError, PodcastId, PodcastMeta,
+    PodcastResult, ProgressRecord, ProgressStatus, ShareRecord, SubscriptionRecord,
+};
 
 /// Legacy ALPN used by personal-device sync v1.
 pub const SYNC_ALPN_V1: &[u8] = b"furumi/sync/1";
@@ -27,7 +52,22 @@ pub const SYNC_ALPN_V2: &[u8] = b"furumi/sync/2";
 pub const SYNC_ALPN: &[u8] = SYNC_ALPN_V2;
 
 /// Version of the personal-device sync wire protocol.
-pub const DEVICE_SYNC_PROTOCOL_VERSION: u16 = 3;
+///
+/// Version 4 adds podcasts. Always advertise the constant of the running
+/// client for **this** device only; for other devices keep the version they
+/// reported themselves (see [`profile_protocol_version`]).
+pub const DEVICE_SYNC_PROTOCOL_VERSION: u16 = 4;
+
+/// First protocol version that understands podcast operations, podcast
+/// snapshot sections and [`PlaybackSource`].
+pub const PODCAST_PROTOCOL_VERSION: u16 = 4;
+
+/// Version assumed for a device whose profile never reported one.
+///
+/// Profiles written by clients before v4 carry no version in
+/// [`SyncOpPayload::DeviceProfileSet`]. Treat such a device as the oldest
+/// protocol: it will be upgraded as soon as it reports its own version.
+pub const UNREPORTED_PROTOCOL_VERSION: u16 = 1;
 
 /// Minimum actual listening time retained for an interrupted listen.
 pub const MIN_RECORDED_LISTEN_MS: i64 = 5_000;
@@ -38,6 +78,46 @@ pub const MAX_QUALIFYING_LISTEN_MS: i64 = 4 * 60 * 1_000;
 /// Returns whether a peer may receive listening-history operations.
 pub const fn supports_listen_history(protocol_version: u16) -> bool {
     protocol_version >= 2
+}
+
+/// Returns whether a peer may receive podcast operations, podcast snapshot
+/// sections and playback state that contains podcast episodes.
+pub const fn supports_podcasts(protocol_version: u16) -> bool {
+    protocol_version >= PODCAST_PROTOCOL_VERSION
+}
+
+/// Protocol version to store for a device after reading **its own** report.
+///
+/// Self-reports are: the `profile` of a `Hello`, `PairRequest` or
+/// `PairResponse` sent by that device; the entry of a `devices` list whose
+/// `device_id` is the authenticated sender of the message (a `SyncResponse`
+/// has no `profile` field, so this is how an initiator learns the responder's
+/// version); and a [`SyncOpPayload::DeviceProfileSet`] whose
+/// `origin_device_id` is that device. `reported` is the version in the report
+/// (`None` when an older client left it out) and `previously_known` the
+/// stored value. A self-report replaces the stored value, so a downgrade is
+/// noticed.
+///
+/// Profiles of **other** devices relayed by a peer are not self-reports: use
+/// [`relayed_protocol_version`] for them. Receivers and relays must never
+/// substitute their own [`DEVICE_SYNC_PROTOCOL_VERSION`] for another device:
+/// doing so would make version gating send podcast state to old clients.
+pub fn profile_protocol_version(reported: Option<u16>, previously_known: Option<u16>) -> u16 {
+    reported
+        .or(previously_known)
+        .unwrap_or(UNREPORTED_PROTOCOL_VERSION)
+}
+
+/// Protocol version to store for a device after reading a profile of it
+/// relayed by **another** device (an entry of a `devices` list).
+///
+/// Deployed v1–v3 clients relay every device with their own protocol
+/// constant, so a relayed value can understate a device's version. A relayed
+/// value therefore only raises the stored version (`max(stored, relayed)`)
+/// and is taken as is only when nothing is stored. Lowering requires a
+/// self-report ([`profile_protocol_version`]).
+pub fn relayed_protocol_version(relayed: u16, previously_known: Option<u16>) -> u16 {
+    previously_known.map_or(relayed, |stored| stored.max(relayed))
 }
 
 /// Default invite lifetime used by applications unless they need a custom TTL.
@@ -66,6 +146,25 @@ pub struct InviteWire {
     /// Expiration timestamp in unix milliseconds.
     #[serde(rename = "e")]
     pub expires_at_ms: i64,
+    /// Device-sync protocol version of the inviter (v4+).
+    ///
+    /// `None` in invites created by older clients. The invite consumer sends
+    /// its `PairRequest` before it hears from the inviter, so it gates the
+    /// operations, snapshot sections and playback state of that request by
+    /// [`InviteWire::inviter_protocol_version`].
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u16>,
+}
+
+impl InviteWire {
+    /// Protocol version to assume for the inviter while building a
+    /// `PairRequest`: the version in the invite, or
+    /// [`UNREPORTED_PROTOCOL_VERSION`] for invites from older clients, which
+    /// strips all podcast state from the request. Podcast state then catches
+    /// up through the snapshot of the next regular sync.
+    pub fn inviter_protocol_version(&self) -> u16 {
+        self.protocol_version.unwrap_or(UNREPORTED_PROTOCOL_VERSION)
+    }
 }
 
 /// Public device profile exchanged inside a trusted sync group.
@@ -77,7 +176,10 @@ pub struct DeviceProfileWire {
     pub name: String,
     /// Application version.
     pub client_version: String,
-    /// Wire protocol version.
+    /// Wire protocol version reported by **this** device.
+    ///
+    /// When relaying other devices' profiles, send the version stored for
+    /// them, never the relay's own constant.
     pub protocol_version: u16,
     /// Transport endpoint id, as string.
     pub endpoint_id: String,
@@ -239,7 +341,38 @@ impl ListenEvent {
     }
 }
 
+/// Explicit source of a queue item (protocol v4).
+///
+/// Absent on music items from older clients, which are music. Podcast
+/// episodes are identified only by this field: never by a negative id, a
+/// placeholder release or a URL in `file_path`.
+///
+/// Clients before v4 do not know [`PlaybackTrack::source`] at all and ignore
+/// it: they would take an episode for a broken music item (id 0, no content
+/// id) and forward it that way, losing the episode for every device. That is
+/// why podcast-bearing playback state is gated by version. This enum is
+/// closed for v4 clients: a new variant needs a protocol bump, because a v4
+/// client fails to parse the whole message on an unknown `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaybackSource {
+    /// Music track resolved by `content_id` / `fed`.
+    Music,
+    /// Podcast episode streamed from the publisher (boxed: music items stay small).
+    PodcastEpisode(Box<PodcastEpisodeRef>),
+    /// Opaque placeholder that replaces a private item in Jam snapshots
+    /// (see [`redact_for_jam`]). It is never playable and carries no title,
+    /// URL or id.
+    Private,
+}
+
+/// Display title of [`PlaybackTrack::private_placeholder`].
+pub const PRIVATE_ITEM_TITLE: &str = "Private item";
+
 /// Portable playback queue track.
+///
+/// For podcast items [`PlaybackTrack::source`] is authoritative; the legacy
+/// display fields mirror it (see [`PlaybackTrack::podcast_episode`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlaybackTrack {
     /// Local or placeholder id on the sending device.
@@ -285,6 +418,89 @@ pub struct PlaybackTrack {
     /// Federation metadata for unresolved tracks.
     #[serde(default)]
     pub fed: Option<SyncedFedTrack>,
+    /// Explicit item source (protocol v4). `None` means music.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PlaybackSource>,
+}
+
+impl PlaybackTrack {
+    /// Queue item for a podcast episode.
+    ///
+    /// Legacy display fields are filled for presentation only: `title` is the
+    /// episode title, `artist_names` and `release_title` the podcast title,
+    /// `id`/`release_id` are `0`, `file_path` is empty and `content_id` is
+    /// `None`.
+    pub fn podcast_episode(episode: PodcastEpisodeRef) -> Self {
+        Self {
+            id: 0,
+            title: episode.episode_title.clone(),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: episode.duration_ms.unwrap_or(0) as f64 / 1_000.0,
+            artist_names: vec![episode.podcast_title.clone()],
+            featured_artist_names: Vec::new(),
+            release_id: 0,
+            release_title: episode.podcast_title.clone(),
+            release_year: None,
+            file_path: String::new(),
+            content_id: None,
+            audio_format: episode.mime.clone(),
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
+            source: Some(PlaybackSource::PodcastEpisode(Box::new(episode))),
+        }
+    }
+
+    /// Opaque, unplayable placeholder for a private item.
+    pub fn private_placeholder() -> Self {
+        Self {
+            id: 0,
+            title: PRIVATE_ITEM_TITLE.to_string(),
+            track_number: None,
+            disc_number: None,
+            duration_seconds: 0.0,
+            artist_names: Vec::new(),
+            featured_artist_names: Vec::new(),
+            release_id: 0,
+            release_title: String::new(),
+            release_year: None,
+            file_path: String::new(),
+            content_id: None,
+            audio_format: None,
+            audio_bitrate: None,
+            audio_sample_rate: None,
+            audio_bit_depth: None,
+            file_size_bytes: None,
+            play_count: 0,
+            fed: None,
+            source: Some(PlaybackSource::Private),
+        }
+    }
+
+    /// The podcast episode of this item, if it is one.
+    pub fn podcast_episode_ref(&self) -> Option<&PodcastEpisodeRef> {
+        match &self.source {
+            Some(PlaybackSource::PodcastEpisode(episode)) => Some(episode),
+            _ => None,
+        }
+    }
+
+    /// Whether this item is a Jam private placeholder.
+    pub fn is_private_placeholder(&self) -> bool {
+        matches!(self.source, Some(PlaybackSource::Private))
+    }
+
+    /// Whether this item needs protocol v4 (podcast episode or placeholder).
+    pub fn requires_podcast_support(&self) -> bool {
+        matches!(
+            self.source,
+            Some(PlaybackSource::PodcastEpisode(_) | PlaybackSource::Private)
+        )
+    }
 }
 
 /// Playback repeat mode.
@@ -325,6 +541,12 @@ pub struct PlaybackStateWire {
     pub shuffle: bool,
     /// Repeat mode.
     pub repeat: PlaybackRepeat,
+    /// Reserved playback rate (1.0 = normal speed); no client uses it yet.
+    ///
+    /// When implemented, position extrapolation and handoff must account for
+    /// it. Receivers that do not support rates treat it as 1.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playback_rate: Option<f32>,
 }
 
 /// Playback snapshot with the common coordination envelope.
@@ -409,6 +631,13 @@ pub enum SyncOpPayload {
         endpoint_ticket: String,
         /// Endpoint id.
         endpoint_id: String,
+        /// Protocol version of the origin device (v4+).
+        ///
+        /// `None` from older clients. Receivers store
+        /// [`profile_protocol_version`]`(protocol_version, stored)` and must
+        /// never substitute their own constant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u16>,
     },
     /// Trust a device.
     DeviceTrusted {
@@ -440,10 +669,99 @@ pub enum SyncOpPayload {
         /// Portable listening event.
         event: ListenEvent,
     },
+    /// Subscribe to or unsubscribe from a podcast (protocol v4).
+    ///
+    /// Last-writer-wins by `(generation, hlc_ms, op_id)`; see
+    /// [`SubscriptionRecord`]. Unsubscribing is state, not a tombstone. Only
+    /// explicit user actions emit it; RSS refreshes never do. Materialize with
+    /// [`SyncOpWire::podcast_subscription`].
+    PodcastSubscriptionSet {
+        /// Podcast.
+        podcast_id: PodcastId,
+        /// Desired subscription state.
+        subscribed: bool,
+        /// Channel metadata, so other devices subscribe without the URL.
+        podcast: PodcastMeta,
+        /// Known feed URLs (grow-only, bounded).
+        #[serde(default)]
+        feed_aliases: Vec<FeedUrl>,
+        /// Per-podcast Lamport generation
+        /// ([`crate::podcast::next_podcast_generation`]).
+        #[serde(default)]
+        generation: u64,
+    },
+    /// Share or stop sharing a podcast card with the federation (protocol v4).
+    ///
+    /// Last-writer-wins by `(generation, hlc_ms, op_id)`; see [`ShareRecord`].
+    /// `shared = false` is privacy-protecting state and **not** a tombstone:
+    /// it is never compacted. Unsubscribing also emits `shared = false`.
+    PodcastShareSet {
+        /// Podcast.
+        podcast_id: PodcastId,
+        /// Desired share state.
+        shared: bool,
+        /// Per-podcast Lamport generation, shared with the subscription.
+        #[serde(default)]
+        generation: u64,
+    },
+    /// Record feed URLs of a podcast learned by any device (protocol v4).
+    ///
+    /// Grow-only: merged into the bounded alias set with
+    /// [`crate::podcast::merge_feed_aliases`]; it never touches the
+    /// subscription or share register, so RSS refreshes may emit it (after a
+    /// permanent redirect or an `itunes:new-feed-url`), but only when merging
+    /// the new URLs changes the stored set.
+    PodcastFeedAliasesAdded {
+        /// Podcast.
+        podcast_id: PodcastId,
+        /// Canonical feed URLs to add (at most `MAX_FEED_ALIASES + 1`).
+        feed_aliases: Vec<FeedUrl>,
+    },
+    /// Write the durable resume register of an episode (protocol v4).
+    ///
+    /// Ordered by `(generation, hlc_ms, origin_device_id, op_id)`; see
+    /// [`ProgressRecord`]. Clients coalesce periodic checkpoints in their
+    /// outgoing log: only the latest per episode needs to stay pending.
+    PodcastProgressSet {
+        /// Episode.
+        episode_id: EpisodeId,
+        /// Owning podcast.
+        podcast_id: PodcastId,
+        /// Resume position in milliseconds.
+        position_ms: i64,
+        /// Listening status.
+        status: ProgressStatus,
+        /// Lamport generation (see [`ProgressRecord`]).
+        generation: u64,
+        /// Session or explicit action id.
+        session_id: String,
+        /// Display reference, so a device without the feed can show and
+        /// resume the episode.
+        #[serde(default)]
+        episode: Option<PodcastEpisodeRef>,
+    },
+    /// Record or update one listening session (protocol v4).
+    ///
+    /// Grow-only set keyed by `session.session_id`; see [`ListenSession`].
+    /// `session.device_id` must equal the operation origin.
+    PodcastListenRecorded {
+        /// Listening session.
+        session: ListenSession,
+        /// Display reference for history on devices without the feed.
+        #[serde(default)]
+        episode: Option<PodcastEpisodeRef>,
+    },
 }
 
 impl SyncOpPayload {
     /// Returns true for operations that remove state and may eventually compact.
+    ///
+    /// No podcast operation is a tombstone. Unsubscribing
+    /// (`podcast_subscription_set { subscribed: false }`) and revoking a share
+    /// (`podcast_share_set { shared: false }`) are last-writer-wins state that
+    /// must keep beating stale `true` writes delivered again later; compacting
+    /// them (and deleting the state row, as like tombstones do) would let an
+    /// older operation still in some log resubscribe or republish the podcast.
     pub fn is_tombstone(&self) -> bool {
         matches!(
             self,
@@ -453,14 +771,314 @@ impl SyncOpPayload {
                 | SyncOpPayload::DeviceRevoked { .. }
         )
     }
+
+    /// Returns true for the protocol v4 podcast operation kinds.
+    pub fn is_podcast(&self) -> bool {
+        matches!(
+            self,
+            SyncOpPayload::PodcastSubscriptionSet { .. }
+                | SyncOpPayload::PodcastShareSet { .. }
+                | SyncOpPayload::PodcastFeedAliasesAdded { .. }
+                | SyncOpPayload::PodcastProgressSet { .. }
+                | SyncOpPayload::PodcastListenRecorded { .. }
+        )
+    }
+}
+
+impl SyncOpWire {
+    /// Subscription record written by a `podcast_subscription_set` operation.
+    ///
+    /// The register stamp is the payload `generation` and the operation's
+    /// `(hlc_ms, op_id)`.
+    pub fn podcast_subscription(&self) -> Option<SubscriptionRecord> {
+        let SyncOpPayload::PodcastSubscriptionSet {
+            podcast_id,
+            subscribed,
+            podcast,
+            feed_aliases,
+            generation,
+        } = &self.payload
+        else {
+            return None;
+        };
+        let mut record = SubscriptionRecord {
+            podcast_id: podcast_id.clone(),
+            subscribed: *subscribed,
+            podcast: podcast.clone(),
+            feed_aliases: feed_aliases.clone(),
+            generation: *generation,
+            hlc_ms: self.hlc_ms,
+            op_id: self.op_id.clone(),
+        };
+        record.normalize();
+        Some(record)
+    }
+
+    /// Share record written by a `podcast_share_set` operation.
+    pub fn podcast_share(&self) -> Option<ShareRecord> {
+        let SyncOpPayload::PodcastShareSet {
+            podcast_id,
+            shared,
+            generation,
+        } = &self.payload
+        else {
+            return None;
+        };
+        Some(ShareRecord {
+            podcast_id: podcast_id.clone(),
+            shared: *shared,
+            generation: *generation,
+            hlc_ms: self.hlc_ms,
+            op_id: self.op_id.clone(),
+        })
+    }
+
+    /// Podcast and feed URLs of a `podcast_feed_aliases_added` operation.
+    ///
+    /// Merge them with [`crate::podcast::merge_feed_aliases`] (or
+    /// [`SubscriptionRecord::add_feed_aliases`]); the registers are untouched.
+    pub fn podcast_feed_aliases(&self) -> Option<(&PodcastId, &[FeedUrl])> {
+        match &self.payload {
+            SyncOpPayload::PodcastFeedAliasesAdded {
+                podcast_id,
+                feed_aliases,
+            } => Some((podcast_id, feed_aliases)),
+            _ => None,
+        }
+    }
+
+    /// Progress register written by a `podcast_progress_set` operation.
+    ///
+    /// `device_id` is the operation origin.
+    pub fn podcast_progress(&self) -> Option<ProgressRecord> {
+        let SyncOpPayload::PodcastProgressSet {
+            episode_id,
+            podcast_id,
+            position_ms,
+            status,
+            generation,
+            session_id,
+            ..
+        } = &self.payload
+        else {
+            return None;
+        };
+        Some(ProgressRecord {
+            episode_id: episode_id.clone(),
+            podcast_id: podcast_id.clone(),
+            position_ms: *position_ms,
+            status: *status,
+            generation: *generation,
+            session_id: session_id.clone(),
+            hlc_ms: self.hlc_ms,
+            device_id: self.origin_device_id.clone(),
+            op_id: self.op_id.clone(),
+        })
+    }
+
+    /// Listening session carried by a `podcast_listen_recorded` operation.
+    pub fn podcast_listen_session(&self) -> Option<&ListenSession> {
+        match &self.payload {
+            SyncOpPayload::PodcastListenRecorded { session, .. } => Some(session),
+            _ => None,
+        }
+    }
+
+    /// Validates a podcast operation against the contract.
+    ///
+    /// Non-podcast operations are accepted unchanged. Receivers must skip
+    /// (but still acknowledge) podcast operations that fail this check
+    /// (bounds, stamps, mismatched references).
+    ///
+    /// Ids ([`PodcastId`], [`EpisodeId`]) and feed URLs ([`FeedUrl`]) are
+    /// checked earlier, while the message is deserialized: a non-canonical id
+    /// or URL is a schema violation like a wrong JSON type, and the whole
+    /// message fails to parse. Conforming clients cannot produce one, because
+    /// these types only serialize canonical values and their rules are frozen
+    /// with the `v1` derivation domains; changing them requires a new protocol
+    /// version.
+    pub fn validate_podcast(&self) -> PodcastResult<()> {
+        let check_ref = |episode: &Option<PodcastEpisodeRef>,
+                         episode_id: &EpisodeId,
+                         podcast_id: &PodcastId| {
+            match episode {
+                Some(episode)
+                    if &episode.episode_id != episode_id || &episode.podcast_id != podcast_id =>
+                {
+                    Err(PodcastError::Mismatch("episode reference"))
+                }
+                Some(episode) => episode.validate(),
+                None => Ok(()),
+            }
+        };
+        match &self.payload {
+            SyncOpPayload::PodcastSubscriptionSet { .. } => self
+                .podcast_subscription()
+                .expect("subscription payload")
+                .validate(),
+            SyncOpPayload::PodcastShareSet { .. } => {
+                self.podcast_share().expect("share payload").validate()
+            }
+            SyncOpPayload::PodcastFeedAliasesAdded { feed_aliases, .. } => {
+                if feed_aliases.is_empty() || feed_aliases.len() > MAX_FEED_ALIASES + 1 {
+                    return Err(PodcastError::InvalidField {
+                        field: "feed_aliases",
+                        reason: "must hold 1 to MAX_FEED_ALIASES + 1 URLs",
+                    });
+                }
+                Ok(())
+            }
+            SyncOpPayload::PodcastProgressSet {
+                episode_id,
+                podcast_id,
+                episode,
+                ..
+            } => {
+                self.podcast_progress()
+                    .expect("progress payload")
+                    .validate()?;
+                check_ref(episode, episode_id, podcast_id)
+            }
+            SyncOpPayload::PodcastListenRecorded { session, episode } => {
+                session.validate()?;
+                if session.device_id != self.origin_device_id {
+                    return Err(PodcastError::Mismatch(
+                        "session device and operation origin",
+                    ));
+                }
+                check_ref(episode, &session.episode_id, &session.podcast_id)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Returns whether `payload` may be sent to a peer with `peer_version`.
+///
+/// * `listen_recorded` needs v2;
+/// * every `podcast_*` operation needs v4;
+/// * a `playback_command` whose state contains podcast items needs v4;
+/// * everything else is accepted by every version.
+///
+/// Gating is mandatory: an older peer cannot deserialize an unknown `kind`
+/// and would reject the entire message, stalling all synchronization.
+pub fn op_allowed_for_peer(payload: &SyncOpPayload, peer_version: u16) -> bool {
+    match payload {
+        SyncOpPayload::ListenRecorded { .. } => supports_listen_history(peer_version),
+        SyncOpPayload::PlaybackCommand { command, .. } => {
+            !playback_command_has_podcasts(command) || supports_podcasts(peer_version)
+        }
+        payload if payload.is_podcast() => supports_podcasts(peer_version),
+        _ => true,
+    }
+}
+
+/// Returns whether the queue contains podcast episodes or Jam placeholders.
+pub fn playback_state_has_podcasts(state: &PlaybackStateWire) -> bool {
+    state
+        .queue
+        .iter()
+        .any(PlaybackTrack::requires_podcast_support)
+}
+
+/// Returns whether a playback command carries podcast items.
+pub fn playback_command_has_podcasts(command: &PlaybackCommand) -> bool {
+    match command {
+        crate::playback::Command::SetState { state, .. }
+        | crate::playback::Command::ActiveChanged { state, .. } => {
+            playback_state_has_podcasts(state)
+        }
+    }
+}
+
+/// Returns whether `state` may be sent to (or handed off to) a peer.
+///
+/// For a peer below v4 with podcast items in the queue, do not send the
+/// playback snapshot and refuse the handoff with an "update required" message.
+/// Never strip the episodes to make the state fit: an old client would then
+/// forward a queue without them and lose them for every device.
+pub fn playback_allowed_for_peer(state: &PlaybackStateWire, peer_version: u16) -> bool {
+    !playback_state_has_podcasts(state) || supports_podcasts(peer_version)
+}
+
+/// Returns whether a `SetState`/`ActiveChanged` command from a peer may be
+/// applied to the local playback state.
+///
+/// While the local queue contains podcast items, commands from peers below
+/// v4 are rejected: such a peer does not know the items and its state would
+/// silently drop them.
+pub fn playback_command_allowed_from_peer(local: &PlaybackStateWire, peer_version: u16) -> bool {
+    supports_podcasts(peer_version) || !playback_state_has_podcasts(local)
+}
+
+/// Returns a copy of `state` safe to show to Jam participants.
+///
+/// Every podcast episode (and any existing placeholder) is replaced by
+/// [`PlaybackTrack::private_placeholder`]: no title, URL, feed or id leaves
+/// the host. Queue order, position and transport state are kept.
+pub fn redact_for_jam(mut state: PlaybackStateWire) -> PlaybackStateWire {
+    for track in &mut state.queue {
+        if track.requires_podcast_support() {
+            *track = PlaybackTrack::private_placeholder();
+        }
+    }
+    state
+}
+
+/// Returns whether a Jam participant command may be considered at all.
+///
+/// Commands that contain real podcast episodes are rejected: participants
+/// cannot add episodes to the host queue. Placeholders are allowed here and
+/// must be mapped back with [`restore_jam_private_items`].
+pub fn jam_command_allowed(command: &PlaybackCommand) -> bool {
+    match command {
+        crate::playback::Command::SetState { state, .. }
+        | crate::playback::Command::ActiveChanged { state, .. } => !state
+            .queue
+            .iter()
+            .any(|track| track.podcast_episode_ref().is_some()),
+    }
+}
+
+/// Maps the placeholders of a participant's state back to the host's items.
+///
+/// The k-th placeholder of `participant` becomes the k-th private item of
+/// `host`. Returns `None` (reject the command) when the participant state
+/// contains real podcast episodes or a different number of placeholders, so a
+/// participant can reorder music and move placeholders but cannot drop,
+/// duplicate or inject private items.
+pub fn restore_jam_private_items(
+    host: &PlaybackStateWire,
+    mut participant: PlaybackStateWire,
+) -> Option<PlaybackStateWire> {
+    let mut private = host
+        .queue
+        .iter()
+        .filter(|track| track.requires_podcast_support());
+    for track in &mut participant.queue {
+        if track.podcast_episode_ref().is_some() {
+            return None;
+        }
+        if track.is_private_placeholder() {
+            *track = private.next()?.clone();
+        }
+    }
+    private.next().is_none().then_some(participant)
 }
 
 /// Materialized sync snapshot sent with every handshake.
 ///
-/// Listening history is intentionally absent: it is an unbounded append-only
-/// log, not last-write-wins state. New devices catch it up from missing
-/// [`SyncOpPayload::ListenRecorded`] operations using the existing per-origin
-/// vector and bounded operation batches.
+/// Music listening history is intentionally absent: it is an unbounded
+/// append-only log, not last-write-wins state. New devices catch it up from
+/// missing [`SyncOpPayload::ListenRecorded`] operations using the existing
+/// per-origin vector and bounded operation batches.
+///
+/// Podcast state (protocol v4) **is** included, bounded by
+/// [`SyncSnapshot::bound_podcast_state`]. Operations hidden from a peer while
+/// it ran an older version are never re-requested after it upgrades, because
+/// sync vectors only grow, so snapshots are the only recovery path for such a
+/// peer, and only for the records that fit the snapshot bounds. Send podcast
+/// sections only to v4 peers ([`SyncSnapshot::for_peer`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncSnapshot {
     /// Current likes.
@@ -478,6 +1096,164 @@ pub struct SyncSnapshot {
     /// Removed playlist items.
     #[serde(default)]
     pub removed_playlist_items: Vec<SnapshotPlaylistItemTombstone>,
+    /// Podcast subscription registers, including unsubscribed ones (v4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub podcast_subscriptions: Vec<SubscriptionRecord>,
+    /// Podcast share registers, including `shared = false` tombstones (v4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub podcast_shares: Vec<ShareRecord>,
+    /// Episode progress registers (v4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub podcast_progress: Vec<ProgressRecord>,
+    /// Most recent podcast listening sessions (v4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub podcast_listen_sessions: Vec<ListenSession>,
+}
+
+impl SyncSnapshot {
+    /// Whether any podcast section is non-empty.
+    pub fn has_podcast_state(&self) -> bool {
+        !self.podcast_subscriptions.is_empty()
+            || !self.podcast_shares.is_empty()
+            || !self.podcast_progress.is_empty()
+            || !self.podcast_listen_sessions.is_empty()
+    }
+
+    /// Removes all podcast sections.
+    pub fn strip_podcast_state(&mut self) {
+        self.podcast_subscriptions.clear();
+        self.podcast_shares.clear();
+        self.podcast_progress.clear();
+        self.podcast_listen_sessions.clear();
+    }
+
+    /// Copy of the snapshot for a peer: podcast sections only for v4+.
+    pub fn for_peer(&self, peer_version: u16) -> Self {
+        let mut snapshot = self.clone();
+        if !supports_podcasts(peer_version) {
+            snapshot.strip_podcast_state();
+        }
+        snapshot
+    }
+
+    /// Bounds the podcast sections with the default budget
+    /// [`MAX_PODCAST_SNAPSHOT_BYTES`]; see
+    /// [`SyncSnapshot::bound_podcast_state_to`].
+    pub fn bound_podcast_state(&mut self) {
+        self.bound_podcast_state_to(MAX_PODCAST_SNAPSHOT_BYTES);
+    }
+
+    /// Sorts and truncates the podcast sections to the snapshot limits and to
+    /// `budget_bytes` of serialized JSON.
+    ///
+    /// * Subscription records lose `podcast.description`: it is the largest
+    ///   field and every device refreshes channel metadata from the feed. The
+    ///   register (`subscribed`, stamps) and feed aliases are kept whole.
+    /// * Each section is ordered newest first (subscriptions and shares by
+    ///   `(generation, hlc_ms)`, progress by `(generation, hlc_ms)`, sessions
+    ///   by `ended_at_ms`; ties by id) and capped by its `MAX_SNAPSHOT_*`
+    ///   count.
+    /// * Each section has its own share of the budget (subscriptions 25 %,
+    ///   shares 5 %, progress 45 %, sessions 25 %), so large subscription
+    ///   records cannot crowd out progress. Unused budget passes on to the
+    ///   following sections in that order.
+    ///
+    /// Callers pass [`MAX_PODCAST_SNAPSHOT_BYTES`], or less when the rest of
+    /// the message (music snapshot, operations, playback) leaves less room
+    /// under [`MAX_SYNC_LINE`]; see [`podcast_snapshot_budget`].
+    ///
+    /// Records cut here reach a peer only through operations it has not
+    /// acknowledged yet. A peer that skipped podcast operations while it ran
+    /// an older version never receives the cut records: it recovers the newest
+    /// records only, and its play counts can differ from other devices.
+    pub fn bound_podcast_state_to(&mut self, budget_bytes: usize) {
+        let share = |percent: usize| budget_bytes / 100 * percent;
+        let mut budget = 0usize;
+        for record in &mut self.podcast_subscriptions {
+            record.podcast.description = None;
+        }
+        self.podcast_subscriptions.sort_by(|a, b| {
+            (b.generation, b.hlc_ms, &b.op_id, &b.podcast_id).cmp(&(
+                a.generation,
+                a.hlc_ms,
+                &a.op_id,
+                &a.podcast_id,
+            ))
+        });
+        budget += share(25);
+        bound_section(
+            &mut self.podcast_subscriptions,
+            MAX_SNAPSHOT_SUBSCRIPTIONS,
+            &mut budget,
+        );
+        self.podcast_shares.sort_by(|a, b| {
+            (b.generation, b.hlc_ms, &b.op_id, &b.podcast_id).cmp(&(
+                a.generation,
+                a.hlc_ms,
+                &a.op_id,
+                &a.podcast_id,
+            ))
+        });
+        budget += share(5);
+        bound_section(&mut self.podcast_shares, MAX_SNAPSHOT_SHARES, &mut budget);
+        self.podcast_progress.sort_by(|a, b| {
+            (b.generation, b.hlc_ms, &b.op_id, &b.episode_id).cmp(&(
+                a.generation,
+                a.hlc_ms,
+                &a.op_id,
+                &a.episode_id,
+            ))
+        });
+        budget += share(45);
+        bound_section(
+            &mut self.podcast_progress,
+            MAX_SNAPSHOT_PROGRESS,
+            &mut budget,
+        );
+        self.podcast_listen_sessions
+            .sort_by(|a, b| (b.ended_at_ms, &b.session_id).cmp(&(a.ended_at_ms, &a.session_id)));
+        budget += budget_bytes - share(25) - share(5) - share(45);
+        bound_section(
+            &mut self.podcast_listen_sessions,
+            MAX_SNAPSHOT_LISTEN_SESSIONS,
+            &mut budget,
+        );
+    }
+
+    /// Whether the podcast sections respect the per-section count limits.
+    ///
+    /// Receivers should ignore the podcast sections of a snapshot that
+    /// violates them and validate every record before merging it.
+    pub fn podcast_state_within_limits(&self) -> bool {
+        self.podcast_subscriptions.len() <= MAX_SNAPSHOT_SUBSCRIPTIONS
+            && self.podcast_shares.len() <= MAX_SNAPSHOT_SHARES
+            && self.podcast_progress.len() <= MAX_SNAPSHOT_PROGRESS
+            && self.podcast_listen_sessions.len() <= MAX_SNAPSHOT_LISTEN_SESSIONS
+    }
+}
+
+/// Byte budget for the podcast snapshot sections of one message.
+///
+/// `other_bytes` is the serialized size of the message without podcast
+/// sections. The result keeps the whole line under [`MAX_SYNC_LINE`] with a
+/// 64 KiB margin and never exceeds [`MAX_PODCAST_SNAPSHOT_BYTES`].
+pub fn podcast_snapshot_budget(other_bytes: usize) -> usize {
+    MAX_SYNC_LINE
+        .saturating_sub(other_bytes.saturating_add(64 * 1024))
+        .min(MAX_PODCAST_SNAPSHOT_BYTES)
+}
+
+fn bound_section<T: Serialize>(items: &mut Vec<T>, max_items: usize, budget: &mut usize) {
+    let mut keep = 0;
+    for item in items.iter().take(max_items) {
+        let size = serde_json::to_vec(item).map_or(usize::MAX, |bytes| bytes.len() + 1);
+        if size > *budget {
+            break;
+        }
+        *budget -= size;
+        keep += 1;
+    }
+    items.truncate(keep);
 }
 
 /// Snapshot like row.
@@ -923,5 +1699,853 @@ mod tests {
     fn v1_peers_do_not_support_listening_history() {
         assert!(!supports_listen_history(1));
         assert!(supports_listen_history(2));
+    }
+
+    mod podcasts {
+        use super::*;
+        use crate::playback::Command;
+        use crate::podcast::{FeedUrl, MAX_SNAPSHOT_SHARES};
+
+        fn feed() -> FeedUrl {
+            FeedUrl::parse("https://private.example.test/feed?token=s3cr3t").unwrap()
+        }
+
+        fn podcast_id() -> PodcastId {
+            PodcastId::from_feed_url(&feed())
+        }
+
+        fn episode_id() -> EpisodeId {
+            EpisodeId::from_guid(&podcast_id(), "ep-1").unwrap()
+        }
+
+        fn episode() -> PodcastEpisodeRef {
+            PodcastEpisodeRef {
+                podcast_id: podcast_id(),
+                episode_id: episode_id(),
+                feed_url: feed(),
+                podcast_title: "Secret Show".to_string(),
+                episode_title: "Private Episode".to_string(),
+                audio_url: "https://cdn.example.test/private.mp3?sig=xyz".to_string(),
+                mime: Some("audio/mpeg".to_string()),
+                duration_ms: Some(3_600_000),
+                published_at_ms: Some(1_700_000_000_000),
+                season: Some(1),
+                episode_number: Some(3),
+                image_url: None,
+                progress_generation: Some(4),
+            }
+        }
+
+        fn music(id: i64) -> PlaybackTrack {
+            PlaybackTrack {
+                id,
+                title: format!("Song {id}"),
+                track_number: Some(1),
+                disc_number: None,
+                duration_seconds: 200.0,
+                artist_names: vec!["Artist".to_string()],
+                featured_artist_names: Vec::new(),
+                release_id: 7,
+                release_title: "Album".to_string(),
+                release_year: Some(2020),
+                file_path: String::new(),
+                content_id: Some(format!("b3:{}", "a".repeat(64))),
+                audio_format: None,
+                audio_bitrate: None,
+                audio_sample_rate: None,
+                audio_bit_depth: None,
+                file_size_bytes: None,
+                play_count: 0,
+                fed: None,
+                source: None,
+            }
+        }
+
+        fn state(queue: Vec<PlaybackTrack>) -> PlaybackStateWire {
+            PlaybackStateWire {
+                queue,
+                queue_pos: 1,
+                playing: true,
+                paused: false,
+                idle_since_ms: None,
+                position_secs: 42.5,
+                volume: 80,
+                shuffle: false,
+                repeat: PlaybackRepeat::Off,
+                playback_rate: None,
+            }
+        }
+
+        fn mixed() -> PlaybackStateWire {
+            state(vec![
+                music(1),
+                PlaybackTrack::podcast_episode(episode()),
+                music(2),
+            ])
+        }
+
+        fn op(seq: i64, payload: SyncOpPayload) -> SyncOpWire {
+            SyncOpWire {
+                op_id: format!("dev-a:{seq}"),
+                origin_device_id: "dev-a".to_string(),
+                seq,
+                hlc_ms: 1_000 + seq,
+                payload,
+            }
+        }
+
+        fn session() -> ListenSession {
+            ListenSession {
+                session_id: "s-1".to_string(),
+                episode_id: episode_id(),
+                podcast_id: podcast_id(),
+                device_id: "dev-a".to_string(),
+                started_at_ms: 10,
+                ended_at_ms: 20,
+                start_position_ms: 0,
+                end_position_ms: 60_000,
+                listened_ms: 60_000,
+                completed: false,
+            }
+        }
+
+        fn podcast_ops() -> Vec<SyncOpPayload> {
+            vec![
+                SyncOpPayload::PodcastSubscriptionSet {
+                    podcast_id: podcast_id(),
+                    subscribed: true,
+                    podcast: PodcastMeta {
+                        feed_url: feed(),
+                        title: "Secret Show".to_string(),
+                        author: None,
+                        description: Some("About things".to_string()),
+                        link: None,
+                        image_url: None,
+                    },
+                    feed_aliases: vec![feed()],
+                    generation: 1,
+                },
+                SyncOpPayload::PodcastShareSet {
+                    podcast_id: podcast_id(),
+                    shared: false,
+                    generation: 2,
+                },
+                SyncOpPayload::PodcastFeedAliasesAdded {
+                    podcast_id: podcast_id(),
+                    feed_aliases: vec![FeedUrl::parse("https://moved.example.test/feed").unwrap()],
+                },
+                SyncOpPayload::PodcastProgressSet {
+                    episode_id: episode_id(),
+                    podcast_id: podcast_id(),
+                    position_ms: 120_000,
+                    status: ProgressStatus::InProgress,
+                    generation: 3,
+                    session_id: "s-1".to_string(),
+                    episode: Some(episode()),
+                },
+                SyncOpPayload::PodcastListenRecorded {
+                    session: session(),
+                    episode: None,
+                },
+            ]
+        }
+
+        #[test]
+        fn podcast_ops_round_trip_and_materialize() {
+            let kinds = [
+                "podcast_subscription_set",
+                "podcast_share_set",
+                "podcast_feed_aliases_added",
+                "podcast_progress_set",
+                "podcast_listen_recorded",
+            ];
+            for (seq, (payload, kind)) in podcast_ops().into_iter().zip(kinds).enumerate() {
+                let op = op(seq as i64 + 1, payload);
+                let json = serde_json::to_string(&op).unwrap();
+                assert!(json.contains(&format!(r#""kind":"{kind}""#)), "{json}");
+                let back: SyncOpWire = serde_json::from_str(&json).unwrap();
+                assert_eq!(back, op);
+                assert!(op.payload.is_podcast());
+                op.validate_podcast().unwrap();
+            }
+            let ops: Vec<SyncOpWire> = podcast_ops()
+                .into_iter()
+                .enumerate()
+                .map(|(i, payload)| op(i as i64 + 1, payload))
+                .collect();
+            let subscription = ops[0].podcast_subscription().unwrap();
+            assert_eq!(
+                (subscription.hlc_ms, subscription.op_id.as_str()),
+                (1_001, "dev-a:1")
+            );
+            assert!(subscription.subscribed);
+            assert_eq!(subscription.generation, 1);
+            let share = ops[1].podcast_share().unwrap();
+            assert!(!share.shared);
+            assert_eq!(share.generation, 2);
+            let (alias_podcast, aliases) = ops[2].podcast_feed_aliases().unwrap();
+            assert_eq!(alias_podcast, &podcast_id());
+            let mut with_alias = subscription.clone();
+            with_alias.add_feed_aliases(aliases);
+            assert!(with_alias.feed_aliases.contains(&aliases[0]));
+            // The alias operation never touches the register.
+            assert_eq!(with_alias.order_key(), subscription.order_key());
+            assert_eq!(with_alias.subscribed, subscription.subscribed);
+            let progress = ops[3].podcast_progress().unwrap();
+            assert_eq!(progress.device_id, "dev-a");
+            assert_eq!(progress.op_id, "dev-a:4");
+            assert_eq!(progress.generation, 3);
+            assert_eq!(ops[4].podcast_listen_session(), Some(&session()));
+            assert!(ops[0].podcast_share().is_none());
+            assert!(ops[0].podcast_feed_aliases().is_none());
+        }
+
+        #[test]
+        fn tombstone_rules() {
+            let ops = podcast_ops();
+            let unsubscribe = SyncOpPayload::PodcastSubscriptionSet {
+                podcast_id: podcast_id(),
+                subscribed: false,
+                podcast: match &ops[0] {
+                    SyncOpPayload::PodcastSubscriptionSet { podcast, .. } => podcast.clone(),
+                    _ => unreachable!(),
+                },
+                feed_aliases: Vec::new(),
+                generation: 3,
+            };
+            assert!(!unsubscribe.is_tombstone(), "unsubscribe is LWW state");
+            // share=false protects privacy: compacting it would let a stale
+            // share=true delivered again republish the podcast.
+            assert!(!ops[1].is_tombstone(), "share=false is LWW state");
+            let share = SyncOpPayload::PodcastShareSet {
+                podcast_id: podcast_id(),
+                shared: true,
+                generation: 4,
+            };
+            assert!(!share.is_tombstone());
+            for payload in &ops {
+                assert!(!payload.is_tombstone(), "{payload:?}");
+            }
+        }
+
+        #[test]
+        fn invalid_podcast_ops_are_detected() {
+            let mut foreign = session();
+            foreign.device_id = "dev-b".to_string();
+            let op1 = op(
+                1,
+                SyncOpPayload::PodcastListenRecorded {
+                    session: foreign,
+                    episode: None,
+                },
+            );
+            assert!(op1.validate_podcast().is_err());
+            let mut wrong = episode();
+            wrong.episode_id = EpisodeId::from_guid(&podcast_id(), "other").unwrap();
+            let op2 = op(
+                2,
+                SyncOpPayload::PodcastProgressSet {
+                    episode_id: episode_id(),
+                    podcast_id: podcast_id(),
+                    position_ms: 1,
+                    status: ProgressStatus::InProgress,
+                    generation: 1,
+                    session_id: "s".to_string(),
+                    episode: Some(wrong),
+                },
+            );
+            assert!(op2.validate_podcast().is_err());
+            let op3 = op(
+                3,
+                SyncOpPayload::PodcastProgressSet {
+                    episode_id: episode_id(),
+                    podcast_id: podcast_id(),
+                    position_ms: -5,
+                    status: ProgressStatus::InProgress,
+                    generation: 1,
+                    session_id: "s".to_string(),
+                    episode: None,
+                },
+            );
+            assert!(op3.validate_podcast().is_err());
+            // Music operations are not affected.
+            let like = op(
+                4,
+                SyncOpPayload::TrackLikeSet {
+                    content_id: "b3:x".to_string(),
+                    liked: true,
+                    fed: None,
+                },
+            );
+            like.validate_podcast().unwrap();
+            let empty_aliases = op(
+                5,
+                SyncOpPayload::PodcastFeedAliasesAdded {
+                    podcast_id: podcast_id(),
+                    feed_aliases: Vec::new(),
+                },
+            );
+            assert!(empty_aliases.validate_podcast().is_err());
+        }
+
+        #[test]
+        fn malformed_ids_and_feed_urls_reject_the_whole_message() {
+            // Pins the documented behaviour: ids and feed URLs are validated
+            // while deserializing, so a non-canonical value is a schema
+            // violation of the whole message, not a skippable operation.
+            let like = op(
+                1,
+                SyncOpPayload::TrackLikeSet {
+                    content_id: "b3:x".to_string(),
+                    liked: true,
+                    fed: None,
+                },
+            );
+            let share = op(
+                2,
+                SyncOpPayload::PodcastShareSet {
+                    podcast_id: podcast_id(),
+                    shared: true,
+                    generation: 1,
+                },
+            );
+            let batch = serde_json::to_string(&vec![like, share]).unwrap();
+            serde_json::from_str::<Vec<SyncOpWire>>(&batch).unwrap();
+            let upper = batch.replace(podcast_id().as_str(), &podcast_id().as_str().to_uppercase());
+            assert!(serde_json::from_str::<Vec<SyncOpWire>>(&upper).is_err());
+            let subscription = op(3, podcast_ops().remove(0));
+            let json = serde_json::to_string(&subscription).unwrap();
+            let non_canonical = json.replace(
+                "https://private.example.test/feed",
+                "HTTPS://private.example.test:443/feed",
+            );
+            assert_ne!(json, non_canonical);
+            assert!(serde_json::from_str::<SyncOpWire>(&non_canonical).is_err());
+        }
+
+        #[test]
+        fn legacy_v3_json_still_parses() {
+            let track = r#"{"id":5,"title":"T","track_number":null,"disc_number":null,
+                "duration_seconds":1.0,"release_id":1,"release_title":"R","release_year":null,
+                "content_id":null,"audio_format":null,"audio_bitrate":null,
+                "audio_sample_rate":null,"audio_bit_depth":null,"file_size_bytes":null}"#;
+            let track: PlaybackTrack = serde_json::from_str(track).unwrap();
+            assert_eq!(track.source, None);
+            let state = r#"{"queue":[],"playing":false,"paused":true,"position_secs":0.0,
+                "shuffle":false,"repeat":"off"}"#;
+            let state: PlaybackStateWire = serde_json::from_str(state).unwrap();
+            assert_eq!(state.playback_rate, None);
+            let profile = r#"{"kind":"device_profile_set","name":"n","client_version":"1",
+                "endpoint_ticket":"t","endpoint_id":"e"}"#;
+            match serde_json::from_str::<SyncOpPayload>(profile).unwrap() {
+                SyncOpPayload::DeviceProfileSet {
+                    protocol_version, ..
+                } => {
+                    assert_eq!(protocol_version, None)
+                }
+                other => panic!("{other:?}"),
+            }
+            let snapshot: SyncSnapshot =
+                serde_json::from_str(r#"{"likes":[],"playlists":[]}"#).unwrap();
+            assert!(!snapshot.has_podcast_state());
+        }
+
+        #[test]
+        fn music_only_messages_keep_the_v3_shape() {
+            let json = serde_json::to_value(state(vec![music(1)])).unwrap();
+            assert!(json.get("playback_rate").is_none());
+            assert!(json["queue"][0].get("source").is_none());
+            let snapshot = serde_json::to_value(SyncSnapshot::default()).unwrap();
+            assert!(snapshot.get("podcast_progress").is_none());
+            let profile = serde_json::to_value(SyncOpPayload::DeviceProfileSet {
+                name: "n".to_string(),
+                client_version: "1".to_string(),
+                endpoint_ticket: "t".to_string(),
+                endpoint_id: "e".to_string(),
+                protocol_version: None,
+            })
+            .unwrap();
+            assert!(profile.get("protocol_version").is_none());
+        }
+
+        #[test]
+        fn podcast_queue_items_round_trip() {
+            let mut state = mixed();
+            state.playback_rate = Some(1.5);
+            let json = serde_json::to_string(&state).unwrap();
+            assert!(json.contains(r#""kind":"podcast_episode""#));
+            let back: PlaybackStateWire = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+            let item = &back.queue[1];
+            assert_eq!(item.podcast_episode_ref(), Some(&episode()));
+            assert_eq!(item.file_path, "");
+            assert_eq!(item.id, 0);
+            assert_eq!(item.content_id, None);
+            assert_eq!(item.duration_seconds, 3_600.0);
+            let explicit_music = PlaybackTrack {
+                source: Some(PlaybackSource::Music),
+                ..music(3)
+            };
+            let json = serde_json::to_string(&explicit_music).unwrap();
+            assert!(json.contains(r#""source":{"kind":"music"}"#), "{json}");
+            assert_eq!(
+                serde_json::from_str::<PlaybackTrack>(&json).unwrap(),
+                explicit_music
+            );
+        }
+
+        /// The v3 operation enum, as compiled into deployed v3 clients.
+        mod v3 {
+            use serde::Deserialize;
+
+            #[derive(Debug, Deserialize)]
+            #[serde(tag = "kind", rename_all = "snake_case")]
+            #[allow(dead_code)]
+            pub enum SyncOpPayload {
+                TrackLikeSet {
+                    content_id: String,
+                    liked: bool,
+                },
+                PlaylistCreated {
+                    playlist_id: String,
+                    title: String,
+                },
+                PlaylistRenamed {
+                    playlist_id: String,
+                    title: String,
+                },
+                PlaylistDeleted {
+                    playlist_id: String,
+                },
+                PlaylistTrackAdded {
+                    playlist_id: String,
+                    content_id: String,
+                    position: i64,
+                },
+                PlaylistTrackRemoved {
+                    playlist_id: String,
+                    content_id: String,
+                },
+                DeviceProfileSet {
+                    name: String,
+                    client_version: String,
+                    endpoint_ticket: String,
+                    endpoint_id: String,
+                },
+                DeviceTrusted {
+                    target_device_id: String,
+                },
+                DeviceRevoked {
+                    target_device_id: String,
+                    target_max_seq_seen: i64,
+                },
+                PlaybackCommand {
+                    target_device_id: String,
+                },
+                ListenRecorded {
+                    event: serde_json::Value,
+                },
+            }
+
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            pub struct SyncOpWire {
+                pub op_id: String,
+                pub origin_device_id: String,
+                pub seq: i64,
+                pub hlc_ms: i64,
+                pub payload: SyncOpPayload,
+            }
+        }
+
+        #[test]
+        fn v3_peers_cannot_parse_new_kinds_so_gating_is_mandatory() {
+            let like = op(
+                1,
+                SyncOpPayload::TrackLikeSet {
+                    content_id: "b3:x".to_string(),
+                    liked: true,
+                    fed: None,
+                },
+            );
+            let profile = op(
+                2,
+                SyncOpPayload::DeviceProfileSet {
+                    name: "n".to_string(),
+                    client_version: "2".to_string(),
+                    endpoint_ticket: "t".to_string(),
+                    endpoint_id: "e".to_string(),
+                    protocol_version: Some(DEVICE_SYNC_PROTOCOL_VERSION),
+                },
+            );
+            // Additive fields are fine for v3.
+            for compatible in [&like, &profile] {
+                let json = serde_json::to_string(compatible).unwrap();
+                serde_json::from_str::<v3::SyncOpWire>(&json).unwrap();
+            }
+            for (seq, payload) in podcast_ops().into_iter().enumerate() {
+                let podcast = op(seq as i64 + 10, payload);
+                let json = serde_json::to_string(&podcast).unwrap();
+                assert!(serde_json::from_str::<v3::SyncOpWire>(&json).is_err());
+                // One unknown op poisons the whole batch of a Hello message.
+                let batch = serde_json::to_string(&vec![like.clone(), podcast.clone()]).unwrap();
+                assert!(serde_json::from_str::<Vec<v3::SyncOpWire>>(&batch).is_err());
+                assert!(!op_allowed_for_peer(&podcast.payload, 3));
+                assert!(op_allowed_for_peer(&podcast.payload, 4));
+            }
+        }
+
+        #[test]
+        fn gating_boundaries() {
+            assert!(!supports_podcasts(3));
+            assert!(supports_podcasts(4));
+            assert!(supports_podcasts(5));
+            let listen = SyncOpPayload::ListenRecorded {
+                event: listen(150_000, Some(300_000), ListenEndReason::Finished),
+            };
+            assert!(!op_allowed_for_peer(&listen, 1));
+            assert!(op_allowed_for_peer(&listen, 2));
+            for payload in podcast_ops() {
+                for version in 0..=3 {
+                    assert!(!op_allowed_for_peer(&payload, version));
+                }
+                assert!(op_allowed_for_peer(&payload, 4));
+            }
+            let like = SyncOpPayload::TrackLikeSet {
+                content_id: "b3:x".to_string(),
+                liked: false,
+                fed: None,
+            };
+            assert!(op_allowed_for_peer(&like, 1));
+
+            let command = |state| SyncOpPayload::PlaybackCommand {
+                target_device_id: "dev-b".to_string(),
+                command: Command::ActiveChanged {
+                    active_device_id: "dev-b".to_string(),
+                    active_device_name: "B".to_string(),
+                    state,
+                },
+                authority: None,
+            };
+            assert!(op_allowed_for_peer(&command(state(vec![music(1)])), 3));
+            assert!(!op_allowed_for_peer(&command(mixed()), 3));
+            assert!(op_allowed_for_peer(&command(mixed()), 4));
+
+            assert!(playback_allowed_for_peer(&state(vec![music(1)]), 1));
+            assert!(!playback_allowed_for_peer(&mixed(), 3));
+            assert!(playback_allowed_for_peer(&mixed(), 4));
+            let redacted = redact_for_jam(mixed());
+            assert!(!playback_allowed_for_peer(&redacted, 3));
+
+            assert!(playback_command_allowed_from_peer(
+                &state(vec![music(1)]),
+                3
+            ));
+            assert!(!playback_command_allowed_from_peer(&mixed(), 3));
+            assert!(playback_command_allowed_from_peer(&mixed(), 4));
+        }
+
+        #[test]
+        fn profile_versions_are_never_substituted() {
+            assert_eq!(profile_protocol_version(Some(4), Some(3)), 4);
+            assert_eq!(profile_protocol_version(None, Some(3)), 3);
+            assert_eq!(
+                profile_protocol_version(None, None),
+                UNREPORTED_PROTOCOL_VERSION
+            );
+            assert!(!supports_podcasts(profile_protocol_version(None, None)));
+            // A self-report may lower the version (downgrade).
+            assert_eq!(profile_protocol_version(Some(3), Some(4)), 3);
+        }
+
+        #[test]
+        fn relayed_versions_only_raise_the_stored_version() {
+            // A deployed v3 relay forwards every device with its own constant.
+            assert_eq!(relayed_protocol_version(3, Some(4)), 4);
+            assert!(supports_podcasts(relayed_protocol_version(3, Some(4))));
+            assert_eq!(relayed_protocol_version(4, Some(3)), 4);
+            assert_eq!(relayed_protocol_version(3, None), 3);
+            assert_eq!(relayed_protocol_version(1, Some(2)), 2);
+        }
+
+        #[test]
+        fn pair_requests_gate_by_the_invite_version() {
+            let invite = InviteWire {
+                v: 1,
+                ticket: "t".to_string(),
+                device_id: "inviter".to_string(),
+                invite_id: "i".to_string(),
+                secret: "s".to_string(),
+                expires_at_ms: 1,
+                protocol_version: None,
+            };
+            // Invites of older clients carry no version: assume the oldest.
+            let legacy = r#"{"v":1,"t":"t","d":"inviter","i":"i","s":"s","e":1}"#;
+            let parsed: InviteWire = serde_json::from_str(legacy).unwrap();
+            assert_eq!(parsed, invite);
+            assert_eq!(serde_json::to_string(&invite).unwrap(), legacy);
+            assert_eq!(
+                parsed.inviter_protocol_version(),
+                UNREPORTED_PROTOCOL_VERSION
+            );
+            let snapshot = SyncSnapshot {
+                podcast_listen_sessions: vec![session()],
+                ..SyncSnapshot::default()
+            };
+            assert!(
+                !snapshot
+                    .for_peer(parsed.inviter_protocol_version())
+                    .has_podcast_state()
+            );
+            for payload in podcast_ops() {
+                assert!(!op_allowed_for_peer(
+                    &payload,
+                    parsed.inviter_protocol_version()
+                ));
+            }
+            assert!(!playback_allowed_for_peer(
+                &mixed(),
+                parsed.inviter_protocol_version()
+            ));
+            let current = InviteWire {
+                protocol_version: Some(DEVICE_SYNC_PROTOCOL_VERSION),
+                ..invite
+            };
+            let link = encode_invite(&current).unwrap();
+            let back = parse_invite(&link).unwrap();
+            assert_eq!(back, current);
+            assert!(supports_podcasts(back.inviter_protocol_version()));
+        }
+
+        #[test]
+        fn jam_redaction_hides_private_items() {
+            let original = mixed();
+            let redacted = redact_for_jam(original.clone());
+            assert_eq!(redacted.queue.len(), 3);
+            assert_eq!(redacted.queue[0], original.queue[0]);
+            assert_eq!(redacted.queue[2], original.queue[2]);
+            assert!(redacted.queue[1].is_private_placeholder());
+            assert_eq!(redacted.queue[1].title, PRIVATE_ITEM_TITLE);
+            assert_eq!(redacted.queue_pos, original.queue_pos);
+            assert_eq!(redacted.position_secs, original.position_secs);
+            let json = serde_json::to_string(&redacted).unwrap();
+            for secret in [
+                "Secret Show",
+                "Private Episode",
+                "private.mp3",
+                "s3cr3t",
+                "private.example.test",
+                podcast_id().as_str(),
+                episode_id().as_str(),
+            ] {
+                assert!(!json.contains(secret), "{secret} leaked: {json}");
+            }
+            assert!(json.contains(r#""source":{"kind":"private"}"#));
+            // Redaction is idempotent.
+            assert_eq!(redact_for_jam(redacted.clone()), redacted);
+        }
+
+        #[test]
+        fn jam_commands_cannot_inject_or_drop_private_items() {
+            let host = mixed();
+            let set = |state| Command::SetState { state, seek: false };
+            // Participants see placeholders; echoing them back is allowed
+            // and maps to the host's episodes.
+            let mut seen = redact_for_jam(host.clone());
+            seen.paused = true;
+            assert!(jam_command_allowed(&set(seen.clone())));
+            let restored = restore_jam_private_items(&host, seen.clone()).unwrap();
+            assert_eq!(restored.queue, host.queue);
+            assert!(restored.paused);
+            // Reordering music around the placeholder keeps the episode.
+            let mut reordered = seen.clone();
+            reordered.queue.swap(0, 2);
+            let restored = restore_jam_private_items(&host, reordered).unwrap();
+            assert_eq!(restored.queue[1].podcast_episode_ref(), Some(&episode()));
+            // Injecting a real episode is rejected.
+            let injected = state(vec![music(1), PlaybackTrack::podcast_episode(episode())]);
+            assert!(!jam_command_allowed(&set(injected.clone())));
+            assert!(restore_jam_private_items(&host, injected).is_none());
+            // Dropping or duplicating placeholders is rejected.
+            let mut dropped = seen.clone();
+            dropped.queue.remove(1);
+            assert!(restore_jam_private_items(&host, dropped).is_none());
+            let mut duplicated = seen;
+            duplicated.queue.push(PlaybackTrack::private_placeholder());
+            assert!(restore_jam_private_items(&host, duplicated).is_none());
+            // Music-only Jam is unaffected.
+            let music_only = state(vec![music(1)]);
+            assert!(jam_command_allowed(&set(music_only.clone())));
+            assert_eq!(
+                restore_jam_private_items(&music_only, music_only.clone()),
+                Some(music_only)
+            );
+        }
+
+        #[test]
+        fn snapshot_sections_round_trip_and_are_gated() {
+            let ops: Vec<SyncOpWire> = podcast_ops()
+                .into_iter()
+                .enumerate()
+                .map(|(i, payload)| op(i as i64 + 1, payload))
+                .collect();
+            let snapshot = SyncSnapshot {
+                podcast_subscriptions: vec![ops[0].podcast_subscription().unwrap()],
+                podcast_shares: vec![ops[1].podcast_share().unwrap()],
+                podcast_progress: vec![ops[3].podcast_progress().unwrap()],
+                podcast_listen_sessions: vec![session()],
+                ..SyncSnapshot::default()
+            };
+            let message = WireMessage::Hello {
+                group_id: "g".to_string(),
+                profile: DeviceProfileWire {
+                    device_id: "dev-a".to_string(),
+                    name: "A".to_string(),
+                    client_version: "1".to_string(),
+                    protocol_version: DEVICE_SYNC_PROTOCOL_VERSION,
+                    endpoint_id: "e".to_string(),
+                    endpoint_ticket: "t".to_string(),
+                    revoked: false,
+                    revoke_cutoff_seq: None,
+                    updated_at_ms: 0,
+                },
+                devices: Vec::new(),
+                vector: BTreeMap::new(),
+                ops,
+                snapshot: snapshot.clone(),
+                playback: None,
+            };
+            let json = serde_json::to_string(&message).unwrap();
+            assert_eq!(serde_json::from_str::<WireMessage>(&json).unwrap(), message);
+            assert!(snapshot.has_podcast_state());
+            assert!(!snapshot.for_peer(3).has_podcast_state());
+            assert_eq!(snapshot.for_peer(4), snapshot);
+        }
+
+        #[test]
+        fn snapshot_bounds_accept_the_limit_and_cut_the_next_record() {
+            let shares = |count: usize| -> Vec<ShareRecord> {
+                (0..count)
+                    .map(|i| ShareRecord {
+                        podcast_id: PodcastId::from_feed_url(
+                            &FeedUrl::parse(&format!("https://a.test/{i}")).unwrap(),
+                        ),
+                        shared: i % 2 == 0,
+                        generation: 1,
+                        hlc_ms: i as i64,
+                        op_id: format!("dev:{i}"),
+                    })
+                    .collect()
+            };
+            let mut at = SyncSnapshot {
+                podcast_shares: shares(MAX_SNAPSHOT_SHARES),
+                ..SyncSnapshot::default()
+            };
+            assert!(at.podcast_state_within_limits());
+            at.bound_podcast_state();
+            assert_eq!(at.podcast_shares.len(), MAX_SNAPSHOT_SHARES);
+            let mut over = SyncSnapshot {
+                podcast_shares: shares(MAX_SNAPSHOT_SHARES + 1),
+                ..SyncSnapshot::default()
+            };
+            assert!(!over.podcast_state_within_limits());
+            over.bound_podcast_state();
+            assert_eq!(over.podcast_shares.len(), MAX_SNAPSHOT_SHARES);
+            // Newest first: the oldest record is the one cut.
+            assert_eq!(over.podcast_shares[0].hlc_ms, MAX_SNAPSHOT_SHARES as i64);
+            assert!(over.podcast_shares.iter().all(|share| share.hlc_ms > 0));
+        }
+
+        #[test]
+        fn snapshot_byte_budget_is_enforced() {
+            // Worst-case subscription records: long Cyrillic title, author and
+            // description, plus a few progress registers.
+            let big: String = "я".repeat(crate::podcast::MAX_DESCRIPTION_CHARS);
+            let title: String = big.chars().take(crate::podcast::MAX_TITLE_CHARS).collect();
+            let subscriptions: Vec<SubscriptionRecord> = (0..MAX_SNAPSHOT_SUBSCRIPTIONS)
+                .map(|i| {
+                    let url = FeedUrl::parse(&format!("https://a.test/{i}")).unwrap();
+                    SubscriptionRecord {
+                        podcast_id: PodcastId::from_feed_url(&url),
+                        subscribed: true,
+                        podcast: PodcastMeta {
+                            feed_url: url,
+                            title: title.clone(),
+                            author: Some(title.clone()),
+                            description: Some(big.clone()),
+                            link: None,
+                            image_url: None,
+                        },
+                        feed_aliases: Vec::new(),
+                        generation: 1,
+                        hlc_ms: i as i64,
+                        op_id: format!("dev:{i}"),
+                    }
+                })
+                .collect();
+            let progress: Vec<ProgressRecord> = (0..10)
+                .map(|i| {
+                    op(
+                        i + 1,
+                        SyncOpPayload::PodcastProgressSet {
+                            episode_id: EpisodeId::from_guid(&podcast_id(), &format!("e{i}"))
+                                .unwrap(),
+                            podcast_id: podcast_id(),
+                            position_ms: 1_000,
+                            status: ProgressStatus::InProgress,
+                            generation: 1,
+                            session_id: "s".to_string(),
+                            episode: None,
+                        },
+                    )
+                    .podcast_progress()
+                    .unwrap()
+                })
+                .collect();
+            let original = SyncSnapshot {
+                podcast_subscriptions: subscriptions,
+                podcast_progress: progress,
+                podcast_listen_sessions: vec![session()],
+                ..SyncSnapshot::default()
+            };
+            let section_bytes = |snapshot: &SyncSnapshot| -> usize {
+                fn sum<T: Serialize>(items: &[T]) -> usize {
+                    items
+                        .iter()
+                        .map(|item| serde_json::to_vec(item).unwrap().len() + 1)
+                        .sum()
+                }
+                sum(&snapshot.podcast_subscriptions)
+                    + sum(&snapshot.podcast_shares)
+                    + sum(&snapshot.podcast_progress)
+                    + sum(&snapshot.podcast_listen_sessions)
+            };
+            let mut snapshot = original.clone();
+            snapshot.bound_podcast_state();
+            assert!(section_bytes(&snapshot) <= MAX_PODCAST_SNAPSHOT_BYTES);
+            assert!(
+                snapshot
+                    .podcast_subscriptions
+                    .iter()
+                    .all(|record| record.podcast.description.is_none()),
+                "descriptions are refreshed from RSS, not snapshotted"
+            );
+            assert!(snapshot.podcast_subscriptions.len() < MAX_SNAPSHOT_SUBSCRIPTIONS);
+            assert!(!snapshot.podcast_subscriptions.is_empty());
+            // Subscriptions cannot crowd out progress and sessions.
+            assert_eq!(snapshot.podcast_progress.len(), 10);
+            assert_eq!(snapshot.podcast_listen_sessions.len(), 1);
+            assert!(serde_json::to_vec(&snapshot).unwrap().len() < MAX_SYNC_LINE);
+
+            // A smaller budget, for a message whose other parts are large.
+            let budget = podcast_snapshot_budget(6 * 1024 * 1024);
+            assert!(budget < MAX_PODCAST_SNAPSHOT_BYTES);
+            let mut small = original;
+            small.bound_podcast_state_to(budget);
+            assert!(section_bytes(&small) <= budget);
+            assert_eq!(small.podcast_progress.len(), 10);
+            assert_eq!(podcast_snapshot_budget(0), MAX_PODCAST_SNAPSHOT_BYTES);
+            assert_eq!(podcast_snapshot_budget(MAX_SYNC_LINE), 0);
+        }
     }
 }

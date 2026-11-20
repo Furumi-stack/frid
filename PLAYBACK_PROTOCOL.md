@@ -97,8 +97,9 @@ is a runtime input, not a persisted setting.
 ## Versioning and rollout
 
 The library-sync JSON ALPN remains `furumi/sync/2`; catalog, pairing and library
-data do not require a new transport. Device profiles advertise protocol version
-3. Coordination envelopes independently carry version 1. Snapshot coordination
+data do not require a new transport. Device profiles advertised protocol
+version 3 when coordination was introduced (version 4 adds podcast queue items,
+see below). Coordination envelopes independently carry version 1. Snapshot coordination
 and operation authority are additive optional JSON fields so library-sync
 records from older clients still deserialize. Upgraded clients ignore legacy
 personal playback snapshots/commands without the coordination envelope.
@@ -108,6 +109,58 @@ The shared generic `Snapshot<S>` and `Command<S>` keep state conversion in the
 applications while preventing divergent control message definitions. These
 envelopes use JSON, not a backwards-compatible promise for postcard layouts.
 Do not change Jam's independent authority by interpreting personal stamps there.
+
+## Protocol v4: podcast queue items
+
+Device profiles advertise protocol version 4. The JSON ALPN stays
+`furumi/sync/2` and the coordination envelope stays version 1. Version 4 adds
+to the portable queue DTO:
+
+- `PlaybackTrack.source`: `music`, `podcast_episode` with a self-contained
+  `PodcastEpisodeRef`, or `private` (Jam placeholder). It is omitted for
+  music, so music-only state serializes exactly as in v3. Podcast episodes are
+  never encoded as negative ids or URLs in `file_path`. Queue items carry
+  `PodcastEpisodeRef.progress_generation`, the greatest progress generation
+  the sender has seen for the episode.
+- `PlaybackStateWire.playback_rate`: reserved, omitted when unset. Treat a
+  missing or unsupported value as 1.0.
+
+A v3 client does not know `source` and ignores it: it would treat an episode
+as a broken music item (id 0, no content id) and forward the queue that way,
+losing the episode for every device. `PlaybackSource` is also a closed enum
+for v4 clients, so a future variant needs a new protocol version. Adapters
+therefore apply the shared helpers from `music_dht::device_sync`:
+
+1. Send a playback snapshot to a peer only when
+   `playback_allowed_for_peer(state, peer_version)` holds; otherwise send
+   `None`.
+2. Refuse an explicit transfer to a device below v4 while the queue contains
+   podcast items and show that the target needs an update. The decision uses
+   the version that device reported itself (`profile_protocol_version`;
+   profiles relayed by other devices only raise it, `relayed_protocol_version`),
+   never the local constant. Do not strip episodes from the queue.
+3. Ignore `SetState`/`ActiveChanged` from peers below v4 while the local
+   queue contains podcast items (`playback_command_allowed_from_peer`).
+4. A stamped `playback_command` operation with podcast items is itself gated
+   by `op_allowed_for_peer`.
+5. A `PairRequest` is sent before the invite consumer hears from the inviter:
+   gate its playback snapshot by `InviteWire::inviter_protocol_version()`
+   (version 1 for invites without one).
+
+A handoff of a podcast episode records the position and the play/pause intent
+first, transfers the queue with its sources, and lets the receiver open the
+publisher's HTTP source and seek. Ownership still changes only through the
+claim, so a late response cannot make the previous owner resume audio. The
+durable episode progress is a separate register; see `PODCASTS.md`. Only the
+receiver writes the handoff's explicit progress action, with
+`ProgressRecord::explicit_generation(max(local, progress_generation))`; the
+sender writes a final checkpoint at its session generation.
+
+Jam hosts send `music_dht::jam::redact_jam_snapshot`, which replaces podcast
+items with opaque `private` placeholders and drops the personal coordination
+envelope. They reject participant commands with real episodes
+(`jam_command_allowed`) and map placeholders back with
+`restore_jam_private_items` before applying a participant's state.
 
 For local integration checks, patch the three frid crates with Cargo's external
 `--config` mechanism. Keep released dependency declarations and lockfiles in

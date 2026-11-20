@@ -19,3 +19,7 @@ publication, clients can depend on the released crate version instead.
 `Library::open(default_db_path()?)` opens the same platform-native Furumi
 library used by every client. Connections use WAL, foreign keys, and a busy
 timeout so independently running clients can safely share the database.
+
+Version 0.3 follows `music-dht` 0.6, whose device-sync and podcast contract
+types it re-exposes. Podcast persistence is not part of this release; it will
+implement the rules of the workspace `PODCASTS.md`.

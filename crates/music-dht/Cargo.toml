@@ -1,6 +1,6 @@
 [package]
 name = "music-dht"
-version = "0.5.0"
+version = "0.6.0"
 description = "Distributed music library search: a Kademlia-style DHT on top of federation-net"
 readme = "README.md"
 documentation = "https://docs.rs/music-dht"
@@ -26,6 +26,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 data-encoding = { workspace = true }
+quick-xml = { workspace = true, optional = true }
+encoding_rs = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[features]
+# RSS 2.0 / RSS 1.0 / Atom podcast feed parser (`music_dht::podcast::feed`).
+podcast-feed = ["dep:quick-xml", "dep:encoding_rs", "dep:url"]
 
 [dev-dependencies]
 anyhow = { workspace = true }
