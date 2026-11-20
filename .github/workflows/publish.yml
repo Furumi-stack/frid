@@ -62,11 +62,11 @@ jobs:
           toolchain: "1.97"
       - name: Publish mirror to Gitea without rebuilding
         env:
-          GITEA_PACKAGES_TOKEN: ${{ secrets.GITEA_PACKAGES_TOKEN }}
+          CARGO_REGISTRIES_GITEA_TOKEN: ${{ secrets.CARGO_REGISTRIES_GITEA_TOKEN }}
         run: |
-          if [ -z "$GITEA_PACKAGES_TOKEN" ]; then
-            echo "::error::Add the GITEA_PACKAGES_TOKEN repository Actions secret, then rerun this workflow."
+          if [ -z "$CARGO_REGISTRIES_GITEA_TOKEN" ]; then
+            echo "::error::Add the CARGO_REGISTRIES_GITEA_TOKEN repository Actions secret, then rerun this workflow."
             exit 1
           fi
-          export CARGO_REGISTRIES_GITEA_TOKEN="Bearer $GITEA_PACKAGES_TOKEN"
+          export CARGO_REGISTRIES_GITEA_TOKEN="Bearer $CARGO_REGISTRIES_GITEA_TOKEN"
           python3 scripts/publish_crates.py --registry gitea --no-verify

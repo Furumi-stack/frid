@@ -86,7 +86,7 @@ Add these repository Actions secrets:
 
 - `CARGO_REGISTRY_TOKEN`: a crates.io API token with publish access to
   `federation-net`, `music-dht` and `furumi-library`.
-- `GITEA_PACKAGES_TOKEN`: a raw Gitea personal access token with
+- `CARGO_REGISTRIES_GITEA_TOKEN`: a raw Gitea personal access token with
   `write:package` and permission to publish under the `Furumi` organization.
   Create it under user Settings → Applications. The workflow adds the
   required `Bearer` prefix itself; no username secret is needed.

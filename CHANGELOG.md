@@ -8,7 +8,7 @@ Releases `music-dht 0.6.0` and `furumi-library 0.3.0`.
 - Tag-driven CI verifies release packages once, then publishes to crates.io
   and the Furumi Gitea Cargo mirror in parallel jobs without recompiling.
   Already published versions are skipped independently in each registry.
-  Authentication uses `CARGO_REGISTRY_TOKEN` and `GITEA_PACKAGES_TOKEN`.
+  Authentication uses `CARGO_REGISTRY_TOKEN` and `CARGO_REGISTRIES_GITEA_TOKEN`.
 
 ### Podcast discovery (`podcast_dht`)
 
