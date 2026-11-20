@@ -6,9 +6,13 @@
 //!
 //! All methods take `&self` and lock the connection internally, so an
 //! `Arc<Library>` can be shared across blocking tasks.
+//!
+//! Podcasts live in a separate database, [`podcasts::PodcastStore`]
+//! (`podcasts.sqlite3`); the music library never stores episodes.
 
 pub mod import;
 pub mod models;
+pub mod podcasts;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
@@ -22,8 +26,8 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 pub use models::{
     ArtistCard, ArtistDetail, ArtistRef, ArtistsPage, Availability, FederatedTrack, LibraryFilters,
-    LibrarySourceMode, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail, ReleaseEdit,
-    SearchResults, TrackEdit, TrackItem,
+    LibrarySourceMode, PlaybackItem, PlaylistCard, PlaylistDetail, ReleaseCard, ReleaseDetail,
+    ReleaseEdit, SearchResults, TrackEdit, TrackItem, TrackItemKey,
 };
 
 /// The virtual "Liked tracks" playlist id, kept from the server API.
@@ -3283,6 +3287,7 @@ fn query_tracks(
                 artists: Vec::new(),
                 featured_artists: Vec::new(),
                 fed: None,
+                podcast: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3348,6 +3353,7 @@ fn pending_track(fed: &FederatedTrack) -> TrackItem {
         file_size_bytes: None,
         play_count: 0,
         fed: Some(fed.clone()),
+        podcast: None,
     }
 }
 

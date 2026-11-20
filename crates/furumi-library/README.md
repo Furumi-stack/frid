@@ -21,5 +21,63 @@ library used by every client. Connections use WAL, foreign keys, and a busy
 timeout so independently running clients can safely share the database.
 
 Version 0.3 follows `music-dht` 0.6, whose device-sync and podcast contract
-types it re-exposes. Podcast persistence is not part of this release; it will
-implement the rules of the workspace `PODCASTS.md`.
+types it re-exposes.
+
+## Podcasts
+
+`furumi_library::podcasts::PodcastStore` is the SQLite reference store of the
+podcast contract (workspace `PODCASTS.md`, section "SQLite reference store").
+It lives in its own file, conventionally `podcasts.sqlite3`
+(`PODCAST_DB_FILE`) next to `library.db`; the caller passes the path.
+
+- **Migrations** run on `PRAGMA user_version`, each in its own transaction.
+  A database of the original podcast prototype (`user_version` 1) is imported:
+  its tables are renamed `legacy_podcasts` / `legacy_podcast_episodes` (never
+  dropped), feeds become subscriptions with contract ids, rows that cannot be
+  imported are listed in `legacy_quarantine`. A database from a newer Furumi,
+  or a file that is not a podcast database, is refused without being touched.
+- **Local actions** (`subscribe`, `unsubscribe`, `set_shared`,
+  `start_session`, `checkpoint`, `seek`, `restart`, `complete_session`,
+  `mark_played`, `mark_unplayed`, `record_listen_session`) draw stamps from a
+  `StampSource` (usually the client's sync log), apply the operation and
+  return `PodcastLocalOp`s to append to the log with exactly those stamps.
+- **Sync**: `apply_remote_op` applies the five `podcast_*` operations,
+  `fill_snapshot` / `export_snapshot` produce the bounded snapshot sections
+  and `apply_snapshot` merges them. Everything goes through the `music-dht`
+  materializers and merge functions, so the result does not depend on
+  delivery order and never loses newer local state.
+- **RSS**: `apply_feed` ingests a document parsed by
+  `music_dht::podcast::feed` (the crate enables the `podcast-feed` feature):
+  channel metadata, episodes with stable ids and current audio URLs, feed
+  aliases from permanent redirects and `itunes:new-feed-url`. It never
+  touches subscriptions, progress or history. HTTP, conditional requests and
+  scheduling stay in the client; `record_fetch_*`, `fetch_state` and
+  `podcasts_due_for_refresh` keep the local-only fetch state, which is never
+  synced.
+- **Queries**: `list_podcasts`, `seasons`, `episodes` (season, played-state
+  and text filters, date or episode-number order), `resume_position_ms`,
+  `episode_ref` / `episode_track` for queueing, `listen_history`.
+
+The store is synchronous: methods take `&self` and lock one connection, so
+`Arc<PodcastStore>` can be shared; run calls on a blocking pool.
+
+`TrackItem.podcast` marks a queue item as a podcast episode
+(`TrackItem::podcast_episode`). Music-only code (likes, playlists, history,
+content ids, federation downloads) must check `TrackItem::is_podcast`; the
+music library never stores episodes.
+
+`TrackItem::key` returns the typed source identity of a queue item
+(`TrackItemKey`: `lib:<id>`, `fed:<owner>:<item_id>` or `ep:<episode id>` as
+a string). A negative `TrackItem::id` only means "not a library row". Every
+podcast item has the same sentinel `id`, `release_id` and artist id
+(`TrackItem::NOT_A_LIBRARY_ROW` = -1). It carries no identity and must not
+be decoded; it only keeps music-only code that predates podcasts from taking
+an episode for library track, release or artist 0. The episode's identity is
+`TrackItem.podcast` alone, so queue, current-track and position matching
+must check it before any fallback to the id. `TrackItemKey` does not equate
+a pending federated item with its library copy; clients that match music by
+content id keep doing so.
+
+Convert received `PlaybackTrack`s with `TrackItem::from_playback_track`
+(`PlaybackItem::Music`, `PodcastEpisode` or `Private`): podcast items and
+Jam private placeholders carry id 0 on the wire, which must never be copied.
