@@ -290,3 +290,14 @@ cargo test -p music-dht --features podcast-feed
 
 The integration test starts three real nodes in one process (they use Iroh's
 public relay infrastructure), so it needs network access.
+
+## Optional lyrics
+
+The `lyrics` module defines `furumi/lyrics/1`: bounded versioned JSON requests
+by canonical audio content ID and responses with alternative plain/LRC texts,
+provenance, language and instrumental markers. Each direction ends with EOF.
+Use `LyricsRequest::new`, `write_request` and `read_response_from`; finish the
+send half after writing, and verify the echoed response content ID.
+Applications register this ALPN and explicitly advertise `lyrics: 1` only when
+serving it. Existing wire protocols remain unchanged. External enrichment and
+display remain application policy; lyrics never enter DHT records.

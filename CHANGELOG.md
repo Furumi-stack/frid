@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.7.0 — 2026-11-23
+
+Releases `music-dht 0.7.0`. Other crate versions remain unchanged.
+
+- Optional `music_dht::lyrics` contract on `furumi/lyrics/1`, addressed by
+  canonical audio content ID, with alternative plain/LRC texts, provenance,
+  language and instrumental markers.
+- Bounded versioned JSON envelopes and shared validation/read/write helpers.
+  Applications advertise `lyrics: 1` only when serving it.
+- Existing audio, catalog, DHT and sync layouts are unchanged; unsupported
+  peers simply lack this ALPN. External lookup and display remain application
+  responsibilities.
+- Tests cover content/version validation, text/frame bounds, roundtrips and
+  real streams to both supporting and legacy peers.
+
 ## v0.6.0 — 2026-11-20
 
 Releases `music-dht 0.6.0` and `furumi-library 0.3.0`.

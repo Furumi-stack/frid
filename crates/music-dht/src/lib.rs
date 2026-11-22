@@ -96,6 +96,7 @@ pub mod device_sync;
 mod dht;
 mod error;
 pub mod jam;
+pub mod lyrics;
 mod message;
 mod node;
 mod normalization;

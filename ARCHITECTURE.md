@@ -375,3 +375,14 @@ architectural constraint:
   projections or opaque placeholders.
 - A device's protocol version is what that device reported; relays never
   substitute their own.
+
+## Optional lyrics streams
+
+The optional music-dht lyrics contract uses furumi/lyrics/1 independently of
+audio, catalog and device-sync. A bounded JSON request identifies exact audio
+bytes by canonical b3 content ID; the response returns bounded alternative
+versions with provenance, plain text and/or LRC timestamps. Empty versions mean
+unavailable. Each direction ends with EOF. Applications advertise lyrics: 1
+only when serving it; older peers keep their existing wire layouts and simply
+lack this ALPN. Fetching external metadata and selecting/displaying versions
+remain application policy. Lyrics are never published into DHT records.
