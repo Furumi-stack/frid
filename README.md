@@ -56,7 +56,7 @@ Use the published crates from crates.io:
 [dependencies]
 federation-net = "0.3.1"
 music-dht = "0.6.0"
-furumi-library = "0.3.0"
+furumi-library = "0.4.0"
 ```
 
 Start with the crate documentation:

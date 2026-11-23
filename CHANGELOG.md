@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.1 — 2026-11-23
+
+Releases `furumi-library 0.4.0` against `music-dht 0.7.0` so applications can use the same podcast and lyrics types. The SQLite library can now store alternative lyrics by audio content ID, merge peer copies with local edits, and remember explicitly removed versions.
+
 ## v0.7.0 — 2026-11-23
 
 Releases `music-dht 0.7.0`. Other crate versions remain unchanged.

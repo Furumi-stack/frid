@@ -11,6 +11,7 @@
 //! (`podcasts.sqlite3`); the music library never stores episodes.
 
 pub mod import;
+pub mod lyrics;
 pub mod models;
 pub mod podcasts;
 
@@ -92,6 +93,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     audio_bit_depth    INTEGER,
     file_size_bytes    INTEGER,
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS track_lyrics (
+    content_id TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS track_artists (
     track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
